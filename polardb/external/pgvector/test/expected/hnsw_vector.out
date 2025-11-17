@@ -162,9 +162,9 @@ DETAIL:  Valid values are between "4" and "1000".
 CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (m = 16, ef_construction = 31);
 ERROR:  ef_construction must be greater than or equal to 2 * m
 SHOW hnsw.ef_search;
- hnsw.ef_search 
+ hnsw.ef_search
 ----------------
- 40
+ 15
 (1 row)
 
 SET hnsw.ef_search = 0;
