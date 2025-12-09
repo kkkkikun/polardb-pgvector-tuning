@@ -1108,8 +1108,8 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 
 	BuildGraph(buildstate);
 
-	if (RelationNeedsWAL(index) || forkNum == INIT_FORKNUM)
-		log_newpage_range(index, forkNum, 0, RelationGetNumberOfBlocksInFork(index, forkNum), true);
+	// if (RelationNeedsWAL(index) || forkNum == INIT_FORKNUM)
+	// 	log_newpage_range(index, forkNum, 0, RelationGetNumberOfBlocksInFork(index, forkNum), true);
 
 	FreeBuildState(buildstate);
 }
