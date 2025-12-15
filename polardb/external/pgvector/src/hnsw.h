@@ -48,7 +48,7 @@
 #define HNSW_NEIGHBOR_TUPLE_TYPE 2
 
 /* Make graph robust against non-HOT updates */
-#define HNSW_HEAPTIDS 10
+#define HNSW_HEAPTIDS 1
 
 #define HNSW_UPDATE_ENTRY_GREATER 1
 #define HNSW_UPDATE_ENTRY_ALWAYS 2
