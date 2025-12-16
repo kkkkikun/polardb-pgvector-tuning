@@ -148,20 +148,6 @@ port=$(random_unused_port)
 debug=on
 minimal=off
 compiler_flag="-g -pipe -Wall -fno-omit-frame-pointer -fsigned-char"
-
-# === Competition 2025: AMD EPYC AVX512 优化 ===
-# 检测CPU并添加优化参数
-if grep -q avx512 /proc/cpuinfo 2>/dev/null; then
-  # AMD EPYC with AVX512 detected
-  info "AMD EPYC AVX512 CPU detected - applying optimization"
-  # 使用COPT而不是直接修改compiler_flag，更安全
-  export COPT="${COPT:-} -O3 -march=znver3 -mtune=znver3 -funroll-loops -funsafe-math-optimizations -ffast-math"
-  # 添加到configure标志
-  configure_flag="$configure_flag --with-clang=no"  # 确保使用GCC
-  info "Applied AMD EPYC optimization flags"
-fi
-# === 优化结束 ===
-
 # disable origin rpath config because of our own rpath config in LDFLAGS
 configure_flag="--enable-depend --with-uuid=e2fs --disable-rpath --with-segsize=128"
 make_flag=""

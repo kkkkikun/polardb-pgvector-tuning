@@ -12,7 +12,7 @@ REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
 REGRESS_OPTS = --inputdir=test --load-extension=$(EXTENSION)
 
 # To compile for portability, run: make OPTFLAGS=""
-# Competition-optimized compilation flags
+# OPTFLAGS = -march=native
 
 # Mac ARM doesn't always support -march=native
 ifeq ($(shell uname -s), Darwin)
@@ -27,25 +27,10 @@ ifneq ($(filter ppc64%, $(shell uname -m)), )
 	OPTFLAGS =
 endif
 
-# AMD EPYC with AVX512 optimization (Competition 2025)
-ifeq ($(shell uname -s), Linux)
-	ifneq ($(filter x86_64, $(shell uname -m)), )
-		# Check if AVX512 is available
-		ifeq ($(shell grep -q avx512 /proc/cpuinfo 2>/dev/null && echo yes), yes)
-			# AMD EPYC with AVX512 - High performance optimization
-			OPTFLAGS = -O3 -march=znver3 -mtune=znver3 -funroll-loops -funsafe-math-optimizations -ffast-math -fno-signed-zeros -fno-trapping-math -fno-math-errno
-			EXTRA_FLAGS = -mavx512f -mavx512vl -mavx512dq -mfma -mbmi2 -mf16c
-		else
-			# Generic x86_64 fallback
-			OPTFLAGS = -O3 -march=x86-64-v3 -mtune=native -funroll-loops -ffast-math
-		endif
-	endif
-endif
-
-# For auto-vectorization with enhanced optimization:
+# For auto-vectorization:
 # - GCC (needs -ftree-vectorize OR -O3) - https://gcc.gnu.org/projects/tree-ssa/vectorization.html
 # - Clang (could use pragma instead) - https://llvm.org/docs/Vectorizers.html
-PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math $(EXTRA_FLAGS)
+PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
 
 # Debug GCC auto-vectorization
 # PG_CFLAGS += -fopt-info-vec

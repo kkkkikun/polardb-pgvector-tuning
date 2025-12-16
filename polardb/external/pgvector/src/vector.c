@@ -551,18 +551,17 @@ VectorL2SquaredDistance(int dim, float *ax, float *bx)
 {
 	float		distance = 0.0;
 
-	// === AMD EPYC AVX512 优化: 针对 200 维硬编码 ===
-    if (dim == 200)
+	// === 比赛专用优化开始: 针对 200 维硬编码 ===
+    if (dim == 200) 
     {
-        float sum = 0.0f;
+        float sum = 0.0;
         int i = 0;
 
-        // AVX512 优化: 一次处理 16 个 float (512位 / 32位)
-        // AMD EPYC 的 AVX512 执行单元可以高效处理这种模式
-        for (; i <= 184; i += 16)
+        // 这里的逻辑是：一次处理 16 个 float
+        // 200 / 16 = 12 次循环，剩余 8 个
+        // 这种写法极度利于编译器生成 AVX-512 指令
+        for (; i <= 184; i += 16) 
         {
-            // 编译器会将这些操作优化为 AVX512 指令
-            // 使用 fused multiply-add (FMA) 指令
             float d0 = ax[i] - bx[i];
             float d1 = ax[i+1] - bx[i+1];
             float d2 = ax[i+2] - bx[i+2];
@@ -580,53 +579,22 @@ VectorL2SquaredDistance(int dim, float *ax, float *bx)
             float d14 = ax[i+14] - bx[i+14];
             float d15 = ax[i+15] - bx[i+15];
 
-            // 编译器会将这些优化为 AVX512 的点积指令
-            sum += d0*d0 + d1*d1 + d2*d2 + d3*d3 +
-                   d4*d4 + d5*d5 + d6*d6 + d7*d7 +
-                   d8*d8 + d9*d9 + d10*d10 + d11*d11 +
+            sum += d0*d0 + d1*d1 + d2*d2 + d3*d3 + 
+                   d4*d4 + d5*d5 + d6*d6 + d7*d7 + 
+                   d8*d8 + d9*d9 + d10*d10 + d11*d11 + 
                    d12*d12 + d13*d13 + d14*d14 + d15*d15;
         }
 
-        // 处理剩余的元素
-        for (; i < 200; i++)
+        // 处理剩余的 8 个 (200 - 192 = 8)
+        // 实际上上面的循环到 192 停，这里处理剩下的
+        for (; i < 200; i++) 
         {
             float d = ax[i] - bx[i];
             sum += d * d;
         }
         return sum;
     }
-
-    // === 常用维度优化: 128, 256, 512 ===
-    if (dim == 128)
-    {
-        float sum = 0.0f;
-        for (int i = 0; i < 128; i += 16) {
-            float d0 = ax[i] - bx[i];
-            float d1 = ax[i+1] - bx[i+1];
-            float d2 = ax[i+2] - bx[i+2];
-            float d3 = ax[i+3] - bx[i+3];
-            float d4 = ax[i+4] - bx[i+4];
-            float d5 = ax[i+5] - bx[i+5];
-            float d6 = ax[i+6] - bx[i+6];
-            float d7 = ax[i+7] - bx[i+7];
-            float d8 = ax[i+8] - bx[i+8];
-            float d9 = ax[i+9] - bx[i+9];
-            float d10 = ax[i+10] - bx[i+10];
-            float d11 = ax[i+11] - bx[i+11];
-            float d12 = ax[i+12] - bx[i+12];
-            float d13 = ax[i+13] - bx[i+13];
-            float d14 = ax[i+14] - bx[i+14];
-            float d15 = ax[i+15] - bx[i+15];
-
-            sum += d0*d0 + d1*d1 + d2*d2 + d3*d3 +
-                   d4*d4 + d5*d5 + d6*d6 + d7*d7 +
-                   d8*d8 + d9*d9 + d10*d10 + d11*d11 +
-                   d12*d12 + d13*d13 + d14*d14 + d15*d15;
-        }
-        return sum;
-    }
-
-    // === 优化结束 ===
+    // === 比赛专用优化结束 ===
 
 
 	/* Auto-vectorized */
@@ -675,41 +643,6 @@ VECTOR_TARGET_CLONES static float
 VectorInnerProduct(int dim, float *ax, float *bx)
 {
 	float		distance = 0.0;
-
-	// === AMD EPYC AVX512 优化: 内积计算 ===
-	if (dim == 200)
-	{
-		float sum = 0.0f;
-		int i = 0;
-
-		// AVX512 点积优化 - 16个元素一组
-		for (; i <= 184; i += 16)
-		{
-			sum += ax[i] * bx[i] + ax[i+1] * bx[i+1] + ax[i+2] * bx[i+2] + ax[i+3] * bx[i+3] +
-			       ax[i+4] * bx[i+4] + ax[i+5] * bx[i+5] + ax[i+6] * bx[i+6] + ax[i+7] * bx[i+7] +
-			       ax[i+8] * bx[i+8] + ax[i+9] * bx[i+9] + ax[i+10] * bx[i+10] + ax[i+11] * bx[i+11] +
-			       ax[i+12] * bx[i+12] + ax[i+13] * bx[i+13] + ax[i+14] * bx[i+14] + ax[i+15] * bx[i+15];
-		}
-
-		// 处理剩余元素
-		for (; i < 200; i++)
-			sum += ax[i] * bx[i];
-
-		return sum;
-	}
-
-	if (dim == 128)
-	{
-		float sum = 0.0f;
-		for (int i = 0; i < 128; i += 16) {
-			sum += ax[i] * bx[i] + ax[i+1] * bx[i+1] + ax[i+2] * bx[i+2] + ax[i+3] * bx[i+3] +
-			       ax[i+4] * bx[i+4] + ax[i+5] * bx[i+5] + ax[i+6] * bx[i+6] + ax[i+7] * bx[i+7] +
-			       ax[i+8] * bx[i+8] + ax[i+9] * bx[i+9] + ax[i+10] * bx[i+10] + ax[i+11] * bx[i+11] +
-			       ax[i+12] * bx[i+12] + ax[i+13] * bx[i+13] + ax[i+14] * bx[i+14] + ax[i+15] * bx[i+15];
-		}
-		return sum;
-	}
-	// === 优化结束 ===
 
 	/* Auto-vectorized */
 	for (int i = 0; i < dim; i++)
