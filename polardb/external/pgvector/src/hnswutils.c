@@ -900,6 +900,30 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 		for (int i = 0; i < unvisitedLength; i++)
 		{
+			/* >>>>>>>>>> 在这里插入预取代码 (开始) <<<<<<<<<< */
+            
+            /* 软件预取：提前告诉 CPU 加载数组后面第 4 个元素的数据 */
+            if (i + 4 < unvisitedLength)
+            {
+                /* 预取 unvisited 数组的下一个条目 */
+                /* 这能加速从数组里读取 BlockNumber 和 OffsetNumber 的过程 */
+                __builtin_prefetch(&unvisited[i + 4], 0, 0);
+
+                /* 如果是纯内存模式 (inMemory=true)，我们甚至可以直接预取向量数据 */
+                /* 虽然比赛主要是磁盘模式，但加个判断是安全的 */
+                if (inMemory)
+                {
+                     HnswElement next_el = unvisited[i + 4].element;
+                     __builtin_prefetch(next_el, 0, 1);
+                     /* 尝试预取向量值 */
+                     /* 只有当 base 指针存在时才预取，防止宏展开错误 */
+                     if (base && next_el) {
+                         /* 简单的指针算术预取，假设 value 是相对指针 */
+                         /* 注意：这里不强求完美，主要收益在上面那行 */
+                     }
+                }
+            }
+            /* >>>>>>>>>> 在这里插入预取代码 (结束) <<<<<<<<<< */
 			HnswElement eElement;
 			HnswSearchCandidate *e;
 			double		eDistance;
