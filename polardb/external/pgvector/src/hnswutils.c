@@ -900,6 +900,11 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 		for (int i = 0; i < unvisitedLength; i++)
 		{
+			HnswElement eElement;
+			HnswSearchCandidate *e;
+			double		eDistance;
+			bool		alwaysAdd = wlen < ef;
+			
 			/* >>>>>>>>>> 在这里插入预取代码 (开始) <<<<<<<<<< */
             
             /* 软件预取：提前告诉 CPU 加载数组后面第 4 个元素的数据 */
@@ -924,10 +929,6 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
                 }
             }
             /* >>>>>>>>>> 在这里插入预取代码 (结束) <<<<<<<<<< */
-			HnswElement eElement;
-			HnswSearchCandidate *e;
-			double		eDistance;
-			bool		alwaysAdd = wlen < ef;
 
 			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 
