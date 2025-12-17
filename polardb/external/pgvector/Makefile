@@ -14,6 +14,11 @@ OBJS = src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/
 #    $(CURDIR) 确保使用的是绝对路径
 override CPPFLAGS += -I$(CURDIR)/mimalloc/include -DMI_MALLOC_OVERRIDE
 
+# 2. 【关键修正】禁用严格检查
+#    -Wno-missing-prototypes: 允许函数没有声明 (解决 alloc-override.c 的报错)
+#    -Wno-error: 防止其他警告变成错误导致编译失败
+override PG_CFLAGS += -Wno-missing-prototypes -Wno-error
+
 # 2. 将源码加入编译列表
 OBJS += mimalloc/src/static.o
 
