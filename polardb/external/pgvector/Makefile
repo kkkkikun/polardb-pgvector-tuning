@@ -6,21 +6,21 @@ DATA = $(wildcard sql/*--*--*.sql)
 DATA_built = sql/$(EXTENSION)--$(EXTVERSION).sql
 OBJS = src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
 # ==========================================
-# 🚀 Mimalloc 强制集成 (核弹模式)
+# 🚀 Mimalloc Integration (Strictness Bypass Edition)
 # ==========================================
 
-# 1. 强制将头文件路径加入 CPPFLAGS (预处理器参数)
-#    override 关键字确保即使系统想忽略也能强制生效
-#    $(CURDIR) 确保使用的是绝对路径
+# 1. Force the include path (using absolute path to be safe)
 override CPPFLAGS += -I$(CURDIR)/mimalloc/include -DMI_MALLOC_OVERRIDE
 
-# 2. 【关键修正】禁用严格检查
-#    -Wno-missing-prototypes: 允许函数没有声明 (解决 alloc-override.c 的报错)
-#    -Wno-error: 防止其他警告变成错误导致编译失败
+# 2. [CRITICAL FIX] Disable strict compiler checks
+#    -Wno-missing-prototypes: Ignores "no previous prototype" errors
+#    -Wno-error: Prevents warnings from stopping the build
 override PG_CFLAGS += -Wno-missing-prototypes -Wno-error
 
-# 2. 将源码加入编译列表
+# 3. Add Mimalloc source to the build list
 OBJS += mimalloc/src/static.o
+
+# ==========================================
 
 # ==========================================
 HEADERS = src/halfvec.h src/sparsevec.h src/vector.h
