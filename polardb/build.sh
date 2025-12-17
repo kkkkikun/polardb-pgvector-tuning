@@ -199,7 +199,9 @@ if [[ $debug == "on" ]]; then
   configure_flag+=" --enable-debug --enable-cassert --enable-tap-tests --enable-fault-injector"
 else
   # 比赛专用魔改：开启 O3, 本地指令集优化, LTO 链接时优化
-  compiler_flag+=" -O3 -march=native -funroll-loops -flto -fno-semantic-interposition"
+  # 追加 -Wno-declaration-after-statement 来允许混合声明
+  # 追加 -Wno-error 来防止其他非致命警告中断编译
+  compiler_flag+=" -O3 -march=native -funroll-loops -flto -fno-semantic-interposition -Wno-declaration-after-statement -Wno-error"
 fi
 
 # Compile PolarDB in minimal mode, this will discard some strange dependencies
