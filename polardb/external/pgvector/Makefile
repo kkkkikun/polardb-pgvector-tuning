@@ -5,6 +5,19 @@ MODULE_big = vector
 DATA = $(wildcard sql/*--*--*.sql)
 DATA_built = sql/$(EXTENSION)--$(EXTVERSION).sql
 OBJS = src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
+# ==========================================
+# 🚀 Mimalloc 强制集成 (核弹模式)
+# ==========================================
+
+# 1. 强制将头文件路径加入 CPPFLAGS (预处理器参数)
+#    override 关键字确保即使系统想忽略也能强制生效
+#    $(CURDIR) 确保使用的是绝对路径
+override CPPFLAGS += -I$(CURDIR)/mimalloc/include -DMI_MALLOC_OVERRIDE
+
+# 2. 将源码加入编译列表
+OBJS += mimalloc/src/static.o
+
+# ==========================================
 HEADERS = src/halfvec.h src/sparsevec.h src/vector.h
 
 TESTS = $(wildcard test/sql/*.sql)
@@ -12,7 +25,7 @@ REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
 REGRESS_OPTS = --inputdir=test --load-extension=$(EXTENSION)
 
 # To compile for portability, run: make OPTFLAGS=""
-OPTFLAGS = -march=native -O3
+OPTFLAGS = -march=native -mtune=native -mavx512f -mavx512dq -mavx512vl -mavx512bw -funroll-loops
 
 # Mac ARM doesn't always support -march=native
 ifeq ($(shell uname -s), Darwin)
@@ -31,6 +44,22 @@ endif
 # - GCC (needs -ftree-vectorize OR -O3) - https://gcc.gnu.org/projects/tree-ssa/vectorization.html
 # - Clang (could use pragma instead) - https://llvm.org/docs/Vectorizers.html
 PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
+# # ==========================================
+# # 🚀 Mimalloc 集成配置 (绝对路径修正版)
+# # ==========================================
+
+# # 1. 使用 $(srcdir) 锁定源码目录的绝对位置
+# #    这是解决 "No such file" 的关键！
+# MIMALLOC_PATH = $(srcdir)/mimalloc
+
+# # 2. 添加头文件路径 (使用绝对路径)
+# PKG_CPPFLAGS += -I$(MIMALLOC_PATH)/include -DMI_MALLOC_OVERRIDE
+
+# # 3. 将源码加入编译列表
+# #    注意：这里依然保持相对路径，因为 make 会根据目录结构自动匹配 .c 文件
+# OBJS += mimalloc/src/static.o
+
+# # ==========================================
 
 # Debug GCC auto-vectorization
 # PG_CFLAGS += -fopt-info-vec
