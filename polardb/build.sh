@@ -231,7 +231,7 @@ export PG_COLOR=auto
 export LANG=en_US.UTF-8
 export LANGUAGE=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
-export COPT="-Werror ${COPT-}"
+export COPT="${COPT-}"
 export CFLAGS="$compiler_flag ${CFLAGS-}"
 export CXXFLAGS="$compiler_flag ${CXXFLAGS-}"
 export LDFLAGS="-Wl,-rpath,'\$\$ORIGIN/../lib:$base_dir/lib',--build-id=sha1 ${LDFLAGS-}"
