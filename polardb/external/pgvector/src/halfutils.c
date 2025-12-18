@@ -53,33 +53,26 @@ HalfvecL2SquaredDistanceDefault(int dim, half * ax, half * bx)
 static float
 HalfvecL2SquaredDistance200_Avx512(int dim, half *ax, half *bx)
 {
-    // 将 half 指针视为 uint16_t 处理位数据
     const uint16_t *a = (const uint16_t *) ax;
     const uint16_t *b = (const uint16_t *) bx;
     
-    // 使用 3 个 sum 寄存器可以进一步增加指令并行度 (Instruction Level Parallelism)
     __m512 sum0 = _mm512_setzero_ps();
     __m512 sum1 = _mm512_setzero_ps();
     __m512 diff;
 
-    // 宏定义：处理 32 个元素 (两个 16-float 的 FMA 操作)
     #define PROCESS_32(offset, s_reg) { \
         __m512i ra = _mm512_loadu_si512((__m512i *)(a + (offset))); \
         __m512i rb = _mm512_loadu_si512((__m512i *)(b + (offset))); \
-        /* 低 256 位 FP16 转 FP32 */ \
         __m512 fa1 = _mm512_cvtph_ps(_mm512_castsi512_si256(ra)); \
         __m512 fb1 = _mm512_cvtph_ps(_mm512_castsi512_si256(rb)); \
         diff = _mm512_sub_ps(fa1, fb1); \
         s_reg = _mm512_fmadd_ps(diff, diff, s_reg); \
-        /* 高 256 位 FP16 转 FP32 */ \
         __m512 fa2 = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(ra, 1)); \
         __m512 fb2 = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(rb, 1)); \
         diff = _mm512_sub_ps(fa2, fb2); \
         s_reg = _mm512_fmadd_ps(diff, diff, s_reg); \
     }
 
-    // 展开 200 = 32*6 + 8
-    // 交替使用 sum0 和 sum1 寄存器，打破指令依赖链
     PROCESS_32(0,   sum0);
     PROCESS_32(32,  sum1);
     PROCESS_32(64,  sum0);
@@ -87,19 +80,18 @@ HalfvecL2SquaredDistance200_Avx512(int dim, half *ax, half *bx)
     PROCESS_32(128, sum0);
     PROCESS_32(160, sum1);
 
-    // 合并两个累加寄存器
     sum0 = _mm512_add_ps(sum0, sum1);
 
-    // 处理最后的 8 个维度 (192-199)
+    // 【修复点】：使用 _mm256_castsi128_si256 解决类型不匹配
     __mmask16 mask = 0x00FF; 
     __m128i ra_tail = _mm_loadu_si128((__m128i *)(a + 192));
     __m128i rb_tail = _mm_loadu_si128((__m128i *)(b + 192));
-    __m512 fa_t = _mm512_cvtph_ps(ra_tail);
-    __m512 fb_t = _mm512_cvtph_ps(rb_tail);
+    __m512 fa_t = _mm512_cvtph_ps(_mm256_castsi128_si256(ra_tail));
+    __m512 fb_t = _mm512_cvtph_ps(_mm256_castsi128_si256(rb_tail));
+    
     diff = _mm512_sub_ps(fa_t, fb_t);
     sum0 = _mm512_maskz_fmadd_ps(mask, diff, diff, sum0);
 
-    // 水平累加得到最终 float
     return _mm512_reduce_add_ps(sum0);
 }
 
