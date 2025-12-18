@@ -547,6 +547,7 @@ halfvec_to_vector(PG_FUNCTION_ARGS)
 }
 
 // VECTOR_TARGET_CLONES static float
+__attribute__((target("avx512f,avx512dq,avx512vl,avx512bw,fma")))
 static float
 VectorL2SquaredDistance(int dim, float *ax, float *bx)
 {
