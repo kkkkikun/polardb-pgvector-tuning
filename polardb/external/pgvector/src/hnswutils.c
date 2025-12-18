@@ -905,30 +905,38 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			double		eDistance;
 			bool		alwaysAdd = wlen < ef;
 			
-			/* >>>>>>>>>> 在这里插入预取代码 (开始) <<<<<<<<<< */
-            
-            /* 软件预取：提前告诉 CPU 加载数组后面第 4 个元素的数据 */
-            if (i + 4 < unvisitedLength)
-            {
-                /* 预取 unvisited 数组的下一个条目 */
-                /* 这能加速从数组里读取 BlockNumber 和 OffsetNumber 的过程 */
-                __builtin_prefetch(&unvisited[i + 4], 0, 0);
+			/* ==========================================================
+             * 【针对 200维 & M=10 优化的深度预取】
+             * ========================================================== */
+            const int prefetch_step = 2; // M=10 时邻居少，步长不宜过大
 
-                /* 如果是纯内存模式 (inMemory=true)，我们甚至可以直接预取向量数据 */
-                /* 虽然比赛主要是磁盘模式，但加个判断是安全的 */
+            if (i + prefetch_step < unvisitedLength)
+            {
                 if (inMemory)
                 {
-                     HnswElement next_el = unvisited[i + 4].element;
-                     __builtin_prefetch(next_el, 0, 1);
-                     /* 尝试预取向量值 */
-                     /* 只有当 base 指针存在时才预取，防止宏展开错误 */
-                     if (base && next_el) {
-                         /* 简单的指针算术预取，假设 value 是相对指针 */
-                         /* 注意：这里不强求完美，主要收益在上面那行 */
-                     }
+                    HnswElement next_el = unvisited[i + prefetch_step].element;
+                    if (next_el)
+                    {
+                        // 1. 预取节点元数据
+                        __builtin_prefetch(next_el, 0, 3);
+
+                        void *next_vec = HnswPtrAccess(base, next_el->value);
+                        if (next_vec)
+                        {
+                            /* * 2. 深度预取向量数据：
+                             * 200维占 800字节，即 12.5 个 Cache Line。
+                             * 我们不需要全部预取（以免浪费带宽），预取前 3-4 个 Line 通常收益最高。
+                             */
+                            char *ptr = (char *)next_vec;
+                            __builtin_prefetch(ptr, 0, 3);       // 第 1-16 维
+                            __builtin_prefetch(ptr + 64, 0, 3);  // 第 17-32 维
+                            __builtin_prefetch(ptr + 128, 0, 3); // 第 33-48 维
+                            __builtin_prefetch(ptr + 192, 0, 3); // 第 49-64 维
+                        }
+                    }
                 }
             }
-            /* >>>>>>>>>> 在这里插入预取代码 (结束) <<<<<<<<<< */
+            /* ========================================================== */
 
 			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 
