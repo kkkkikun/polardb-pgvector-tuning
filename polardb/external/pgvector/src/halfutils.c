@@ -91,7 +91,11 @@ HalfvecL2SquaredDistance200_Avx512(int dim, half *ax, half *bx)
     __m512 fb_t = _mm512_cvtph_ps(_mm256_castsi128_si256(rb_tail));
     
     diff = _mm512_sub_ps(fa_t, fb_t);
-    sum0 = _mm512_maskz_fmadd_ps(mask, diff, diff, sum0);
+    /* 【关键修复点】：使用 _mm512_mask_fmadd_ps 
+     * 参数含义：(原有值, 掩码, 乘数1, 乘数2)
+     * 这样在掩码为 0 的通道（8-15），会保留 sum0 原有的累加值。
+     */
+    sum0 = _mm512_mask_fmadd_ps(sum0, mask, diff, diff);
 
     return _mm512_reduce_add_ps(sum0);
 }
