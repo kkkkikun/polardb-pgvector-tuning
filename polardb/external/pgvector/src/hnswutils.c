@@ -930,8 +930,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
                             char *ptr = (char *)next_vec;
                             __builtin_prefetch(ptr, 0, 3);       // 第 1-16 维
                             __builtin_prefetch(ptr + 64, 0, 3);  // 第 17-32 维
-                            __builtin_prefetch(ptr + 128, 0, 3); // 第 33-48 维
-                            __builtin_prefetch(ptr + 192, 0, 3); // 第 49-64 维
+                            // __builtin_prefetch(ptr + 128, 0, 3); // 第 33-48 维
+                            // __builtin_prefetch(ptr + 192, 0, 3); // 第 49-64 维
                         }
                     }
                 }
