@@ -566,6 +566,12 @@ halfvec_l2_squared_distance(PG_FUNCTION_ARGS)
 
 	CheckDims(a, b);
 
+    if (a->dim == 200)
+    {
+        // 直接调用写好的极致加速版
+        return Float8GetDatum((double) HalfvecL2SquaredDistance200_Avx512(a->dim, a->x, b->x));
+    }
+
 	PG_RETURN_FLOAT8((double) HalfvecL2SquaredDistance(a->dim, a->x, b->x));
 }
 
