@@ -259,5 +259,5 @@ Float4ToHalf(float num)
 
 	return result;
 }
-
+float HalfvecL2SquaredDistance200_Avx512(int dim, half *ax, half *bx);
 #endif

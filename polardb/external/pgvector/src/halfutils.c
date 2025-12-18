@@ -50,7 +50,7 @@ HalfvecL2SquaredDistanceDefault(int dim, half * ax, half * bx)
  * 逻辑：200 维 = 32 * 6 + 8
  * 1000 万数据量下，手动展开能极大减少分支预测开销
  */
-static float
+float
 HalfvecL2SquaredDistance200_Avx512(int dim, half *ax, half *bx)
 {
     const uint16_t *a = (const uint16_t *) ax;
