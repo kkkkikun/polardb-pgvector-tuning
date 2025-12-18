@@ -50,6 +50,9 @@ HalfvecL2SquaredDistanceDefault(int dim, half * ax, half * bx)
  * 逻辑：200 维 = 32 * 6 + 8
  * 1000 万数据量下，手动展开能极大减少分支预测开销
  */
+/* * 200 维 halfvec 极速版 (4路 ILP + 纯 AVX-512)
+ * 核心优化：使用 4 个累加器打破 FMA 延迟链，榨干 CPU 流水线
+ */
 __attribute__((target("avx512f,avx512dq,avx512bw,avx512vl,fma")))
 float
 HalfvecL2SquaredDistance200_Avx512(int dim, half *ax, half *bx)
@@ -57,58 +60,62 @@ HalfvecL2SquaredDistance200_Avx512(int dim, half *ax, half *bx)
     const uint16_t *a = (const uint16_t *) ax;
     const uint16_t *b = (const uint16_t *) bx;
     
-    __m512 sum = _mm512_setzero_ps();
+    // 使用 4 个独立的累加器，允许 CPU 并行计算
+    __m512 sum0 = _mm512_setzero_ps();
+    __m512 sum1 = _mm512_setzero_ps();
+    __m512 sum2 = _mm512_setzero_ps();
+    __m512 sum3 = _mm512_setzero_ps();
 
-    // 内部宏：处理 32 个元素 (64字节)
-    #define PROCESS_BLOCK_32(off) { \
+    // 内部宏：计算并累加到指定的寄存器 S_REG
+    #define PROCESS_BLOCK(off, S_REG) { \
         __m512i ra = _mm512_loadu_si512((__m512i *)(a + (off))); \
         __m512i rb = _mm512_loadu_si512((__m512i *)(b + (off))); \
-        /* 转换低 16 个 half */ \
+        /* 低 16 half -> float */ \
         __m512 fa1 = _mm512_cvtph_ps(_mm512_castsi512_si256(ra)); \
         __m512 fb1 = _mm512_cvtph_ps(_mm512_castsi512_si256(rb)); \
         __m512 d1 = _mm512_sub_ps(fa1, fb1); \
-        sum = _mm512_fmadd_ps(d1, d1, sum); \
-        /* 转换高 16 个 half */ \
+        S_REG = _mm512_fmadd_ps(d1, d1, S_REG); \
+        /* 高 16 half -> float */ \
         __m512 fa2 = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(ra, 1)); \
         __m512 fb2 = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(rb, 1)); \
         __m512 d2 = _mm512_sub_ps(fa2, fb2); \
-        sum = _mm512_fmadd_ps(d2, d2, sum); \
+        S_REG = _mm512_fmadd_ps(d2, d2, S_REG); \
     }
 
-    // 1. 处理前 192 维
-    PROCESS_BLOCK_32(0);   PROCESS_BLOCK_32(32);
-    PROCESS_BLOCK_32(64);  PROCESS_BLOCK_32(96);
-    PROCESS_BLOCK_32(128); PROCESS_BLOCK_32(160);
+    // 192 维 = 6 个 32 元素块。
+    // 我们将它们分配给不同的累加器，打破依赖链
+    PROCESS_BLOCK(0,   sum0); // Block 0 -> sum0
+    PROCESS_BLOCK(32,  sum1); // Block 1 -> sum1
+    PROCESS_BLOCK(64,  sum2); // Block 2 -> sum2
+    PROCESS_BLOCK(96,  sum3); // Block 3 -> sum3
+    PROCESS_BLOCK(128, sum0); // Block 4 -> sum0 (此时 sum0 的上一轮早就算完了)
+    PROCESS_BLOCK(160, sum1); // Block 5 -> sum1
 
-    // 2. 处理尾部 8 维 (使用纯 AVX-512 技巧)
-    // 加载 128 位 (8个half)
+    // 处理尾部 8 维 (使用安全的零扩展技巧)
     __m128i ra_tail_128 = _mm_loadu_si128((__m128i *)(a + 192));
     __m128i rb_tail_128 = _mm_loadu_si128((__m128i *)(b + 192));
     
-    // 显式构建 256 位寄存器：低128位是数据，高128位是0
-    // 这样就无需担心高位 Garbage 产生 NaN
+    // 扩展到 256 位，高位补 0
     __m256i ra_tail_256 = _mm256_set_m128i(_mm_setzero_si128(), ra_tail_128);
     __m256i rb_tail_256 = _mm256_set_m128i(_mm_setzero_si128(), rb_tail_128);
-
-    // 使用 avx512f 的转换指令
-    // 结果：低8个float是有效差值，高8个float是 0.0
+    
     __m512 fa_tail = _mm512_cvtph_ps(ra_tail_256);
     __m512 fb_tail = _mm512_cvtph_ps(rb_tail_256);
-    
     __m512 d_tail = _mm512_sub_ps(fa_tail, fb_tail);
     
-    // 累加。因为高位是 0.0*0.0=0.0，所以可以直接加到 sum 里，不影响结果
-    sum = _mm512_fmadd_ps(d_tail, d_tail, sum);
+    // 累加到 sum2
+    sum2 = _mm512_fmadd_ps(d_tail, d_tail, sum2);
 
-    // 3. 稳健的水平归约 (Manual Reduction)
-    __m256 ymm_sum = _mm256_add_ps(_mm512_castps512_ps256(sum), _mm512_extractf32x8_ps(sum, 1));
-    __m128 xmm_sum = _mm_add_ps(_mm256_castps256_ps128(ymm_sum), _mm256_extractf128_ps(ymm_sum, 1));
-    __m128 xmm_shuf = _mm_movehdup_ps(xmm_sum);
-    xmm_sum = _mm_add_ps(xmm_sum, xmm_shuf);
-    xmm_shuf = _mm_movehl_ps(xmm_shuf, xmm_sum);
-    xmm_sum = _mm_add_ss(xmm_sum, xmm_shuf);
-    
-    return _mm_cvtss_f32(xmm_sum);
+    // 最终汇总所有累加器
+    // sum0 = sum0 + sum1
+    sum0 = _mm512_add_ps(sum0, sum1);
+    // sum2 = sum2 + sum3
+    sum2 = _mm512_add_ps(sum2, sum3);
+    // sum0 = sum0 + sum2
+    sum0 = _mm512_add_ps(sum0, sum2);
+
+    // 水平归约
+    return _mm512_reduce_add_ps(sum0);
 }
 
 // #ifdef HALFVEC_DISPATCH
