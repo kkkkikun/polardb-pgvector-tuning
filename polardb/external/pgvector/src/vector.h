@@ -1,15 +1,15 @@
-/* ==========================================
- * 🚀 Mimalloc 强制覆盖 (PolarDB 比赛专用)
- * ========================================== */
-#include "mimalloc.h"
+// /* ==========================================
+//  * 🚀 Mimalloc 强制覆盖 (PolarDB 比赛专用)
+//  * ========================================== */
+// #include "mimalloc.h"
 
-// 强制将标准内存函数替换为 mimalloc 版本
-#define malloc(n)       mi_malloc(n)
-#define free(p)         mi_free(p)
-#define realloc(p,n)    mi_realloc(p,n)
-#define calloc(n,c)     mi_calloc(n,c)
-#define strdup(s)       mi_strdup(s)
-/* ========================================== */
+// // 强制将标准内存函数替换为 mimalloc 版本
+// #define malloc(n)       mi_malloc(n)
+// #define free(p)         mi_free(p)
+// #define realloc(p,n)    mi_realloc(p,n)
+// #define calloc(n,c)     mi_calloc(n,c)
+// #define strdup(s)       mi_strdup(s)
+// /* ========================================== */
 #ifndef VECTOR_H
 #define VECTOR_H
 

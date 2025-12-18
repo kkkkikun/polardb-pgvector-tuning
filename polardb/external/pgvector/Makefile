@@ -5,24 +5,6 @@ MODULE_big = vector
 DATA = $(wildcard sql/*--*--*.sql)
 DATA_built = sql/$(EXTENSION)--$(EXTVERSION).sql
 OBJS = src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
-# ==========================================
-# 🚀 Mimalloc Integration (Strictness Bypass Edition)
-# ==========================================
-
-# 1. Force the include path (using absolute path to be safe)
-override CPPFLAGS += -I$(CURDIR)/mimalloc/include -DMI_MALLOC_OVERRIDE
-
-# 2. [CRITICAL FIX] Disable strict compiler checks
-#    -Wno-missing-prototypes: Ignores "no previous prototype" errors
-#    -Wno-error: Prevents warnings from stopping the build
-override PG_CFLAGS += -Wno-missing-prototypes -Wno-error
-
-# 3. Add Mimalloc source to the build list
-OBJS += mimalloc/src/static.o
-
-# ==========================================
-
-# ==========================================
 HEADERS = src/halfvec.h src/sparsevec.h src/vector.h
 
 TESTS = $(wildcard test/sql/*.sql)
@@ -48,29 +30,7 @@ endif
 # For auto-vectorization:
 # - GCC (needs -ftree-vectorize OR -O3) - https://gcc.gnu.org/projects/tree-ssa/vectorization.html
 # - Clang (could use pragma instead) - https://llvm.org/docs/Vectorizers.html
-PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
-# # ==========================================
-# # 🚀 Mimalloc 集成配置 (绝对路径修正版)
-# # ==========================================
-
-# # 1. 使用 $(srcdir) 锁定源码目录的绝对位置
-# #    这是解决 "No such file" 的关键！
-# MIMALLOC_PATH = $(srcdir)/mimalloc
-
-# # 2. 添加头文件路径 (使用绝对路径)
-# PKG_CPPFLAGS += -I$(MIMALLOC_PATH)/include -DMI_MALLOC_OVERRIDE
-
-# # 3. 将源码加入编译列表
-# #    注意：这里依然保持相对路径，因为 make 会根据目录结构自动匹配 .c 文件
-# OBJS += mimalloc/src/static.o
-
-# # ==========================================
-
-# Debug GCC auto-vectorization
-# PG_CFLAGS += -fopt-info-vec
-
-# Debug Clang auto-vectorization
-# PG_CFLAGS += -Rpass=loop-vectorize -Rpass-analysis=loop-vectorize
+override PG_CFLAGS += $(OPTFLAGS) -mfma -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
 
 all: sql/$(EXTENSION)--$(EXTVERSION).sql
 
