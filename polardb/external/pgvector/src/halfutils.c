@@ -57,47 +57,48 @@ HalfvecL2SquaredDistance200_Avx512(int dim, half *ax, half *bx)
     const uint16_t *a = (const uint16_t *) ax;
     const uint16_t *b = (const uint16_t *) bx;
     
-    __m512 sum0 = _mm512_setzero_ps();
-    __m512 sum1 = _mm512_setzero_ps();
-    __m512 diff;
+    __m512 sum = _mm512_setzero_ps();
 
-    #define PROCESS_32(offset, s_reg) { \
-        __m512i ra = _mm512_loadu_si512((__m512i *)(a + (offset))); \
-        __m512i rb = _mm512_loadu_si512((__m512i *)(b + (offset))); \
+    // 内部处理函数：处理 32 个 FP16 元素
+    #define PROCESS_BLOCK_32(off) { \
+        __m512i ra = _mm512_loadu_si512((__m512i *)(a + (off))); \
+        __m512i rb = _mm512_loadu_si512((__m512i *)(b + (off))); \
+        /* 低 256 位转换 */ \
         __m512 fa1 = _mm512_cvtph_ps(_mm512_castsi512_si256(ra)); \
         __m512 fb1 = _mm512_cvtph_ps(_mm512_castsi512_si256(rb)); \
-        diff = _mm512_sub_ps(fa1, fb1); \
-        s_reg = _mm512_fmadd_ps(diff, diff, s_reg); \
+        __m512 d1 = _mm512_sub_ps(fa1, fb1); \
+        sum = _mm512_fmadd_ps(d1, d1, sum); \
+        /* 高 256 位转换 */ \
         __m512 fa2 = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(ra, 1)); \
         __m512 fb2 = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(rb, 1)); \
-        diff = _mm512_sub_ps(fa2, fb2); \
-        s_reg = _mm512_fmadd_ps(diff, diff, s_reg); \
+        __m512 d2 = _mm512_sub_ps(fa2, fb2); \
+        sum = _mm512_fmadd_ps(d2, d2, sum); \
     }
 
-    PROCESS_32(0,   sum0);
-    PROCESS_32(32,  sum1);
-    PROCESS_32(64,  sum0);
-    PROCESS_32(96,  sum1);
-    PROCESS_32(128, sum0);
-    PROCESS_32(160, sum1);
+    // 192 维度展开 (32 * 6)
+    PROCESS_BLOCK_32(0);   PROCESS_BLOCK_32(32);
+    PROCESS_BLOCK_32(64);  PROCESS_BLOCK_32(96);
+    PROCESS_BLOCK_32(128); PROCESS_BLOCK_32(160);
 
-    sum0 = _mm512_add_ps(sum0, sum1);
-
-    // 【修复点】：使用 _mm256_castsi128_si256 解决类型不匹配
+    // 处理最后的 8 个维度 (192-199)
     __mmask16 mask = 0x00FF; 
     __m128i ra_tail = _mm_loadu_si128((__m128i *)(a + 192));
     __m128i rb_tail = _mm_loadu_si128((__m128i *)(b + 192));
     __m512 fa_t = _mm512_cvtph_ps(_mm256_castsi128_si256(ra_tail));
     __m512 fb_t = _mm512_cvtph_ps(_mm256_castsi128_si256(rb_tail));
-    
-    diff = _mm512_sub_ps(fa_t, fb_t);
-    /* 【关键修复点】：使用 _mm512_mask_fmadd_ps 
-     * 参数含义：(原有值, 掩码, 乘数1, 乘数2)
-     * 这样在掩码为 0 的通道（8-15），会保留 sum0 原有的累加值。
-     */
-    sum0 = _mm512_mask_fmadd_ps(sum0, mask, diff, diff);
+    __m512 d_tail = _mm512_sub_ps(fa_t, fb_t);
+    // 使用 mask 保护，不破坏已有的 sum 结果
+    sum = _mm512_mask_fmadd_ps(sum, mask, d_tail, d_tail);
 
-    return _mm512_reduce_add_ps(sum0);
+    /* --- 核心修复：更鲁棒的水平累加 (Horizontal Add) --- */
+    __m256 ymm_sum = _mm256_add_ps(_mm512_castps512_ps256(sum), _mm512_extractf32x8_ps(sum, 1));
+    __m128 xmm_sum = _mm_add_ps(_mm256_castps256_ps128(ymm_sum), _mm256_extractf128_ps(ymm_sum, 1));
+    __m128 xmm_shuf = _mm_movehdup_ps(xmm_sum);
+    xmm_sum = _mm_add_ps(xmm_sum, xmm_shuf);
+    xmm_shuf = _mm_movehl_ps(xmm_shuf, xmm_sum);
+    xmm_sum = _mm_add_ss(xmm_sum, xmm_shuf);
+    
+    return _mm_cvtss_f32(xmm_sum);
 }
 
 // #ifdef HALFVEC_DISPATCH
