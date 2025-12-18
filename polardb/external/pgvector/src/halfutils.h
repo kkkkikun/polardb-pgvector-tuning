@@ -259,5 +259,6 @@ Float4ToHalf(float num)
 
 	return result;
 }
+__attribute__((target("avx512f,avx512dq,avx512bw,avx512vl,fma")))
 float HalfvecL2SquaredDistance200_Avx512(int dim, half *ax, half *bx);
 #endif
