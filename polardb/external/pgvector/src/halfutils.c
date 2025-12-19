@@ -475,23 +475,27 @@ SupportsCpuFeature(unsigned int feature)
 void
 HalfvecInit(void)
 {
-	/*
-	 * Could skip pointer when single function, but no difference in
-	 * performance
-	 */
-	HalfvecL2SquaredDistance = HalfvecL2SquaredDistanceDefault;
-	HalfvecInnerProduct = HalfvecInnerProductDefault;
-	HalfvecCosineSimilarity = HalfvecCosineSimilarityDefault;
-	HalfvecL1Distance = HalfvecL1DistanceDefault;
+    /* 1. 设置默认实现 (纯 C 语言慢速版) */
+    HalfvecL2SquaredDistance = HalfvecL2SquaredDistanceDefault;
+    HalfvecInnerProduct = HalfvecInnerProductDefault;
+    HalfvecCosineSimilarity = HalfvecCosineSimilarityDefault;
+    HalfvecL1Distance = HalfvecL1DistanceDefault;
 
 #ifdef HALFVEC_DISPATCH
-	if (SupportsCpuFeature(CPU_FEATURE_AVX | CPU_FEATURE_F16C | CPU_FEATURE_FMA))
-	{
-		HalfvecL2SquaredDistance = HalfvecL2SquaredDistanceF16c;
-		HalfvecInnerProduct = HalfvecInnerProductF16c;
-		HalfvecCosineSimilarity = HalfvecCosineSimilarityF16c;
-		/* Does not require FMA, but keep logic simple */
-		HalfvecL1Distance = HalfvecL1DistanceF16c;
-	}
+    /* 2. 如果支持 F16C (标准优化)，则启用 F16C 版本 */
+    /* 这里的 SupportsCpuFeature 是 pgvector 原带的检测函数，不用改 */
+    if (SupportsCpuFeature(CPU_FEATURE_AVX | CPU_FEATURE_F16C | CPU_FEATURE_FMA))
+    {
+        HalfvecL2SquaredDistance = HalfvecL2SquaredDistanceF16c;
+        HalfvecInnerProduct = HalfvecInnerProductF16c;
+        HalfvecCosineSimilarity = HalfvecCosineSimilarityF16c;
+        HalfvecL1Distance = HalfvecL1DistanceF16c;
+    }
 #endif
+
+    /* * 注意：
+     * 这里不再强制指派 HalfvecL2SquaredDistance200_Avx512。
+     * 因为我们已经在 HnswSearchLayer (src/hnswutils.c) 里
+     * 通过 l2_distance_sq8 直接拦截了计算。
+     */
 }
