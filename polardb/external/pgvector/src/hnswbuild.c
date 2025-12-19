@@ -587,35 +587,27 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
 	if (isnull[0])
 		return;
 
-	/* === 插入探测逻辑 START === */
-    /* 只探测前 10万 条数据 */
+	/* === 探测逻辑 START === */
     if (global_probe_count < 100000)
     {
-        /* 1. 获取向量对象 */
         Vector *vec = DatumGetVector(values[0]);
         int dim = vec->dim;
-        
-        /* 2. 获取 half 数组指针 (因为是 halfvec 类型) */
         half *hvec = (half *) vec->x;
 
         for (int i = 0; i < dim; i++)
         {
-            /* 3. 转换数值并统计 */
-            float val = HalfToFloat4(hvec[i]);
-
+            float val = HalfToFloat4(hvec[i]); /* 确保使用正确的转换函数 */
             if (val < global_probe_min) global_probe_min = val;
             if (val > global_probe_max) global_probe_max = val;
         }
 
         global_probe_count++;
 
-        /* 4. 输出结果到标准错误流 (确保你能看到) */
+        /* === 关键修改：攒够了直接报错，强行把数据吐出来 === */
         if (global_probe_count == 100000)
         {
-            fprintf(stderr, "\n\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
-            fprintf(stderr, "DATA PROBE RESULT: MIN=%f, MAX=%f\n", global_probe_min, global_probe_max);
-            fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n");
-            fflush(stderr);
+            /* 使用 ERROR 级别，这会导致构建中断，但一定会打印日志！ */
+            elog(ERROR, "DATA PROBE SUCCESS: MIN=%f, MAX=%f", global_probe_min, global_probe_max);
         }
     }
     /* === 探测逻辑 END === */
