@@ -1,3 +1,23 @@
+// 开启 AVX512 基础指令、位运算和字节/字扩展
+// #define TARGET_AVX512 __attribute__((target("avx512f,avx512vl,avx512bw,avx512dq,fma")))
+
+/* =========================================================
+ * 暴力开启 AVX-512 支持
+ * 原因：Makefile 的 flag 被 LLVM 编译流程吞了，必须在这里手动定义
+ * ========================================================= */
+
+/* 1. 先手动定义宏，骗过 <immintrin.h> 让它暴露 __m512i 类型 */
+#ifndef __AVX512F__
+#define __AVX512F__ 1
+#endif
+#ifndef __AVX512BW__
+#define __AVX512BW__ 1
+#endif
+#ifndef __AVX512VL__
+#define __AVX512VL__ 1
+#endif
+/* 强制开启 AVX-512F (基础) 和 AVX-512BW (字节/字指令) */
+#pragma GCC target("avx512f,avx512bw")
 #include "postgres.h"
 
 #include <math.h>
@@ -35,33 +55,65 @@ float_to_u8(float val)
     return (uint8)((val - SQ_MIN) / SQ_RANGE * 255.0f);
 }
 
-/* AVX2 距离计算 */
+/* * 针对 AMD EPYC (AVX-512BW) 的极速实现
+ * 数学安全性验证：Max(Sum) = 200 * 255^2 ≈ 1.3e7 << Max(int32) ≈ 2.1e9
+ * 绝对无溢出，无需分块累加，精度 100% 无损。
+ */
+__attribute__((target("avx512f,avx512bw,avx512vl")))
 static float
 l2_distance_sq8(uint8 *a, uint8 *b, int dim)
 {
     int i = 0;
-    long long result = 0;
-    __m256i sum = _mm256_setzero_si256();
-    __m256i v_zero = _mm256_setzero_si256();
+    long long result = 0; // 用 long long 防止哪怕万一的溢出，虽然 int32 也够
+    
+    /* 512位累加器，初始化为 0 */
+    __m512i sum = _mm512_setzero_si512();
 
-    for (; i <= dim - 32; i += 32) {
-        __m256i va = _mm256_loadu_si256((__m256i*)&a[i]);
-        __m256i vb = _mm256_loadu_si256((__m256i*)&b[i]);
-        __m256i v_max = _mm256_max_epu8(va, vb);
-        __m256i v_min = _mm256_min_epu8(va, vb);
-        __m256i diff = _mm256_subs_epu8(v_max, v_min);
-        __m256i diff_lo = _mm256_unpacklo_epi8(diff, v_zero);
-        __m256i diff_hi = _mm256_unpackhi_epi8(diff, v_zero);
-        sum = _mm256_add_epi32(sum, _mm256_madd_epi16(diff_lo, diff_lo));
-        sum = _mm256_add_epi32(sum, _mm256_madd_epi16(diff_hi, diff_hi));
+    /* * 循环展开：200 维 = 64 * 3 + 8
+     * 只需循环 3 次
+     */
+    for (; i <= dim - 64; i += 64) {
+        /* 使用 loadu (unaligned) 是安全的，x86 对非对齐加载惩罚很小 */
+        __m512i va = _mm512_loadu_si512((const void*)&a[i]);
+        __m512i vb = _mm512_loadu_si512((const void*)&b[i]);
+
+        /* * 1. 升位：uint8 -> int16
+         * 利用 avx512bw 的 cvtepu8_epi16 指令，速度极快
+         */
+        __m512i va_lo = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(va));
+        __m512i vb_lo = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(vb));
+        
+        /* 取高 256 位进行升位 */
+        __m512i va_hi = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(va, 1));
+        __m512i vb_hi = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(vb, 1));
+
+        /* * 2. 减法：int16 - int16
+         * 结果范围 -255 ~ 255，int16 轻松装下
+         */
+        __m512i diff_lo = _mm512_sub_epi16(va_lo, vb_lo);
+        __m512i diff_hi = _mm512_sub_epi16(va_hi, vb_hi);
+
+        /* * 3. 平方并累加：MADD
+         * 相当于：sum += diff * diff
+         * 结果累加到 32位整数 sum 中，绝对安全
+         */
+        sum = _mm512_add_epi32(sum, _mm512_madd_epi16(diff_lo, diff_lo));
+        sum = _mm512_add_epi32(sum, _mm512_madd_epi16(diff_hi, diff_hi));
     }
-    int32_t tmp[8];
-    _mm256_storeu_si256((__m256i*)tmp, sum);
-    for (int k = 0; k < 8; k++) result += tmp[k];
+
+    /* 4. 归约：将 512 位寄存器内的 16 个 int32 加起来 */
+    result = _mm512_reduce_add_epi32(sum);
+
+    /* 5. 尾部处理 (剩下 8 个维度) */
     for (; i < dim; i++) {
+        /* 显式转 int 计算，清晰明了 */
         int d = (int)a[i] - (int)b[i];
         result += d * d;
     }
+
+    /* * 6. 还原尺度
+     * 虽然 HNSW 只需要相对大小，但还原回 float 距离能保证 epsilon 等参数逻辑正常
+     */
     float scale = SQ_RANGE / 255.0f;
     return (float)result * (scale * scale);
 }
