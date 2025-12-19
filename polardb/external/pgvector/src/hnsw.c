@@ -13,7 +13,16 @@
 #include "utils/guc.h"
 #include "utils/selfuncs.h"
 #include "utils/spccache.h"
+/* =========================================================
+ * DEBUG PROBE GLOBALS (调试探测全局变量)
+ * ========================================================= */
+#include <float.h>
+#include "halfutils.h"// 如果报错找不到 halfvec.h，试着改为 "halfutils.h"
 
+static float global_probe_min = FLT_MAX;
+static float global_probe_max = -FLT_MAX;
+static long  global_probe_count = 0;
+/* ========================================================= */
 #if PG_VERSION_NUM < 150000
 #define MarkGUCPrefixReserved(x) EmitWarningsOnPlaceholders(x)
 #endif

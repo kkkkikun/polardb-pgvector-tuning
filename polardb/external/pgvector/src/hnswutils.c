@@ -513,6 +513,40 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 		Datum		value = datumCopy(PointerGetDatum(&etup->data), false, -1);
 
 		HnswPtrStore(base, element->value, DatumGetPointer(value));
+
+		/* =========================================================
+         * DEBUG PROBE LOGIC (数据探测逻辑 - 仅运行前 10万 次)
+         * ========================================================= */
+        if (global_probe_count < 100000)
+        {
+            /* 1. 将 Datum 强转为 Vector 结构指针 */
+            Vector *vec = (Vector *) DatumGetPointer(value);
+            int dim = vec->dim;
+            
+            /* 2. 获取 Half 指针 (因为你是 halfvec!) */
+            /* 这里的 x 在结构体里是 float，但在 halfvec 中存的是 Half */
+            Half *hvec = (Half *) vec->x; 
+
+            for (int i = 0; i < dim; i++)
+            {
+                /* 3. 关键：必须使用 HalfToFloat 转换，否则数值是乱码 */
+                float val = HalfToFloat(hvec[i]);
+
+                if (val < global_probe_min) global_probe_min = val;
+                if (val > global_probe_max) global_probe_max = val;
+            }
+
+            global_probe_count++;
+
+            /* 4. 攒够了 10万条，或者是前面几条，打印出来看看 */
+            /* 为了防止刷屏，只在第 1000, 10000, 100000 条打印 */
+            if (global_probe_count == 1000 || global_probe_count == 100000)
+            {
+                elog(WARNING, "!!! DATA PROBE [%ld]: MIN=%f, MAX=%f !!!", 
+                     global_probe_count, global_probe_min, global_probe_max);
+            }
+        }
+        /* ========================================================= */
 	}
 }
 
@@ -930,8 +964,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
                             char *ptr = (char *)next_vec;
                             __builtin_prefetch(ptr, 0, 3);       // 第 1-16 维
                             __builtin_prefetch(ptr + 64, 0, 3);  // 第 17-32 维
-                            // __builtin_prefetch(ptr + 128, 0, 3); // 第 33-48 维
-                            // __builtin_prefetch(ptr + 192, 0, 3); // 第 49-64 维
+                            __builtin_prefetch(ptr + 128, 0, 3); // 第 33-48 维
+                            __builtin_prefetch(ptr + 192, 0, 3); // 第 49-64 维
                         }
                     }
                 }
