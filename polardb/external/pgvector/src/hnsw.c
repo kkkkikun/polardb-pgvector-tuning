@@ -1,8 +1,4 @@
 #include "postgres.h"
-/* 新增 */
-#include "halfutils.h"
-#include "vector.h"
-#include <immintrin.h> /* 必须包含，用于 SIMD 指令 */
 
 #include <float.h>
 #include <math.h>
@@ -17,9 +13,6 @@
 #include "utils/guc.h"
 #include "utils/selfuncs.h"
 #include "utils/spccache.h"
-#define SQ_MIN -0.5f
-#define SQ_MAX 0.5f
-#define SQ_RANGE (SQ_MAX - SQ_MIN)
 
 #if PG_VERSION_NUM < 150000
 #define MarkGUCPrefixReserved(x) EmitWarningsOnPlaceholders(x)
@@ -75,66 +68,6 @@ HnswInitLockTranche(void)
 #endif
 }
 
-/* 辅助函数：将 float 转为 uint8 */
-static inline uint8
-float_to_u8(float val)
-{
-    if (val <= SQ_MIN) return 0;
-    if (val >= SQ_MAX) return 255;
-    return (uint8)((val - SQ_MIN) / SQ_RANGE * 255.0f);
-}
-
-/* 核心函数：计算两个 uint8 向量的 L2 距离平方 (AVX2 SIMD 加速) */
-static float
-l2_distance_sq8(uint8 *a, uint8 *b, int dim)
-{
-    int i = 0;
-    long long result = 0;
-
-    /* 初始化 256位 (32字节) 的累加器 */
-    __m256i sum = _mm256_setzero_si256();
-    __m256i v_zero = _mm256_setzero_si256();
-
-    /* 每次处理 32 个维度 */
-    for (; i <= dim - 32; i += 32) {
-        __m256i va = _mm256_loadu_si256((__m256i*)&a[i]);
-        __m256i vb = _mm256_loadu_si256((__m256i*)&b[i]);
-
-        /* 计算绝对差值 |a - b| */
-        /* max(a,b) - min(a,b) 是处理无符号数减法防溢出的标准做法 */
-        __m256i v_max = _mm256_max_epu8(va, vb);
-        __m256i v_min = _mm256_min_epu8(va, vb);
-        __m256i diff = _mm256_subs_epu8(v_max, v_min);
-
-        /* 将 8bit 拆解为 16bit */
-        __m256i diff_lo = _mm256_unpacklo_epi8(diff, v_zero);
-        __m256i diff_hi = _mm256_unpackhi_epi8(diff, v_zero);
-
-        /* 平方并累加: madd_epi16 会做 (a*a + b*b) 并加到 32bit 结果里 */
-        sum = _mm256_add_epi32(sum, _mm256_madd_epi16(diff_lo, diff_lo));
-        sum = _mm256_add_epi32(sum, _mm256_madd_epi16(diff_hi, diff_hi));
-    }
-
-    /* 汇总 SIMD 寄存器里的值 */
-    /* 提取为 scalar 数组求和 */
-    int32_t tmp[8];
-    _mm256_storeu_si256((__m256i*)tmp, sum);
-    for (int k = 0; k < 8; k++) result += tmp[k];
-
-    /* 处理剩余的维度 (尾部) */
-    for (; i < dim; i++) {
-        int d = (int)a[i] - (int)b[i];
-        result += d * d;
-    }
-
-    /* * 注意：这里算出来的是量化后的整数距离。
-     * 如果你需要真实的 float 距离，需要反归一化： result * (scale * scale)
-     * scale = SQ_RANGE / 255.0
-     * 但如果是纯排序比大小，其实不用乘系数也可以，为了保持兼容性我们乘回去。
-     */
-    float scale = SQ_RANGE / 255.0f;
-    return (float)result * (scale * scale);
-}
 
 /*
  * Initialize index options and variables

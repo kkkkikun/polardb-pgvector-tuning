@@ -154,8 +154,6 @@ struct HnswElementData
 	BlockNumber neighborPage;
 	DatumPtr	value;
 	LWLock		lock;
-	/* === 新增：存放量化后的数据 === */
-    uint8      *dataSq;
 } __attribute__((aligned(64))); //强制每个节点在内存中按照 64 字节（CPU Cache Line 大小）对齐。这样当 CPU 读取一个节点时，能一次性把该节点的关键信息（neighbors 指针、value 指针等）全部读入一级缓存，减少读取次数。
 
 typedef HnswElementData * HnswElement;
@@ -266,8 +264,6 @@ typedef struct HnswSupport
 typedef struct HnswQuery
 {
 	Datum		value;
-	/* === 新增：量化后的查询向量 === */
-    uint8      *dataSq;
 }			HnswQuery;
 
 typedef struct HnswBuildState
