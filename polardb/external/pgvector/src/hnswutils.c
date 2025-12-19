@@ -573,10 +573,13 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 		HnswPtrStore(base, element->value, DatumGetPointer(value));
 
 		/* === SQ8 注入点：加载时顺便量化 === */
-          // 判断向量类型：检查是否为halfvec类型
-          // 通过检查第一个4字节是否符合halfvec的binary格式特征来判断
-          char *raw_data = (char *) DatumGetPointer(value);
-          int16 dim = *(int16 *)(raw_data + 4);  // 跳过vl_len_，读取dim字段
+		/* 获取原始数据指针 */
+        void *raw_data = DatumGetPointer(value);
+		/* * 安全获取维度：
+         * Vector 和 HalfVector 的头部布局一致 (vl_len_, dim, unused)，
+         * 所以先强转为 Vector* 读取 dim 是安全的。
+         */
+        int dim = ((Vector *)raw_data)->dim;
 
           if (dim == 200) /* 只针对 200 维处理，安全 */
           {
@@ -596,7 +599,7 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
                   // 这是HalfVector类型
                   HalfVector *hvec = (HalfVector *) raw_data;
                   for (int i = 0; i < dim; i++)
-                      element->dataSq[i] = float_to_u8(HalfToFloat4(hvec->x[i]));
+                	  element->dataSq[i] = float_to_u8(HalfToFloat4(hvec->x[i]));
               } else if (data_size == expected_vector_size) {
                   // 这是Vector类型
                   Vector *vec = (Vector *) raw_data;
@@ -933,26 +936,35 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 	/* === SQ8 预处理 === */
     bool free_q_sq = false;
-    int dim = 200; 
+    int dim = 0;
 
     /* 量化 Query 向量 */
     if (q->value != (Datum) 0 && q->dataSq == NULL)
     {
-        Vector *vec = DatumGetVector(q->value);
-        dim = vec->dim;
-        half *hvec = (half *) vec->x;
+        void *raw_data = DatumGetPointer(q->value);
+        dim = ((Vector *)raw_data)->dim; // 安全读取 dim
         
         /* 仅在维度匹配时启用 */
-        if (dim == 200) {
-            q->dataSq = (uint8 *) palloc(dim * sizeof(uint8));
-            free_q_sq = true;
-            for (int i = 0; i < dim; i++)
-                q->dataSq[i] = float_to_u8(HalfToFloat4(hvec[i]));
+        if (dim == 200)
+		{
+            Size data_size = VARSIZE_ANY(raw_data);
+            Size size_half = offsetof(HalfVector, x) + dim * sizeof(half);
+            
+            /* 只有大小匹配 HalfVector 才处理 (比赛场景主要是 HalfVector Query) */
+            if (data_size == size_half)
+            {
+                HalfVector *hvec = (HalfVector *)raw_data;
+                q->dataSq = (uint8 *) palloc(dim * sizeof(uint8));
+                free_q_sq = true;
+                
+                for (int i = 0; i < dim; i++)
+                    q->dataSq[i] = float_to_u8(HalfToFloat4(hvec->x[i]));
+            }
         }
-    } else if (q->value != (Datum) 0)
+    }
+	else if (q->value != (Datum) 0)
     {
-         Vector *vec = DatumGetVector(q->value);
-         dim = vec->dim;
+    	dim = ((Vector *)DatumGetPointer(q->value))->dim;
     }
     /* ================= */
 
