@@ -1,5 +1,14 @@
 #include "postgres.h"
 /* 1. 定义宏：让 <immintrin.h> 乖乖交出 __m512i 类型定义 */
+#undef __AVX512F__
+#define __AVX512F__ 1
+#undef __AVX512BW__
+#define __AVX512BW__ 1
+#undef __AVX512VL__
+#define __AVX512VL__ 1
+
+/* 2. Pragma 强制编译器后端生成 AVX-512 指令 */
+#pragma GCC target("avx512f,avx512bw,avx512vl")
 #include <immintrin.h>
 #include "halfutils.h"
 #include "vector.h"
@@ -915,6 +924,10 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
             for (int i = 0; i < dim; i++)
                 q->dataSq[i] = float_to_u8(HalfToFloat4(hvec[i]));
         }
+    } else if (q->value != (Datum) 0)
+    {
+         Vector *vec = DatumGetVector(q->value);
+         dim = vec->dim;
     }
     /* ================= */
 
@@ -1005,22 +1018,31 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
                     HnswElement next_el = unvisited[i + prefetch_step].element;
                     if (next_el)
                     {
-                        // 1. 预取节点元数据
-                        __builtin_prefetch(next_el, 0, 3);
 
-                        void *next_vec = HnswPtrAccess(base, next_el->value);
-                        if (next_vec)
-                        {
-                            /* * 2. 深度预取向量数据：
-                             * 200维占 800字节，即 12.5 个 Cache Line。
-                             * 我们不需要全部预取（以免浪费带宽），预取前 3-4 个 Line 通常收益最高。
-                             */
-                            char *ptr = (char *)next_vec;
-                            __builtin_prefetch(ptr, 0, 3);       // 第 1-16 维
-                            __builtin_prefetch(ptr + 64, 0, 3);  // 第 17-32 维
-                            __builtin_prefetch(ptr + 128, 0, 3); // 第 33-48 维
-                            __builtin_prefetch(ptr + 192, 0, 3); // 第 49-64 维
-                        }
+						/* 1. 预取节点元数据 */
+                        __builtin_prefetch(next_el, 0, 3);
+                        
+                        /* 2. 预取量化数据 (dataSq) */
+                        /* dataSq 只有 200 字节，3-4 个 cache line 足矣，一次 prefetch 大概率够用 */
+                        if (next_el->dataSq) 
+                            __builtin_prefetch(next_el->dataSq, 0, 3);
+						
+                        // // 1. 预取节点元数据
+                        // __builtin_prefetch(next_el, 0, 3);
+
+                        // void *next_vec = HnswPtrAccess(base, next_el->value);
+                        // if (next_vec)
+                        // {
+                        //     /* * 2. 深度预取向量数据：
+                        //      * 200维占 800字节，即 12.5 个 Cache Line。
+                        //      * 我们不需要全部预取（以免浪费带宽），预取前 3-4 个 Line 通常收益最高。
+                        //      */
+                        //     char *ptr = (char *)next_vec;
+                        //     __builtin_prefetch(ptr, 0, 3);       // 第 1-16 维
+                        //     __builtin_prefetch(ptr + 64, 0, 3);  // 第 17-32 维
+                        //     __builtin_prefetch(ptr + 128, 0, 3); // 第 33-48 维
+                        //     __builtin_prefetch(ptr + 192, 0, 3); // 第 49-64 维
+                        // }
                     }
                 }
             }
@@ -1103,6 +1125,13 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 		w = lappend(w, sc);
 	}
+	/* === 修复 Warning：清理内存 === */
+    if (free_q_sq && q->dataSq != NULL)
+    {
+        pfree(q->dataSq);
+        q->dataSq = NULL;
+    }
+    /* ============================ */
 
 	return w;
 }
