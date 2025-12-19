@@ -530,7 +530,7 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
             
             /* 2. 获取 Half 指针 (因为你是 halfvec!) */
             /* 这里的 x 在结构体里是 float，但在 halfvec 中存的是 Half */
-            Half *hvec = (Half *) vec->x; 
+            half *hvec = (half *) vec->x; 
 
             for (int i = 0; i < dim; i++)
             {
