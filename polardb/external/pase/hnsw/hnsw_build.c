@@ -27,7 +27,15 @@
 #include "access/tableam.h"
 
 #include "pase.h"
+/* === 探测代码所需头文件与全局变量 === */
+#include "halfutils.h" /* 用于 HalfToFloat4 */
+#include "vector.h"    /* 用于 Vector 结构 */
+#include <stdio.h>     /* 用于 fprintf */
 
+static float global_probe_min = 1e30f;
+static float global_probe_max = -1e30f;
+static long  global_probe_count = 0;
+/* ================================= */
 static void
 HNSWBuildCallback(Relation index, ItemPointer tid, Datum *values,
   bool *isnull, bool tupleIsAlive, void *state) {
@@ -35,6 +43,35 @@ HNSWBuildCallback(Relation index, ItemPointer tid, Datum *values,
   HNSWDataTuple *tup;
   MemoryContext oldCtx;
   int blkid;
+
+  /* === 插入探测逻辑 START === */
+  /* 只有当数据不为空，且统计数量少于 10万 条时执行 */
+  if (!isnull[0] && global_probe_count < 100000) {
+      /* 1. 获取向量 */
+      Vector *vec = DatumGetVector(values[0]);
+      int dim = vec->dim;
+      
+      /* 2. 获取 half 数组指针 */
+      half *hvec = (half *) vec->x;
+
+      for (int i = 0; i < dim; i++) {
+          /* 3. 转换并统计 */
+          float val = HalfToFloat4(hvec[i]);
+          if (val < global_probe_min) global_probe_min = val;
+          if (val > global_probe_max) global_probe_max = val;
+      }
+
+      global_probe_count++;
+
+      /* 4. 暴力输出结果到标准错误流 */
+      if (global_probe_count == 100000) {
+          fprintf(stderr, "\n\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+          fprintf(stderr, "DATA PROBE RESULT: MIN=%f, MAX=%f\n", global_probe_min, global_probe_max);
+          fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n");
+          fflush(stderr);
+      }
+  }
+  /* === 探测逻辑 END === */
 
   buildState = (HNSWBuildState *) state;
   oldCtx = MemoryContextSwitchTo(buildState->tmpctx);
