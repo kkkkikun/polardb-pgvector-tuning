@@ -14,7 +14,12 @@
 #include "utils/datum.h"
 #include "utils/memdebug.h"
 #include "utils/rel.h"
+#include "halfutils.h" /* 包含 HalfToFloat4 的头文件 */
+#include "vector.h"    /* 包含 Vector 结构体定义 */
 
+static float global_probe_min = 1e30f;
+static float global_probe_max = -1e30f;
+static long  global_probe_count = 0;
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
 #endif
@@ -529,8 +534,8 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 
             for (int i = 0; i < dim; i++)
             {
-                /* 3. 关键：必须使用 HalfToFloat 转换，否则数值是乱码 */
-                float val = HalfToFloat(hvec[i]);
+                /* 3. 关键：必须使用 HalfToFloat4 转换，否则数值是乱码 */
+                float val = HalfToFloat4(hvec[i]);
 
                 if (val < global_probe_min) global_probe_min = val;
                 if (val > global_probe_max) global_probe_max = val;
