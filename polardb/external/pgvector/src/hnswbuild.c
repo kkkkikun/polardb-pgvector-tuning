@@ -843,21 +843,21 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	buildstate->hnswarea = NULL;
 }
 
-// /*
-//  * Free resources
-//  */
-// static void
-// FreeBuildState(HnswBuildState * buildstate)
-// {
-// 	/* 新增：解除 CXL 映射 */
-//     if (buildstate->use_cxl && buildstate->cxl_base_addr != NULL)
-//     {
-//         munmap(buildstate->cxl_base_addr, buildstate->cxl_size);
-//     }
+/*
+ * Free resources
+ */
+static void
+FreeBuildState(HnswBuildState * buildstate)
+{
+	// /* 新增：解除 CXL 映射 */
+    // if (buildstate->use_cxl && buildstate->cxl_base_addr != NULL)
+    // {
+    //     munmap(buildstate->cxl_base_addr, buildstate->cxl_size);
+    // }
 
-// 	MemoryContextDelete(buildstate->graphCtx);
-// 	MemoryContextDelete(buildstate->tmpCtx);
-// }
+	MemoryContextDelete(buildstate->graphCtx);
+	MemoryContextDelete(buildstate->tmpCtx);
+}
 
 /*
  * Within leader, wait for end of heap scan
