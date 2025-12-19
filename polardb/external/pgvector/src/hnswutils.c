@@ -512,27 +512,6 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 		Datum		value = datumCopy(PointerGetDatum(&etup->data), false, -1);
 
 		HnswPtrStore(base, element->value, DatumGetPointer(value));
-
-		/* === SQ8 量化填充逻辑 START === */
-        /* 分配内存 */
-        Vector *vec = (Vector *) DatumGetPointer(value);
-        int dim = vec->dim;
-        
-        /* 1. 给 dataSq 分配内存 */
-        /* 注意：这里使用 CurrentMemoryContext 或者和 element 相同的上下文 */
-        /* 为了简单，我们先用 palloc，PG 会自动管理内存释放 */
-        element->dataSq = (uint8 *) palloc(dim * sizeof(uint8));
-
-        /* 2. 获取 half 指针 */
-        half *hvec = (half *) vec->x;
-
-        /* 3. 循环转换 */
-        for (int i = 0; i < dim; i++)
-        {
-            float val = HalfToFloat4(hvec[i]);
-            element->dataSq[i] = float_to_u8(val);
-        }
-        /* === SQ8 量化填充逻辑 END === */
 	}
 }
 
@@ -850,30 +829,6 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	int			unvisitedLength;
 	bool		inMemory = index == NULL;
 
-	/* === SQ8: 在搜索开始前，量化查询向量 === */
-    /* 只有当 q 有值，且还没量化过时，才执行 */
-    bool free_q_sq = false; /* 标记是否需要我们释放 */
-	int dim = 0;
-	
-    if (q->value != (Datum) 0 && q->dataSq == NULL)
-    {
-        Vector *vec = DatumGetVector(q->value);
-        int dim = vec->dim;
-        half *hvec = (half *) vec->x;
-
-        /* 分配内存 */
-        q->dataSq = (uint8 *) palloc(dim * sizeof(uint8));
-        free_q_sq = true; /* 标记：是我申请的，我负责释放 */
-
-        /* 转换 */
-        for (int i = 0; i < dim; i++)
-        {
-            /* 确保 float_to_u8 和 HalfToFloat4 可用 */
-            q->dataSq[i] = float_to_u8(HalfToFloat4(hvec[i]));
-        }
-    }
-    /* ======================================== */
-
 	if (v == NULL)
 	{
 		v = &vh;
@@ -987,18 +942,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			if (inMemory)
 			{
 				eElement = unvisited[i].element;
-				/* === SQ8 核心加速点: 替换 GetElementDistance === */
-                if (eElement->dataSq != NULL && q->dataSq != NULL)
-                {
-                    /* 走极速 AVX2 通道 */
-                    eDistance = (double) l2_distance_sq8(eElement->dataSq, q->dataSq, dim);
-                }
-                else
-                {
-                    /* 兜底走老通道 */
-                    eDistance = GetElementDistance(base, eElement, q, support);
-                }
-                /* =========================================== */
+
+                eDistance = GetElementDistance(base, eElement, q, support);
 			}
 			else
 			{
@@ -1063,14 +1008,6 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 		w = lappend(w, sc);
 	}
-
-	/* === SQ8: 清理内存 === */
-    if (free_q_sq && q->dataSq != NULL)
-    {
-        pfree(q->dataSq);
-        q->dataSq = NULL; /* 防止野指针 */
-    }
-    /* =================== */
 
 	return w;
 }
