@@ -573,21 +573,46 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 		HnswPtrStore(base, element->value, DatumGetPointer(value));
 
 		/* === SQ8 注入点：加载时顺便量化 === */
-        Vector *vec = (Vector *) DatumGetPointer(value);
-        if (vec->dim == 200) /* 只针对 200 维处理，安全 */
-        {
-            /* 使用 malloc 或 palloc 均可，这里跟随 PG 内存上下文 */
-            element->dataSq = (uint8 *) MemoryContextAlloc(CurrentMemoryContext, vec->dim * sizeof(uint8));
-            
-            half *hvec = (half *) vec->x;
-            for (int i = 0; i < vec->dim; i++)
-                element->dataSq[i] = float_to_u8(HalfToFloat4(hvec[i]));
-        }
-        else
-        {
-            element->dataSq = NULL;
-        }
-        /* ================================ */
+          // 判断向量类型：检查是否为halfvec类型
+          // 通过检查第一个4字节是否符合halfvec的binary格式特征来判断
+          char *raw_data = (char *) DatumGetPointer(value);
+          int16 dim = *(int16 *)(raw_data + 4);  // 跳过vl_len_，读取dim字段
+
+          if (dim == 200) /* 只针对 200 维处理，安全 */
+          {
+              /* 使用 malloc 或 palloc 均可，这里跟随 PG 内存上下文 */
+              element->dataSq = (uint8 *) MemoryContextAlloc(CurrentMemoryContext, dim * sizeof(uint8));
+
+              // 检查类型标识符：通过比较vector类型表或调用类型检查函数
+              // 由于我们在HnswLoadElementFromTuple中无法直接获取类型信息，
+              // 我们通过更安全的方式来判断
+
+              // 方法1: 检查数据大小来推断类型
+              Size data_size = VARSIZE_ANY(raw_data);
+              Size expected_vector_size = offsetof(Vector, x) + dim * sizeof(float);
+              Size expected_halfvec_size = offsetof(HalfVector, x) + dim * sizeof(half);
+
+              if (data_size == expected_halfvec_size) {
+                  // 这是HalfVector类型
+                  HalfVector *hvec = (HalfVector *) raw_data;
+                  for (int i = 0; i < dim; i++)
+                      element->dataSq[i] = float_to_u8(HalfToFloat4(hvec->x[i]));
+              } else if (data_size == expected_vector_size) {
+                  // 这是Vector类型
+                  Vector *vec = (Vector *) raw_data;
+                  for (int i = 0; i < dim; i++)
+                      element->dataSq[i] = float_to_u8(vec->x[i]);
+              } else {
+                  // 未知类型，不进行量化
+                  pfree(element->dataSq);
+                  element->dataSq = NULL;
+              }
+          }
+          else
+          {
+              element->dataSq = NULL;
+          }
+          /* ================================ */
 
 	}
 }

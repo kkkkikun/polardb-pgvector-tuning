@@ -28,6 +28,7 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	HnswGetMetaPageInfo(index, &m, &entryPoint);
 
 	q->value = value;
+	q->dataSq = NULL;
 	so->m = m;
 
 	if (entryPoint == NULL)
