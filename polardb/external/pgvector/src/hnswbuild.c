@@ -53,15 +53,15 @@
 #include "tcop/tcopprot.h"
 #include "utils/datum.h"
 #include "utils/memutils.h"
-/* === 探测逻辑：头文件与全局变量 === */
+// /* === 探测逻辑：头文件与全局变量 === */
 #include "halfutils.h" /* 必须包含 */
 #include "vector.h"    /* 必须包含 */
-#include <stdio.h>     /* 用于 fprintf */
+// #include <stdio.h>     /* 用于 fprintf */
 
-static float global_probe_min = 1e30f;
-static float global_probe_max = -1e30f;
-static long  global_probe_count = 0;
-/* ================================= */
+// static float global_probe_min = 1e30f;
+// static float global_probe_max = -1e30f;
+// static long  global_probe_count = 0;
+// /* ================================= */
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
@@ -587,30 +587,30 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
 	if (isnull[0])
 		return;
 
-	/* === 探测逻辑 START === */
-    if (global_probe_count < 100000)
-    {
-        Vector *vec = DatumGetVector(values[0]);
-        int dim = vec->dim;
-        half *hvec = (half *) vec->x;
+	// /* === 探测逻辑 START === */
+    // if (global_probe_count < 100000)
+    // {
+    //     Vector *vec = DatumGetVector(values[0]);
+    //     int dim = vec->dim;
+    //     half *hvec = (half *) vec->x;
 
-        for (int i = 0; i < dim; i++)
-        {
-            float val = HalfToFloat4(hvec[i]); /* 确保使用正确的转换函数 */
-            if (val < global_probe_min) global_probe_min = val;
-            if (val > global_probe_max) global_probe_max = val;
-        }
+    //     for (int i = 0; i < dim; i++)
+    //     {
+    //         float val = HalfToFloat4(hvec[i]); /* 确保使用正确的转换函数 */
+    //         if (val < global_probe_min) global_probe_min = val;
+    //         if (val > global_probe_max) global_probe_max = val;
+    //     }
 
-        global_probe_count++;
+    //     global_probe_count++;
 
-        /* === 关键修改：攒够了直接报错，强行把数据吐出来 === */
-        if (global_probe_count == 100000)
-        {
-            /* 使用 ERROR 级别，这会导致构建中断，但一定会打印日志！ */
-            elog(ERROR, "DATA PROBE SUCCESS: MIN=%f, MAX=%f", global_probe_min, global_probe_max);
-        }
-    }
-    /* === 探测逻辑 END === */
+    //     /* === 关键修改：攒够了直接报错，强行把数据吐出来 === */
+    //     if (global_probe_count == 100000)
+    //     {
+    //         /* 使用 ERROR 级别，这会导致构建中断，但一定会打印日志！ */
+    //         elog(ERROR, "DATA PROBE SUCCESS: MIN=%f, MAX=%f", global_probe_min, global_probe_max);
+    //     }
+    // }
+    // /* === 探测逻辑 END === */
 
 	/* Use memory context */
 	oldCtx = MemoryContextSwitchTo(buildstate->tmpCtx);

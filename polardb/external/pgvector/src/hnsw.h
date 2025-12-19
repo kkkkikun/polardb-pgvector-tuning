@@ -21,6 +21,9 @@
 #define HNSW_TYPE_INFO_PROC 3
 
 #define HNSW_VERSION	1
+// /* 新增：CXL 设备路径和标志 */
+// #define CXL_DEVICE_PATH "/dev/dax0.0" 
+// #define HNSW_CXL_MAGIC 0x43584C20  /* "CXL " 的十六进制 */
 #define HNSW_MAGIC_NUMBER 0xA953A953
 #define HNSW_PAGE_ID	0xFF90
 
@@ -151,6 +154,8 @@ struct HnswElementData
 	BlockNumber neighborPage;
 	DatumPtr	value;
 	LWLock		lock;
+	/* === 新增：存放量化后的数据 === */
+    uint8      *dataSq;
 } __attribute__((aligned(64))); //强制每个节点在内存中按照 64 字节（CPU Cache Line 大小）对齐。这样当 CPU 读取一个节点时，能一次性把该节点的关键信息（neighbors 指针、value 指针等）全部读入一级缓存，减少读取次数。
 
 typedef HnswElementData * HnswElement;
@@ -261,6 +266,8 @@ typedef struct HnswSupport
 typedef struct HnswQuery
 {
 	Datum		value;
+	/* === 新增：量化后的查询向量 === */
+    uint8      *dataSq;
 }			HnswQuery;
 
 typedef struct HnswBuildState
@@ -299,6 +306,10 @@ typedef struct HnswBuildState
 	HnswLeader *hnswleader;
 	HnswShared *hnswshared;
 	char	   *hnswarea;
+	/* 新增：CXL 专用状态 */
+    // void       *cxl_base_addr;  /* CXL 内存映射的起始地址 */
+    // Size        cxl_size;       /* 已映射的大小 */
+    // bool        use_cxl;        /* 是否成功启用 CXL */
 }			HnswBuildState;
 
 typedef struct HnswMetaPageData
@@ -378,6 +389,9 @@ typedef struct HnswScanOpaqueData
 
 	/* Support functions */
 	HnswSupport support;
+
+	// /* 新增：查询时的 CXL 基地址 */
+    // char       *cxl_base;
 }			HnswScanOpaqueData;
 
 typedef HnswScanOpaqueData * HnswScanOpaque;
