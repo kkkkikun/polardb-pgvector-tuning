@@ -1,25 +1,9 @@
 // 开启 AVX512 基础指令、位运算和字节/字扩展
 // #define TARGET_AVX512 __attribute__((target("avx512f,avx512vl,avx512bw,avx512dq,fma")))
-
-/* =========================================================
- * 暴力开启 AVX-512 支持
- * 原因：Makefile 的 flag 被 LLVM 编译流程吞了，必须在这里手动定义
- * ========================================================= */
-
-/* 1. 先手动定义宏，骗过 <immintrin.h> 让它暴露 __m512i 类型 */
-#ifndef __AVX512F__
-#define __AVX512F__ 1
-#endif
-#ifndef __AVX512BW__
-#define __AVX512BW__ 1
-#endif
-#ifndef __AVX512VL__
-#define __AVX512VL__ 1
-#endif
 /* 强制开启 AVX-512F (基础) 和 AVX-512BW (字节/字指令) */
-#pragma GCC target("avx512f,avx512bw")
 #include "postgres.h"
-
+/* 1. 定义宏：让 <immintrin.h> 乖乖交出 __m512i 类型定义 */
+#include <immintrin.h>
 #include <math.h>
 
 #include "access/generic_xlog.h"
