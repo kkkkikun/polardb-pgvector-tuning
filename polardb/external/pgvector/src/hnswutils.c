@@ -740,9 +740,12 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 
 			if (VARSIZE_ANY_EXHDR(index_vec) >= q_size)
 			{
-				/* 量化格式：使用优化的距离计算 */
+				/* 量化格式：使用优化的距离计算
+				 * ⚠️ 关键修正：必须传入 index_vec (Tuple Header)，不能传 index_vec->x
+				 * 因为 HnswGetDistanceOptimized 期望从 Offset 0 开始解析
+				 */
 				result = HnswGetDistanceOptimized(PointerGetDatum(query_vec),
-												  PointerGetDatum(index_vec->x),
+												  PointerGetDatum(index_vec), /* <--- 去掉了 ->x */
 												  support);
 			}
 			else
