@@ -682,61 +682,84 @@ HnswGetDistance(Datum a, Datum b, HnswSupport * support)
 static void
 HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element)
 {
-	Buffer		buf;
-	Page		page;
-	HnswElementTuple etup;
+    Buffer      buf;
+    Page        page;
+    HnswElementTuple etup;
 
-	/* Read vector */
-	buf = ReadBuffer(index, blkno);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	page = BufferGetPage(buf);
+    /* Read vector */
+    buf = ReadBuffer(index, blkno);
+    LockBuffer(buf, BUFFER_LOCK_SHARE);
+    page = BufferGetPage(buf);
 
-	etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
+    etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
 
-	Assert(HnswIsElementTuple(etup));
+    Assert(HnswIsElementTuple(etup));
 
-	/* Calculate distance */
-	if (distance != NULL)
-	{
-		if (DatumGetPointer(q->value) == NULL)
-			*distance = 0;
-		else
-		{
-			/* === 比赛专用 Hack：量化距离计算 === */
-			Vector	   *query_vec = DatumGetVector(q->value);
-			Vector	   *index_vec = (Vector *) & etup->data;
-			float		result;
+    /* Calculate distance */
+    if (distance != NULL)
+    {
+        if (DatumGetPointer(q->value) == NULL)
+            *distance = 0;
+        else
+        {
+            /* === 比赛专用 Hack：量化距离计算 === */
+            Vector     *query_vec = DatumGetVector(q->value);
+            /* 注意：etup->data 是变长数组起始位置，强转为 Vector* 是为了获取头部信息 */
+            Vector     *index_vec = (Vector *) & etup->data;
+            float       result;
 
-			/* 检查是否为量化格式（通过空间大小判断） */
-			Size		q_size = HNSW_QV_SIZE(query_vec->dim);
+            /* * 1. 精确计算期望的量化大小 
+             * Payload = Scale(4) + Bias(4) + Data(dim) = 8 + dim
+             * Vector Overhead (在 VARSIZE_ANY_EXHDR 中包含) = dim(2) + unused(2) = 4
+             * Total Expected = 12 + dim
+             */
+            Size payload_size = sizeof(float) * 2 + query_vec->dim;
+            Size vec_overhead = sizeof(int16) + sizeof(uint16); /* dim + unused */
+            Size expected_size = vec_overhead + payload_size;
+            
+            /* 获取实际存储的数据大小 (不含 varlena 4字节头部) */
+            Size actual_size = VARSIZE_ANY_EXHDR(index_vec);
 
-			if (VARSIZE_ANY_EXHDR(index_vec) >= q_size)
-			{
-				/* 量化格式：现在index_vec是合法的Vector，可以安全传入 */
-				result = HnswGetDistanceOptimized(PointerGetDatum(query_vec),
-                                    PointerGetDatum(index_vec), 
-                                    support);
-			}
-			else
-			{
-				/* 非量化格式：使用原始计算 */
-				result = (float) HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
-			}
+            /* [DEBUG 探针] 打印大小检查结果 (提交时可保留，用于排查) */
+            /* 如果你在服务器日志看到 [FALLBACK]，说明这就是 Recall 0 的原因 */
+            fprintf(stderr, "[CHECK] Dim=%d, Actual=%zu, Expected=%zu\n", 
+                    query_vec->dim, actual_size, expected_size);
 
-			*distance = result;
-		}
-	}
+            /* 2. 检查是否为量化格式 */
+            /* 只要实际大小足够容纳 Payload，就认为是 SQ8 */
+            if (actual_size >= expected_size)
+            {
+                /* 量化格式：现在index_vec是合法的Vector，可以安全传入 */
+                /* 注意：必须传入 PointerGetDatum(index_vec)，它是头部指针 */
+                result = HnswGetDistanceOptimized(PointerGetDatum(query_vec),
+                                                  PointerGetDatum(index_vec), 
+                                                  support);
+            }
+            else
+            {
+                /* [DEBUG 探针] 警告：回退到慢速路径 */
+                fprintf(stderr, "[FALLBACK] Size mismatch! Actual(%zu) < Expected(%zu). using slow path.\n", 
+                        actual_size, expected_size);
 
-	/* Load element */
-	if (distance == NULL || maxDistance == NULL || *distance < *maxDistance)
-	{
-		if (*element == NULL)
-			*element = HnswInitElementFromBlock(blkno, offno);
+                /* 非量化格式：使用原始计算 */
+                /* 警告：如果数据其实是 SQ8 但误入了这里，计算结果就是错的 (Recall=0) */
+                result = (float) HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
+            }
 
-		HnswLoadElementFromTuple(*element, etup, true, loadVec);
-	}
+            *distance = result;
+        }
+    }
 
-	UnlockReleaseBuffer(buf);
+    /* Load element */
+    if (distance == NULL || maxDistance == NULL || *distance < *maxDistance)
+    {
+        if (*element == NULL)
+            *element = HnswInitElementFromBlock(blkno, offno);
+
+        HnswLoadElementFromTuple(*element, etup, true, loadVec);
+    }
+
+    UnlockReleaseBuffer(buf);
 }
 
 /*
