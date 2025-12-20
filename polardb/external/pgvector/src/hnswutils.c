@@ -103,16 +103,18 @@ __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
 static float
 HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
 {
-    /* 1. 准备 Query 向量 (half -> float) */
+    /* C90 变量声明 */
     Vector     *query = DatumGetVector(v1);
     int         dim = query->dim;
     float       query_f[2048];
     half       *h_query;
     int         i;
+    
+    char       *ptr;
     float       scale;
     float       bias;
     uint8_t    *data;
-    HnswQuantizedTuple *node;
+
     __m512      v_scale;
     __m512      v_bias;
     __m512      v_sum;
@@ -124,30 +126,30 @@ HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
     __m512      v_q;
     __m512      v_diff;
 
+    /* 1. Query 转换 (Half -> Float) */
     h_query = (half *)query->x;
     for(i = 0; i < dim; i++) {
         query_f[i] = HalfToFloat4(h_query[i]);
     }
 
-    /* 2. 解析 Index 向量 (v2)
-     * v2 传入时指向完整的 HnswQuantizedTuple 结构
+    /* 2. Index 解析 (关键修正) */
+    /* * v2 传入时，实际上已经跳过了 8 字节的 Header (TID + Unused)。
+     * 所以 v2 直接指向 Scale。
      */
-    node = (HnswQuantizedTuple *)DatumGetPointer(v2);
-
-    /* * 正确的内存布局：
-     * HnswQuantizedTuple {
-     *     ItemPointerData heaptid;  // 6 bytes
-     *     uint16_t unused;          // 2 bytes
-     *     float scale;              // 4 bytes <- offset 8
-     *     float bias;               // 4 bytes <- offset 12
-     *     uint8_t data[dim];        // dim bytes <- offset 16
-     * }
+    ptr = (char *)DatumGetPointer(v2);
+    
+    /* * 内存布局解析：
+     * ptr + 0 : Scale (4 bytes)
+     * ptr + 4 : Bias  (4 bytes)
+     * ptr + 8 : Data  (Uint8...)
      */
-    scale = node->scale;
-    bias = node->bias;
-    data = node->data;             /* <--- 直接访问数据数组 */
+    
+    /* 直接强转读取，不使用结构体，避免偏移量误判 */
+    scale = *((float *)(ptr));
+    bias  = *((float *)(ptr + 4));
+    data  = (uint8_t *)(ptr + 8);
 
-    /* 3. AVX-512 极速计算 */
+    /* 3. AVX-512 计算 */
     v_scale = _mm512_set1_ps(scale);
     v_bias  = _mm512_set1_ps(bias);
     v_sum   = _mm512_setzero_ps();
