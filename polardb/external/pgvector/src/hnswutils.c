@@ -150,11 +150,11 @@ __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
 static float
 HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
 {
-    /* C90 规定：所有变量声明必须在最前面 */
+    /* 1. 准备 Query 向量 (half -> float) */
     Vector     *query = DatumGetVector(v1);
     int         dim = query->dim;
     float       query_f[2048];
-    half       *h_query;      /* 修正：使用小写 half */
+    half       *h_query;
     int         i;
     char       *ptr;
     float      *p_scale;
@@ -172,45 +172,41 @@ HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
     __m512      v_q;
     __m512      v_diff;
 
-    /* 1. 准备 Query 向量 (half -> float) */
-    h_query = (half *)query->x; /* 修正：使用小写 half */
+    h_query = (half *)query->x;
     for(i = 0; i < dim; i++) {
         query_f[i] = HalfToFloat4(h_query[i]);
     }
 
-    /* 2. 准备 Index 向量 (v2) */
-    /* v2 指向 HnswIndexTuple，我们手动解析 */
+    /* 2. 解析 Index 向量 (v2) 
+     * v2 传入时已经是剥离了 Header 的指针 (指向 Scale)
+     */
     ptr = (char *)DatumGetPointer(v2);
     
-    /* 3. 解析量化数据 (偏移量 8: scale, 12: bias, 16: data) */
-    p_scale = (float *)(ptr + 8);
+    /* * 内存布局修正：
+     * ptr[0-3] : Scale (之前的 offset 8)
+     * ptr[4-7] : Bias  (之前的 offset 12)
+     * ptr[8...] : Data (之前的 offset 16)
+     */
+    p_scale = (float *)ptr;      /* <--- 修正点：不加偏移 */
     scale = *p_scale;
     bias = *(p_scale + 1);
-    data = (uint8_t *)(ptr + 16);
+    data = (uint8_t *)(ptr + 8); /* <--- 修正点：数据在 Scale+Bias 之后 */
 
-    /* 4. AVX-512 极速计算 */
+    /* 3. AVX-512 极速计算 */
     v_scale = _mm512_set1_ps(scale);
     v_bias  = _mm512_set1_ps(bias);
     v_sum   = _mm512_setzero_ps();
 
     for (i = 0; i <= dim - 16; i += 16) {
-        /* 加载 16个 uint8 */
         v_u8 = _mm_loadu_si128((const __m128i *)&data[i]);
-        
-        /* 转换 u8 -> i32 -> float */
         v_i32 = _mm512_cvtepu8_epi32(v_u8);
         v_f_idx = _mm512_cvtepi32_ps(v_i32);
-        
-        /* 还原数值: scale * val + bias */
         v_rec = _mm512_fmadd_ps(v_f_idx, v_scale, v_bias);
-        
-        /* 计算欧氏距离 */
         v_q = _mm512_loadu_ps(&query_f[i]);
         v_diff = _mm512_sub_ps(v_q, v_rec);
         v_sum = _mm512_fmadd_ps(v_diff, v_diff, v_sum);
     }
     
-    /* 处理剩余尾部 */
     if (i < dim) {
         mask = (1U << (dim - i)) - 1;
         v_u8 = _mm_mask_loadu_epi8(_mm_setzero_si128(), mask, &data[i]);
