@@ -2,12 +2,14 @@
 
 #include <float.h>
 #include <math.h>
+#include <immintrin.h>		/* 必须引入这个头文件 */
 
 #include "access/amapi.h"
 #include "access/reloptions.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "hnsw.h"
+#include "halfutils.h"
 #include "miscadmin.h"
 #include "utils/float.h"
 #include "utils/guc.h"
@@ -17,6 +19,124 @@
 #if PG_VERSION_NUM < 150000
 #define MarkGUCPrefixReserved(x) EmitWarningsOnPlaceholders(x)
 #endif
+
+/* ================== 比赛专用 Hack 结构 ================== */
+
+/*
+ * 压缩后的 HNSW 节点结构
+ * 内存布局: [Header 6B] [Padding 2B] [Scale 4B] [Bias 4B] [Uint8 Data...]
+ * 总开销: 16字节头部 + 维度字节数
+ */
+typedef struct HnswQuantizedTuple
+{
+	ItemPointerData heaptid;	/* 6 bytes (pgvector 原有字段) */
+	uint16_t		unused;		/* 2 bytes (凑齐 8 字节对齐，防 crash) */
+	float			scale;		/* 量化参数 Scale */
+	float			bias;		/* 量化参数 Bias */
+	uint8_t			data[FLEXIBLE_ARRAY_MEMBER];	/* 变长数组 */
+} HnswQuantizedTuple;
+
+/* 计算存储所需大小的宏 */
+#define HNSW_QV_SIZE(dim) (offsetof(HnswQuantizedTuple, data) + (dim) * sizeof(uint8_t))
+
+/* ======================================================= */
+
+/* 将原始向量压缩为 HnswQuantizedTuple 格式 */
+static void
+QuantizeVector(Vector *vec, HnswQuantizedTuple *dest)
+{
+	int				dim = vec->dim;
+	half		   *v_data = (half *) vec->x;
+
+	/* 1. 扫描找 Min/Max */
+	float			min_v = 1e30f;
+	float			max_v = -1e30f;
+
+	for (int i = 0; i < dim; i++)
+	{
+		float		val = HalfToFloat4(v_data[i]);
+		if (val < min_v)
+			min_v = val;
+		if (val > max_v)
+			max_v = val;
+	}
+
+	/* 2. 计算参数 */
+	float			scale = (max_v - min_v) / 255.0f;
+	float			bias = min_v;
+
+	dest->scale = scale;
+	dest->bias = bias;
+
+	/* 3. 压缩 */
+	if (scale == 0.0f)
+	{
+		memset(dest->data, 0, dim);
+	}
+	else
+	{
+		float		inv_scale = 1.0f / scale;
+
+		for (int i = 0; i < dim; i++)
+		{
+			float		val = HalfToFloat4(v_data[i]);
+			int32_t		q = (int32_t) ((val - bias) * inv_scale + 0.5f);
+
+			if (q < 0)
+				q = 0;
+			if (q > 255)
+				q = 255;
+			dest->data[i] = (uint8_t) q;
+		}
+	}
+}
+
+/*
+ * 核心函数：计算 Float Query 与 Uint8 Index 的 L2 距离
+ * 你的 CPU 支持 avx512bw，可以直接用 _mm512_cvtepu8_epi32
+ */
+static float
+l2_sq8_avx512(const float *query, const HnswQuantizedTuple *node, int dim)
+{
+	__m512			v_scale = _mm512_set1_ps(node->scale);
+	__m512			v_bias = _mm512_set1_ps(node->bias);
+	__m512			v_sum = _mm512_setzero_ps();
+
+	int				i = 0;
+
+	/* 每次处理 16 个维度 */
+	for (; i <= dim - 16; i += 16)
+	{
+		/* 1. 加载 16 byte (Uint8) */
+		__m128i		v_u8 = _mm_loadu_si128((const __m128i *) & node->data[i]);
+
+		/* 2. 转换 Uint8 -> Int32 (AVX512BW) -> Float */
+		__m512i		v_i32 = _mm512_cvtepu8_epi32(v_u8);
+		__m512		v_f_idx = _mm512_cvtepi32_ps(v_i32);
+
+		/* 3. 还原: scale * val + bias */
+		__m512		v_rec = _mm512_fmadd_ps(v_f_idx, v_scale, v_bias);
+
+		/* 4. 计算距离 */
+		__m512		v_q = _mm512_loadu_ps(&query[i]);
+		__m512		v_diff = _mm512_sub_ps(v_q, v_rec);
+		v_sum = _mm512_fmadd_ps(v_diff, v_diff, v_sum);
+	}
+
+	/* 处理剩余维度 (0-15个) */
+	if (i < dim)
+	{
+		__mmask16		mask = (1U << (dim - i)) - 1;
+		__m128i		v_u8 = _mm_mask_loadu_epi8(_mm_setzero_si128(), mask, &node->data[i]);
+		__m512i		v_i32 = _mm512_cvtepu8_epi32(v_u8);
+		__m512		v_rec = _mm512_fmadd_ps(_mm512_cvtepi32_ps(v_i32), v_scale, v_bias);
+		__m512		v_q = _mm512_mask_loadu_ps(_mm512_setzero_ps(), mask, &query[i]);
+		__m512		v_diff = _mm512_sub_ps(v_q, v_rec);
+		v_sum = _mm512_mask3_fmadd_ps(v_diff, v_diff, v_sum, mask);
+	}
+
+	return _mm512_reduce_add_ps(v_sum);
+}
 
 static const struct config_enum_entry hnsw_iterative_scan_options[] = {
 	{"off", HNSW_ITERATIVE_SCAN_OFF, false},

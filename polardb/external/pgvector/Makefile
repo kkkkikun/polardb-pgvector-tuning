@@ -12,7 +12,9 @@ REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
 REGRESS_OPTS = --inputdir=test --load-extension=$(EXTENSION)
 
 # To compile for portability, run: make OPTFLAGS=""
-OPTFLAGS = -march=native -mtune=native -mavx512f -mavx512dq -mavx512vl -mavx512bw -funroll-loops
+# 强制开启针对你机器的所有 AVX512 优化
+# -mavx512bw 是关键，它支持 byte 到 int 的快速转换
+override CFLAGS += -march=native -O3 -funroll-loops -mavx512f -mavx512vl -mavx512bw -mavx512dq
 
 # Mac ARM doesn't always support -march=native
 ifeq ($(shell uname -s), Darwin)
@@ -30,7 +32,7 @@ endif
 # For auto-vectorization:
 # - GCC (needs -ftree-vectorize OR -O3) - https://gcc.gnu.org/projects/tree-ssa/vectorization.html
 # - Clang (could use pragma instead) - https://llvm.org/docs/Vectorizers.html
-override PG_CFLAGS += $(OPTFLAGS) -mfma -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
+override PG_CFLAGS += -O3 -mfma -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
 
 all: sql/$(EXTENSION)--$(EXTVERSION).sql
 

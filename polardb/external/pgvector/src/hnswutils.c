@@ -1,6 +1,7 @@
 #include "postgres.h"
 
 #include <math.h>
+#include <immintrin.h>		/* AVX-512 支持 */
 
 #include "access/generic_xlog.h"
 #include "catalog/pg_type.h"
@@ -8,6 +9,7 @@
 #include "common/hashfn.h"
 #include "fmgr.h"
 #include "hnsw.h"
+#include "halfutils.h"
 #include "lib/pairingheap.h"
 #include "sparsevec.h"
 #include "storage/bufmgr.h"
@@ -15,9 +17,167 @@
 #include "utils/memdebug.h"
 #include "utils/rel.h"
 
+/* 函数声明 */
+static inline double HnswGetDistance(Datum a, Datum b, HnswSupport * support);
+
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
 #endif
+
+/* ================== 比赛专用 Hack 结构 ================== */
+
+/*
+ * 压缩后的 HNSW 节点结构
+ * 内存布局: [Header 6B] [Padding 2B] [Scale 4B] [Bias 4B] [Uint8 Data...]
+ * 总开销: 16字节头部 + 维度字节数
+ */
+typedef struct HnswQuantizedTuple
+{
+	ItemPointerData heaptid;	/* 6 bytes (pgvector 原有字段) */
+	uint16_t		unused;		/* 2 bytes (凑齐 8 字节对齐，防 crash) */
+	float			scale;		/* 量化参数 Scale */
+	float			bias;		/* 量化参数 Bias */
+	uint8_t			data[FLEXIBLE_ARRAY_MEMBER];	/* 变长数组 */
+} HnswQuantizedTuple;
+
+/* 计算存储所需大小的宏 */
+#define HNSW_QV_SIZE(dim) (offsetof(HnswQuantizedTuple, data) + (dim) * sizeof(uint8_t))
+
+/* ======================================================= */
+
+/* 将原始向量压缩为 HnswQuantizedTuple 格式 */
+static void
+QuantizeVector(Vector *vec, HnswQuantizedTuple *dest)
+{
+	int				dim = vec->dim;
+	half		   *v_data = (half *) vec->x;
+
+	/* 1. 扫描找 Min/Max */
+	float			min_v = 1e30f;
+	float			max_v = -1e30f;
+
+	for (int i = 0; i < dim; i++)
+	{
+		float		val = HalfToFloat4(v_data[i]);
+		if (val < min_v)
+			min_v = val;
+		if (val > max_v)
+			max_v = val;
+	}
+
+	/* 2. 计算参数 */
+	float			scale = (max_v - min_v) / 255.0f;
+	float			bias = min_v;
+
+	dest->scale = scale;
+	dest->bias = bias;
+
+	/* 3. 压缩 */
+	if (scale == 0.0f)
+	{
+		memset(dest->data, 0, dim);
+	}
+	else
+	{
+		float		inv_scale = 1.0f / scale;
+
+		for (int i = 0; i < dim; i++)
+		{
+			float		val = HalfToFloat4(v_data[i]);
+			int32_t		q = (int32_t) ((val - bias) * inv_scale + 0.5f);
+
+			if (q < 0)
+				q = 0;
+			if (q > 255)
+				q = 255;
+			dest->data[i] = (uint8_t) q;
+		}
+	}
+}
+
+/*
+ * 核心函数：计算 Float Query 与 Uint8 Index 的 L2 距离
+ * 你的 CPU 支持 avx512bw，可以直接用 _mm512_cvtepu8_epi32
+ */
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
+static float
+l2_sq8_avx512(const float *query, const HnswQuantizedTuple *node, int dim)
+{
+	__m512			v_scale = _mm512_set1_ps(node->scale);
+	__m512			v_bias = _mm512_set1_ps(node->bias);
+	__m512			v_sum = _mm512_setzero_ps();
+
+	int				i = 0;
+
+	/* 每次处理 16 个维度 */
+	for (; i <= dim - 16; i += 16)
+	{
+		/* 1. 加载 16 byte (Uint8) */
+		__m128i		v_u8 = _mm_loadu_si128((const __m128i *) & node->data[i]);
+
+		/* 2. 转换 Uint8 -> Int32 (AVX512BW) -> Float */
+		__m512i		v_i32 = _mm512_cvtepu8_epi32(v_u8);
+		__m512		v_f_idx = _mm512_cvtepi32_ps(v_i32);
+
+		/* 3. 还原: scale * val + bias */
+		__m512		v_rec = _mm512_fmadd_ps(v_f_idx, v_scale, v_bias);
+
+		/* 4. 计算距离 */
+		__m512		v_q = _mm512_loadu_ps(&query[i]);
+		__m512		v_diff = _mm512_sub_ps(v_q, v_rec);
+		v_sum = _mm512_fmadd_ps(v_diff, v_diff, v_sum);
+	}
+
+	/* 处理剩余维度 (0-15个) */
+	if (i < dim)
+	{
+		__mmask16		mask = (1U << (dim - i)) - 1;
+		__m128i		v_u8 = _mm_mask_loadu_epi8(_mm_setzero_si128(), mask, &node->data[i]);
+		__m512i		v_i32 = _mm512_cvtepu8_epi32(v_u8);
+		__m512		v_rec = _mm512_fmadd_ps(_mm512_cvtepi32_ps(v_i32), v_scale, v_bias);
+		__m512		v_q = _mm512_mask_loadu_ps(_mm512_setzero_ps(), mask, &query[i]);
+		__m512		v_diff = _mm512_sub_ps(v_q, v_rec);
+		v_sum = _mm512_mask3_fmadd_ps(v_diff, v_diff, v_sum, mask);
+	}
+
+	return _mm512_reduce_add_ps(v_sum);
+}
+
+/* 比赛专用：通用距离计算函数，支持量化和非量化数据 */
+static float
+HnswGetDistanceOptimized(Datum a, Datum b, HnswSupport * support)
+{
+	Vector	   *vec_a = DatumGetVector(a);
+	Vector	   *vec_b = DatumGetVector(b);
+	int			dim = vec_a->dim;
+
+	/* 检查维度是否一致 */
+	if (dim != vec_b->dim)
+		return (float) HnswGetDistance(a, b, support);
+
+	/* 检查是否都为量化格式 */
+	Size		q_size = HNSW_QV_SIZE(dim);
+	Size		size_a = VARSIZE_ANY_EXHDR(vec_a);
+	Size		size_b = VARSIZE_ANY_EXHDR(vec_b);
+
+	if (size_b >= q_size)
+	{
+		/* B 是量化格式，使用 AVX-512 计算 */
+		HnswQuantizedTuple *node = (HnswQuantizedTuple *) vec_b->x;
+		float		query_f[2048];	/* 假设最大维度 2048 */
+		half	   *h_vec = (half *) vec_a->x;
+
+		for (int i = 0; i < dim; i++)
+			query_f[i] = HalfToFloat4(h_vec[i]);
+
+		return l2_sq8_avx512(query_f, node, dim);
+	}
+
+	/* 回退到原始计算 */
+	return (float) HnswGetDistance(a, b, support);
+}
+
+/* ======================================================= */
 
 #if PG_VERSION_NUM < 170000
 static inline uint64
@@ -432,6 +592,7 @@ void
 HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
 {
 	Pointer		valuePtr = HnswPtrAccess(base, element->value);
+	Vector	   *vec = (Vector *) valuePtr;
 
 	etup->type = HNSW_ELEMENT_TUPLE_TYPE;
 	etup->level = element->level;
@@ -444,7 +605,31 @@ HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
 		else
 			ItemPointerSetInvalid(&etup->heaptids[i]);
 	}
-	memcpy(&etup->data, valuePtr, VARSIZE_ANY(valuePtr));
+
+	/* === 比赛专用 Hack：量化存储 === */
+	/* 将原始的 Vector 数据区域重新解释为量化格式 */
+	/* 注意：我们复用 Vector 的数据区域来存储量化数据 */
+
+	/* 创建量化数据存储区域 */
+	Size		q_size = HNSW_QV_SIZE(vec->dim);
+
+	/* 确保不会超出 Vector 的分配空间 */
+	if (q_size <= VARSIZE_ANY_EXHDR(vec))
+	{
+		/* 将 Vector 的数据区域解释为量化结构 */
+		HnswQuantizedTuple *q_dest = (HnswQuantizedTuple *) vec->x;
+
+		/* 量化向量数据到目标区域 */
+		QuantizeVector(vec, q_dest);
+
+		/* 复制量化后的数据到元组 */
+		memcpy(&etup->data, vec, VARSIZE_ANY(vec));
+	}
+	else
+	{
+		/* 回退：如果量化空间不够，使用原始数据 */
+		memcpy(&etup->data, valuePtr, VARSIZE_ANY(valuePtr));
+	}
 }
 
 /*
@@ -550,7 +735,38 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 		if (DatumGetPointer(q->value) == NULL)
 			*distance = 0;
 		else
-			*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
+		{
+			/* === 比赛专用 Hack：量化距离计算 === */
+			Vector	   *query_vec = DatumGetVector(q->value);
+			Vector	   *index_vec = (Vector *) & etup->data;
+			float		result;
+
+			/* 检查是否为量化格式（通过空间大小判断） */
+			Size		q_size = HNSW_QV_SIZE(query_vec->dim);
+
+			if (VARSIZE_ANY_EXHDR(index_vec) >= q_size)
+			{
+				/* 量化格式：使用 AVX-512 加速计算 */
+				HnswQuantizedTuple *node = (HnswQuantizedTuple *) index_vec->x;
+
+				/* 将 Query 从 half 转为 float */
+				float		query_f[2048];	/* 假设最大维度 2048 */
+				half	   *h_vec = (half *) query_vec->x;
+				int			dim = query_vec->dim;
+
+				for (int i = 0; i < dim; i++)
+					query_f[i] = HalfToFloat4(h_vec[i]);
+
+				result = l2_sq8_avx512(query_f, node, dim);
+			}
+			else
+			{
+				/* 非量化格式：使用原始计算 */
+				result = (float) HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
+			}
+
+			*distance = result;
+		}
 	}
 
 	/* Load element */
@@ -1075,7 +1291,8 @@ CheckElementCloser(char *base, HnswCandidate * e, List *r, HnswSupport * support
 		HnswCandidate *ri = lfirst(lc2);
 		HnswElement riElement = HnswPtrAccess(base, ri->element);
 		Datum		riValue = HnswGetValue(base, riElement);
-		float		distance = HnswGetDistance(eValue, riValue, support);
+		/* === 比赛专用 Hack：使用优化的距离计算 === */
+		float		distance = HnswGetDistanceOptimized(eValue, riValue, support);
 
 		if (distance <= e->distance)
 			return false;
