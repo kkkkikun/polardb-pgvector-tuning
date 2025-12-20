@@ -11,6 +11,7 @@
 #include "utils/relptr.h"
 #include "utils/sampling.h"
 #include "vector.h"
+#include "halfvec.h"
 
 #define HNSW_MAX_DIM 2000
 #define HNSW_MAX_NNZ 1000
@@ -517,6 +518,7 @@ typedef struct HnswSQ8Payload {
     uint8_t data[FLEXIBLE_ARRAY_MEMBER];
 } HnswSQ8Payload;
 
+#include "halfutils.h"
 #include <immintrin.h>
 #include <string.h>
 
