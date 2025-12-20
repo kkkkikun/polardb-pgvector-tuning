@@ -39,104 +39,11 @@ typedef struct HnswQuantizedTuple
 /* 计算存储所需大小的宏 */
 #define HNSW_QV_SIZE(dim) (offsetof(HnswQuantizedTuple, data) + (dim) * sizeof(uint8_t))
 
+/* 从 hnswutils.c 引入的外部函数声明 */
+extern void QuantizeVector(Vector *vec, HnswQuantizedTuple *dest);
+extern float l2_sq8_avx512(const float *query, const HnswQuantizedTuple *node, int dim);
+
 /* ======================================================= */
-
-/* 将原始向量压缩为 HnswQuantizedTuple 格式 */
-static void
-QuantizeVector(Vector *vec, HnswQuantizedTuple *dest)
-{
-	int				dim = vec->dim;
-	half		   *v_data = (half *) vec->x;
-
-	/* 1. 扫描找 Min/Max */
-	float			min_v = 1e30f;
-	float			max_v = -1e30f;
-
-	for (int i = 0; i < dim; i++)
-	{
-		float		val = HalfToFloat4(v_data[i]);
-		if (val < min_v)
-			min_v = val;
-		if (val > max_v)
-			max_v = val;
-	}
-
-	/* 2. 计算参数 */
-	float			scale = (max_v - min_v) / 255.0f;
-	float			bias = min_v;
-
-	dest->scale = scale;
-	dest->bias = bias;
-
-	/* 3. 压缩 */
-	if (scale == 0.0f)
-	{
-		memset(dest->data, 0, dim);
-	}
-	else
-	{
-		float		inv_scale = 1.0f / scale;
-
-		for (int i = 0; i < dim; i++)
-		{
-			float		val = HalfToFloat4(v_data[i]);
-			int32_t		q = (int32_t) ((val - bias) * inv_scale + 0.5f);
-
-			if (q < 0)
-				q = 0;
-			if (q > 255)
-				q = 255;
-			dest->data[i] = (uint8_t) q;
-		}
-	}
-}
-
-/*
- * 核心函数：计算 Float Query 与 Uint8 Index 的 L2 距离
- * 你的 CPU 支持 avx512bw，可以直接用 _mm512_cvtepu8_epi32
- */
-static float
-l2_sq8_avx512(const float *query, const HnswQuantizedTuple *node, int dim)
-{
-	__m512			v_scale = _mm512_set1_ps(node->scale);
-	__m512			v_bias = _mm512_set1_ps(node->bias);
-	__m512			v_sum = _mm512_setzero_ps();
-
-	int				i = 0;
-
-	/* 每次处理 16 个维度 */
-	for (; i <= dim - 16; i += 16)
-	{
-		/* 1. 加载 16 byte (Uint8) */
-		__m128i		v_u8 = _mm_loadu_si128((const __m128i *) & node->data[i]);
-
-		/* 2. 转换 Uint8 -> Int32 (AVX512BW) -> Float */
-		__m512i		v_i32 = _mm512_cvtepu8_epi32(v_u8);
-		__m512		v_f_idx = _mm512_cvtepi32_ps(v_i32);
-
-		/* 3. 还原: scale * val + bias */
-		__m512		v_rec = _mm512_fmadd_ps(v_f_idx, v_scale, v_bias);
-
-		/* 4. 计算距离 */
-		__m512		v_q = _mm512_loadu_ps(&query[i]);
-		__m512		v_diff = _mm512_sub_ps(v_q, v_rec);
-		v_sum = _mm512_fmadd_ps(v_diff, v_diff, v_sum);
-	}
-
-	/* 处理剩余维度 (0-15个) */
-	if (i < dim)
-	{
-		__mmask16		mask = (1U << (dim - i)) - 1;
-		__m128i		v_u8 = _mm_mask_loadu_epi8(_mm_setzero_si128(), mask, &node->data[i]);
-		__m512i		v_i32 = _mm512_cvtepu8_epi32(v_u8);
-		__m512		v_rec = _mm512_fmadd_ps(_mm512_cvtepi32_ps(v_i32), v_scale, v_bias);
-		__m512		v_q = _mm512_mask_loadu_ps(_mm512_setzero_ps(), mask, &query[i]);
-		__m512		v_diff = _mm512_sub_ps(v_q, v_rec);
-		v_sum = _mm512_mask3_fmadd_ps(v_diff, v_diff, v_sum, mask);
-	}
-
-	return _mm512_reduce_add_ps(v_sum);
-}
 
 static const struct config_enum_entry hnsw_iterative_scan_options[] = {
 	{"off", HNSW_ITERATIVE_SCAN_OFF, false},

@@ -46,7 +46,7 @@ typedef struct HnswQuantizedTuple
 /* ======================================================= */
 
 /* 将原始向量压缩为 HnswQuantizedTuple 格式 */
-static void
+void
 QuantizeVector(Vector *vec, HnswQuantizedTuple *dest)
 {
 	int				dim = vec->dim;
@@ -100,7 +100,7 @@ QuantizeVector(Vector *vec, HnswQuantizedTuple *dest)
  * 你的 CPU 支持 avx512bw，可以直接用 _mm512_cvtepu8_epi32
  */
 __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
-static float
+float
 l2_sq8_avx512(const float *query, const HnswQuantizedTuple *node, int dim)
 {
 	__m512			v_scale = _mm512_set1_ps(node->scale);
