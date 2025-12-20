@@ -527,25 +527,28 @@ QuantizeAndSerialize(Vector *src, Vector *dest)
 {
     int dim = src->dim;
     half *hdata = (half *)src->x;
-
-    char *buffer = (char *)dest->x; /* 指向 Offset 8 */
-
-    float min_v = 1e30f, max_v = -1e30f;
+    
+    /* dest->x 指向 Vector 数据区的起始位置 (Offset 8) */
+    char *buffer = (char *)dest->x;
+    
+    float min_v = 1e30f;
+    float max_v = -1e30f;
     for(int i=0; i<dim; i++) {
         float val = HalfToFloat4(hdata[i]);
         if(val < min_v) min_v = val;
         if(val > max_v) max_v = val;
     }
-
+    
     float scale = (max_v - min_v) / 255.0f;
     float bias = min_v;
 
-    /* 协议写入：Scale(4) + Bias(4) + Data(dim) */
+    /* 序列化元数据 (Scale + Bias) */
     memcpy(buffer, &scale, sizeof(float));
     memcpy(buffer + sizeof(float), &bias, sizeof(float));
-
+    
+    /* 量化数据区从 buffer + 8 开始 */
     uint8_t *code_ptr = (uint8_t *)(buffer + sizeof(float) * 2);
-
+    
     if (scale == 0.0f) {
         memset(code_ptr, 0, dim);
     } else {
@@ -557,10 +560,10 @@ QuantizeAndSerialize(Vector *src, Vector *dest)
             code_ptr[i] = (uint8_t)q;
         }
     }
-
+    
     dest->dim = dim;
     dest->unused = 0;
-    /* 设置总长度：Header + Scale + Bias + Data */
+    /* 设置总长度：Scale(4) + Bias(4) + Data(dim) */
     SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) + sizeof(float)*2 + dim);
 }
 

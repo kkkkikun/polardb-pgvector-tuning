@@ -94,68 +94,58 @@ QuantizeVectorToPayload(Vector *src, Vector *dest)
         dest->unused = 0;
     }
 }
-
+#include <stdio.h> // 必须加在文件头
 /* 比赛专用：通用距离计算函数，支持量化和非量化数据 */
 __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
 static float
 HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
 {
-    /* 1. 解包 Query */
     Vector *query = DatumGetVector(v1);
+    Vector *index_vec = DatumGetVector(v2);
+    
     int dim = query->dim;
+    
+    /* 这里的 index_vec->x 就是我们写入时的 buffer (Scale起始位置) */
+    char *buffer = (char *)index_vec->x;
+    
+    float scale, bias;
+    uint8_t *data;
+
+    /* 反序列化 (绝对安全) */
+    memcpy(&scale, buffer, sizeof(float));
+    memcpy(&bias, buffer + sizeof(float), sizeof(float));
+    data = (uint8_t *)(buffer + sizeof(float) * 2);
+
     float query_f[2048];
     half *h_query = (half *)query->x;
     int i;
 
+    /* Query 转 Float */
     for(i = 0; i < dim; i++) {
         query_f[i] = HalfToFloat4(h_query[i]);
     }
 
-    /* 2. 解包 Index (基于崩溃日志验证的 Offset 8 理论) */
-    /* DatumGetVector 返回的指针指向 Header (Offset 0) */
-    Vector *index_vec = DatumGetVector(v2);
-
-    /* index_vec->x 指向 Header 之后的区域 (Offset 8) */
-    /* 这正是我们 QuantizeAndSerialize 写入 buffer 的起始位置 */
-    char *buffer = (char *)index_vec->x;
-
-    float scale, bias;
-    uint8_t *data;
-    __m512 v_scale, v_bias, v_sum;
-    __mmask16 mask;
-    __m128i v_u8;
-    __m512i v_i32;
-    __m512 v_f_idx, v_rec, v_q, v_diff;
-
-    /* 从 buffer (Offset 8) 读取 Scale */
-    memcpy(&scale, buffer, sizeof(float));
-    /* 从 buffer + 4 (Offset 12) 读取 Bias */
-    memcpy(&bias, buffer + sizeof(float), sizeof(float));
-    /* 从 buffer + 8 (Offset 16) 读取 Data */
-    data = (uint8_t *)(buffer + sizeof(float) * 2);
-
-    /* 3. 计算 (逻辑不变) */
-    v_scale = _mm512_set1_ps(scale);
-    v_bias  = _mm512_set1_ps(bias);
-    v_sum   = _mm512_setzero_ps();
+    __m512 v_scale = _mm512_set1_ps(scale);
+    __m512 v_bias  = _mm512_set1_ps(bias);
+    __m512 v_sum   = _mm512_setzero_ps();
 
     for (i = 0; i <= dim - 16; i += 16) {
-        v_u8 = _mm_loadu_si128((const __m128i *)&data[i]);
-        v_i32 = _mm512_cvtepu8_epi32(v_u8);
-        v_f_idx = _mm512_cvtepi32_ps(v_i32);
-        v_rec = _mm512_fmadd_ps(v_f_idx, v_scale, v_bias);
-        v_q = _mm512_loadu_ps(&query_f[i]);
-        v_diff = _mm512_sub_ps(v_q, v_rec);
+        __m128i v_u8 = _mm_loadu_si128((const __m128i *)&data[i]);
+        __m512i v_i32 = _mm512_cvtepu8_epi32(v_u8);
+        __m512 v_f_idx = _mm512_cvtepi32_ps(v_i32);
+        __m512 v_rec = _mm512_fmadd_ps(v_f_idx, v_scale, v_bias);
+        __m512 v_q = _mm512_loadu_ps(&query_f[i]);
+        __m512 v_diff = _mm512_sub_ps(v_q, v_rec);
         v_sum = _mm512_fmadd_ps(v_diff, v_diff, v_sum);
     }
-
+    
     if (i < dim) {
-        mask = (1U << (dim - i)) - 1;
-        v_u8 = _mm_mask_loadu_epi8(_mm_setzero_si128(), mask, &data[i]);
-        v_i32 = _mm512_cvtepu8_epi32(v_u8);
-        v_rec = _mm512_fmadd_ps(_mm512_cvtepi32_ps(v_i32), v_scale, v_bias);
-        v_q = _mm512_mask_loadu_ps(_mm512_setzero_ps(), mask, &query_f[i]);
-        v_diff = _mm512_sub_ps(v_q, v_rec);
+        __mmask16 mask = (1U << (dim - i)) - 1;
+        __m128i v_u8 = _mm_mask_loadu_epi8(_mm_setzero_si128(), mask, &data[i]);
+        __m512i v_i32 = _mm512_cvtepu8_epi32(v_u8);
+        __m512 v_rec = _mm512_fmadd_ps(_mm512_cvtepi32_ps(v_i32), v_scale, v_bias);
+        __m512 v_q = _mm512_mask_loadu_ps(_mm512_setzero_ps(), mask, &query_f[i]);
+        __m512 v_diff = _mm512_sub_ps(v_q, v_rec);
         v_sum = _mm512_mask3_fmadd_ps(v_diff, v_diff, v_sum, mask);
     }
 
@@ -724,8 +714,8 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 			{
 				/* 量化格式：现在index_vec是合法的Vector，可以安全传入 */
 				result = HnswGetDistanceOptimized(PointerGetDatum(query_vec),
-												  PointerGetDatum(index_vec),
-												  support);
+                                    PointerGetDatum(index_vec), 
+                                    support);
 			}
 			else
 			{
