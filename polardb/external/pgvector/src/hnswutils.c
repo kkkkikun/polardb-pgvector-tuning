@@ -103,15 +103,16 @@ HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
 {
     /* C90 变量声明 */
     Vector     *query = DatumGetVector(v1);
+    Vector     *index_vec = DatumGetVector(v2);
     int         dim = query->dim;
     float       query_f[2048];
     half       *h_query;
     int         i;
-
+    
+    char       *raw_data;
     float       scale;
     float       bias;
     uint8_t    *data;
-    HnswSQ8Payload *payload;
 
     __m512      v_scale;
     __m512      v_bias;
@@ -124,20 +125,25 @@ HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
     __m512      v_q;
     __m512      v_diff;
 
-    /* 1. Query 转换 (Half -> Float) */
+    /* 1. Query 转换 */
     h_query = (half *)query->x;
     for(i = 0; i < dim; i++) {
         query_f[i] = HalfToFloat4(h_query[i]);
     }
 
-    /* 2. Index 解析 (关键修正) */
-    /* * 现在v2是一个"合法"的Vector，我们可以安全地使用DatumGetVector */
-    Vector *index_vec = DatumGetVector(v2);
-    payload = (HnswSQ8Payload *)index_vec->x;
+    /* 2. Index 解析 (字节级操作，避免任何结构体对齐问题) */
+    /* index_vec->x 是数据区的起始地址 */
+    raw_data = (char *)index_vec->x;
+    
+    /* 安全读取 Scale 和 Bias (使用 memcpy 防止未对齐崩溃/错误) */
+    memcpy(&scale, raw_data, sizeof(float));
+    memcpy(&bias, raw_data + sizeof(float), sizeof(float));
+    
+    /* Data 指针指向偏移 8 字节的位置 */
+    data = (uint8_t *)(raw_data + sizeof(float) * 2);
 
-    scale = payload->scale;
-    bias  = payload->bias;
-    data  = payload->data;
+    /* 调试保护：如果 Scale 为 0，说明读错了或者数据有问题 */
+    if (scale == 0.0f) scale = 1.0f; // 防止后续除零或无效计算，虽然这里是乘法
 
     /* 3. AVX-512 计算 */
     v_scale = _mm512_set1_ps(scale);
@@ -145,7 +151,9 @@ HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
     v_sum   = _mm512_setzero_ps();
 
     for (i = 0; i <= dim - 16; i += 16) {
+        /* 非对齐加载是安全的，因为 data 是 uint8 指针 */
         v_u8 = _mm_loadu_si128((const __m128i *)&data[i]);
+        
         v_i32 = _mm512_cvtepu8_epi32(v_u8);
         v_f_idx = _mm512_cvtepi32_ps(v_i32);
         v_rec = _mm512_fmadd_ps(v_f_idx, v_scale, v_bias);
@@ -153,7 +161,7 @@ HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
         v_diff = _mm512_sub_ps(v_q, v_rec);
         v_sum = _mm512_fmadd_ps(v_diff, v_diff, v_sum);
     }
-
+    
     if (i < dim) {
         mask = (1U << (dim - i)) - 1;
         v_u8 = _mm_mask_loadu_epi8(_mm_setzero_si128(), mask, &data[i]);
