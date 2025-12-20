@@ -45,7 +45,7 @@ typedef struct HnswQuantizedTuple
 /* 函数声明 */
 static inline double HnswGetDistance(Datum a, Datum b, HnswSupport * support);
 void QuantizeVector(Vector *vec, HnswQuantizedTuple *dest);
-float l2_sq8_avx512(const float *query, const HnswQuantizedTuple *node, int dim);
+static float HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support);
 
 /* 将原始向量压缩为 HnswQuantizedTuple 格式 */
 void
@@ -97,53 +97,6 @@ QuantizeVector(Vector *vec, HnswQuantizedTuple *dest)
 	}
 }
 
-/*
- * 核心函数：计算 Float Query 与 Uint8 Index 的 L2 距离
- * 你的 CPU 支持 avx512bw，可以直接用 _mm512_cvtepu8_epi32
- */
-__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
-float
-l2_sq8_avx512(const float *query, const HnswQuantizedTuple *node, int dim)
-{
-	__m512			v_scale = _mm512_set1_ps(node->scale);
-	__m512			v_bias = _mm512_set1_ps(node->bias);
-	__m512			v_sum = _mm512_setzero_ps();
-
-	int				i = 0;
-
-	/* 每次处理 16 个维度 */
-	for (; i <= dim - 16; i += 16)
-	{
-		/* 1. 加载 16 byte (Uint8) */
-		__m128i		v_u8 = _mm_loadu_si128((const __m128i *) & node->data[i]);
-
-		/* 2. 转换 Uint8 -> Int32 (AVX512BW) -> Float */
-		__m512i		v_i32 = _mm512_cvtepu8_epi32(v_u8);
-		__m512		v_f_idx = _mm512_cvtepi32_ps(v_i32);
-
-		/* 3. 还原: scale * val + bias */
-		__m512		v_rec = _mm512_fmadd_ps(v_f_idx, v_scale, v_bias);
-
-		/* 4. 计算距离 */
-		__m512		v_q = _mm512_loadu_ps(&query[i]);
-		__m512		v_diff = _mm512_sub_ps(v_q, v_rec);
-		v_sum = _mm512_fmadd_ps(v_diff, v_diff, v_sum);
-	}
-
-	/* 处理剩余维度 (0-15个) */
-	if (i < dim)
-	{
-		__mmask16		mask = (1U << (dim - i)) - 1;
-		__m128i		v_u8 = _mm_mask_loadu_epi8(_mm_setzero_si128(), mask, &node->data[i]);
-		__m512i		v_i32 = _mm512_cvtepu8_epi32(v_u8);
-		__m512		v_rec = _mm512_fmadd_ps(_mm512_cvtepi32_ps(v_i32), v_scale, v_bias);
-		__m512		v_q = _mm512_mask_loadu_ps(_mm512_setzero_ps(), mask, &query[i]);
-		__m512		v_diff = _mm512_sub_ps(v_q, v_rec);
-		v_sum = _mm512_mask3_fmadd_ps(v_diff, v_diff, v_sum, mask);
-	}
-
-	return _mm512_reduce_add_ps(v_sum);
-}
 
 /* 比赛专用：通用距离计算函数，支持量化和非量化数据 */
 __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
@@ -156,11 +109,10 @@ HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
     float       query_f[2048];
     half       *h_query;
     int         i;
-    char       *ptr;
-    float      *p_scale;
     float       scale;
     float       bias;
     uint8_t    *data;
+    HnswQuantizedTuple *node;
     __m512      v_scale;
     __m512      v_bias;
     __m512      v_sum;
@@ -177,20 +129,23 @@ HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
         query_f[i] = HalfToFloat4(h_query[i]);
     }
 
-    /* 2. 解析 Index 向量 (v2) 
-     * v2 传入时已经是剥离了 Header 的指针 (指向 Scale)
+    /* 2. 解析 Index 向量 (v2)
+     * v2 传入时指向完整的 HnswQuantizedTuple 结构
      */
-    ptr = (char *)DatumGetPointer(v2);
-    
-    /* * 内存布局修正：
-     * ptr[0-3] : Scale (之前的 offset 8)
-     * ptr[4-7] : Bias  (之前的 offset 12)
-     * ptr[8...] : Data (之前的 offset 16)
+    node = (HnswQuantizedTuple *)DatumGetPointer(v2);
+
+    /* * 正确的内存布局：
+     * HnswQuantizedTuple {
+     *     ItemPointerData heaptid;  // 6 bytes
+     *     uint16_t unused;          // 2 bytes
+     *     float scale;              // 4 bytes <- offset 8
+     *     float bias;               // 4 bytes <- offset 12
+     *     uint8_t data[dim];        // dim bytes <- offset 16
+     * }
      */
-    p_scale = (float *)ptr;      /* <--- 修正点：不加偏移 */
-    scale = *p_scale;
-    bias = *(p_scale + 1);
-    data = (uint8_t *)(ptr + 8); /* <--- 修正点：数据在 Scale+Bias 之后 */
+    scale = node->scale;
+    bias = node->bias;
+    data = node->data;             /* <--- 直接访问数据数组 */
 
     /* 3. AVX-512 极速计算 */
     v_scale = _mm512_set1_ps(scale);
@@ -785,18 +740,10 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 
 			if (VARSIZE_ANY_EXHDR(index_vec) >= q_size)
 			{
-				/* 量化格式：使用 AVX-512 加速计算 */
-				HnswQuantizedTuple *node = (HnswQuantizedTuple *) index_vec->x;
-
-				/* 将 Query 从 half 转为 float */
-				float		query_f[2048];	/* 假设最大维度 2048 */
-				half	   *h_vec = (half *) query_vec->x;
-				int			dim = query_vec->dim;
-
-				for (int i = 0; i < dim; i++)
-					query_f[i] = HalfToFloat4(h_vec[i]);
-
-				result = l2_sq8_avx512(query_f, node, dim);
+				/* 量化格式：使用优化的距离计算 */
+				result = HnswGetDistanceOptimized(PointerGetDatum(query_vec),
+												  PointerGetDatum(index_vec->x),
+												  support);
 			}
 			else
 			{
