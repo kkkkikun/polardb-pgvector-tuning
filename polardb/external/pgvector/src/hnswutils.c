@@ -582,7 +582,24 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 		value = HnswNormValue(typeInfo, support->collation, value);
 	}
 
-	*out = value;
+	/* === 比赛专用 Hack：量化存储 === */
+	/* 将原始Vector量化为更小的格式 */
+	Vector	   *vec = DatumGetVector(value);
+	int			dim = vec->dim;
+	Size		q_size = HNSW_QV_SIZE(dim);
+
+	/* 创建新的量化向量 */
+	Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + q_size);
+
+	/* 设置向量头信息 */
+	SET_VARSIZE(quantized_vec, offsetof(Vector, x) + q_size);
+	quantized_vec->dim = dim;
+
+	/* 量化数据到新向量 */
+	HnswQuantizedTuple *q_dest = (HnswQuantizedTuple *) quantized_vec->x;
+	QuantizeVector(vec, q_dest);
+
+	*out = PointerGetDatum(quantized_vec);
 
 	return true;
 }
@@ -609,29 +626,8 @@ HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
 	}
 
 	/* === 比赛专用 Hack：量化存储 === */
-	/* 将原始的 Vector 数据区域重新解释为量化格式 */
-	/* 注意：我们复用 Vector 的数据区域来存储量化数据 */
-
-	/* 创建量化数据存储区域 */
-	Size		q_size = HNSW_QV_SIZE(vec->dim);
-
-	/* 确保不会超出 Vector 的分配空间 */
-	if (q_size <= VARSIZE_ANY_EXHDR(vec))
-	{
-		/* 将 Vector 的数据区域解释为量化结构 */
-		HnswQuantizedTuple *q_dest = (HnswQuantizedTuple *) vec->x;
-
-		/* 量化向量数据到目标区域 */
-		QuantizeVector(vec, q_dest);
-
-		/* 复制量化后的数据到元组 */
-		memcpy(&etup->data, vec, VARSIZE_ANY(vec));
-	}
-	else
-	{
-		/* 回退：如果量化空间不够，使用原始数据 */
-		memcpy(&etup->data, valuePtr, VARSIZE_ANY(valuePtr));
-	}
+	/* 数据已经在 HnswFormIndexValue 中量化过了，直接复制 */
+	memcpy(&etup->data, vec, VARSIZE_ANY(vec));
 }
 
 /*
