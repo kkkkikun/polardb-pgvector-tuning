@@ -508,4 +508,16 @@ typedef struct OffsetHashEntry
 #define SH_DECLARE
 #include "lib/simplehash.h"
 
+/* * SQ8 数据包结构
+ * 我们将其存储在标准 Vector 的 x[] 数组位置
+ */
+typedef struct HnswSQ8Payload {
+    float   scale;
+    float   bias;
+    uint8_t data[FLEXIBLE_ARRAY_MEMBER];
+} HnswSQ8Payload;
+
+/* 声明量化函数，实现在 hnswutils.c 中 */
+static void QuantizeVectorToPayload(Vector *src, Vector *dest);
+
 #endif

@@ -23,78 +23,76 @@
 
 /* ================== 比赛专用 Hack 结构 ================== */
 
-/*
- * 压缩后的 HNSW 节点结构
- * 内存布局: [Header 6B] [Padding 2B] [Scale 4B] [Bias 4B] [Uint8 Data...]
- * 总开销: 16字节头部 + 维度字节数
- */
-typedef struct HnswQuantizedTuple
-{
-	ItemPointerData heaptid;	/* 6 bytes (pgvector 原有字段) */
-	uint16_t		unused;		/* 2 bytes (凑齐 8 字节对齐，防 crash) */
-	float			scale;		/* 量化参数 Scale */
-	float			bias;		/* 量化参数 Bias */
-	uint8_t			data[FLEXIBLE_ARRAY_MEMBER];	/* 变长数组 */
-} HnswQuantizedTuple;
-
-/* 计算存储所需大小的宏 */
-#define HNSW_QV_SIZE(dim) (offsetof(HnswQuantizedTuple, data) + (dim) * sizeof(uint8_t))
+/* 计算存储所需大小的宏 - 用于检测量化格式 */
+#define HNSW_QV_SIZE(dim) (sizeof(float)*2 + (dim) * sizeof(uint8_t))
 
 /* ======================================================= */
 
 /* 函数声明 */
 static inline double HnswGetDistance(Datum a, Datum b, HnswSupport * support);
-void QuantizeVector(Vector *vec, HnswQuantizedTuple *dest);
 static float HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support);
 
-/* 将原始向量压缩为 HnswQuantizedTuple 格式 */
-void
-QuantizeVector(Vector *vec, HnswQuantizedTuple *dest)
+/* * 压缩函数：生成一个符合 pgvector 标准的 Vector，但在内部存储 SQ8 数据
+ * dest: 已经分配好内存的 Vector 指针
+ */
+static void
+QuantizeVectorToPayload(Vector *src, Vector *dest)
 {
-	int				dim = vec->dim;
-	half		   *v_data = (half *) vec->x;
+    /* C90 变量声明 */
+    int dim;
+    int i;
+    float min_v;
+    float max_v;
+    float scale;
+    float bias;
+    float inv_scale;
+    HnswSQ8Payload *payload;
+    half *hdata;
 
-	/* 1. 扫描找 Min/Max */
-	float			min_v = 1e30f;
-	float			max_v = -1e30f;
+    dim = src->dim;
+    hdata = (half *)src->x;
 
-	for (int i = 0; i < dim; i++)
-	{
-		float		val = HalfToFloat4(v_data[i]);
-		if (val < min_v)
-			min_v = val;
-		if (val > max_v)
-			max_v = val;
-	}
+    /* 1. 计算统计量 */
+    min_v = 1e30f;
+    max_v = -1e30f;
+    for(i = 0; i < dim; i++) {
+        float val = HalfToFloat4(hdata[i]);
+        if(val < min_v) min_v = val;
+        if(val > max_v) max_v = val;
+    }
 
-	/* 2. 计算参数 */
-	float			scale = (max_v - min_v) / 255.0f;
-	float			bias = min_v;
+    scale = (max_v - min_v) / 255.0f;
+    bias = min_v;
 
-	dest->scale = scale;
-	dest->bias = bias;
+    /* 2. 定位 Payload 写入区 (即 dest->x 的位置) */
+    payload = (HnswSQ8Payload *)dest->x;
+    payload->scale = scale;
+    payload->bias = bias;
 
-	/* 3. 压缩 */
-	if (scale == 0.0f)
-	{
-		memset(dest->data, 0, dim);
-	}
-	else
-	{
-		float		inv_scale = 1.0f / scale;
+    /* 3. 量化写入 */
+    if (scale == 0.0f) {
+        memset(payload->data, 0, dim);
+    } else {
+        inv_scale = 1.0f / scale;
+        for (i = 0; i < dim; i++) {
+            float val = HalfToFloat4(hdata[i]);
+            int32_t q = (int32_t)((val - bias) * inv_scale + 0.5f);
+            if (q < 0) q = 0; else if (q > 255) q = 255;
+            payload->data[i] = (uint8_t)q;
+        }
+    }
 
-		for (int i = 0; i < dim; i++)
-		{
-			float		val = HalfToFloat4(v_data[i]);
-			int32_t		q = (int32_t) ((val - bias) * inv_scale + 0.5f);
-
-			if (q < 0)
-				q = 0;
-			if (q > 255)
-				q = 255;
-			dest->data[i] = (uint8_t) q;
-		}
-	}
+    /* 4. 关键：设置 Vector 头部信息，欺骗 pgvector 宏 */
+    /* * 数据总大小 = scale(4) + bias(4) + data(dim) = 8 + dim
+     * Vector 头部 = 8 bytes (vl_len_ + dim + unused)
+     * Total VARSIZE = 8 + 8 + dim = 16 + dim
+     */
+    {
+        int data_size = sizeof(float)*2 + dim;
+        SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) + data_size);
+        dest->dim = dim;
+        dest->unused = 0;
+    }
 }
 
 
@@ -109,11 +107,11 @@ HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
     float       query_f[2048];
     half       *h_query;
     int         i;
-    
-    char       *ptr;
+
     float       scale;
     float       bias;
     uint8_t    *data;
+    HnswSQ8Payload *payload;
 
     __m512      v_scale;
     __m512      v_bias;
@@ -133,21 +131,13 @@ HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
     }
 
     /* 2. Index 解析 (关键修正) */
-    /* * v2 传入时，实际上已经跳过了 8 字节的 Header (TID + Unused)。
-     * 所以 v2 直接指向 Scale。
-     */
-    ptr = (char *)DatumGetPointer(v2);
-    
-    /* * 内存布局解析：
-     * ptr + 0 : Scale (4 bytes)
-     * ptr + 4 : Bias  (4 bytes)
-     * ptr + 8 : Data  (Uint8...)
-     */
-    
-    /* 直接强转读取，不使用结构体，避免偏移量误判 */
-    scale = *((float *)(ptr));
-    bias  = *((float *)(ptr + 4));
-    data  = (uint8_t *)(ptr + 8);
+    /* * 现在v2是一个"合法"的Vector，我们可以安全地使用DatumGetVector */
+    Vector *index_vec = DatumGetVector(v2);
+    payload = (HnswSQ8Payload *)index_vec->x;
+
+    scale = payload->scale;
+    bias  = payload->bias;
+    data  = payload->data;
 
     /* 3. AVX-512 计算 */
     v_scale = _mm512_set1_ps(scale);
@@ -163,7 +153,7 @@ HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
         v_diff = _mm512_sub_ps(v_q, v_rec);
         v_sum = _mm512_fmadd_ps(v_diff, v_diff, v_sum);
     }
-    
+
     if (i < dim) {
         mask = (1U << (dim - i)) - 1;
         v_u8 = _mm_mask_loadu_epi8(_mm_setzero_si128(), mask, &data[i]);
@@ -584,18 +574,13 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 	/* 将原始Vector量化为更小的格式 */
 	Vector	   *vec = DatumGetVector(value);
 	int			dim = vec->dim;
-	Size		q_size = HNSW_QV_SIZE(dim);
+	Size		payload_size = sizeof(float)*2 + dim; /* scale + bias + data */
 
-	/* 创建新的量化向量 */
-	Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + q_size);
+	/* 创建新的"合法"Vector用于存储量化数据 */
+	Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
 
-	/* 设置向量头信息 */
-	SET_VARSIZE(quantized_vec, offsetof(Vector, x) + q_size);
-	quantized_vec->dim = dim;
-
-	/* 量化数据到新向量 */
-	HnswQuantizedTuple *q_dest = (HnswQuantizedTuple *) quantized_vec->x;
-	QuantizeVector(vec, q_dest);
+	/* 执行量化，会正确设置Vector头部 */
+	QuantizeVectorToPayload(vec, quantized_vec);
 
 	*out = PointerGetDatum(quantized_vec);
 
@@ -742,12 +727,9 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 
 			if (VARSIZE_ANY_EXHDR(index_vec) >= q_size)
 			{
-				/* 量化格式：使用优化的距离计算
-				 * ⚠️ 关键修正：必须传入 index_vec (Tuple Header)，不能传 index_vec->x
-				 * 因为 HnswGetDistanceOptimized 期望从 Offset 0 开始解析
-				 */
+				/* 量化格式：现在index_vec是合法的Vector，可以安全传入 */
 				result = HnswGetDistanceOptimized(PointerGetDatum(query_vec),
-												  PointerGetDatum(index_vec), /* <--- 去掉了 ->x */
+												  PointerGetDatum(index_vec),
 												  support);
 			}
 			else
