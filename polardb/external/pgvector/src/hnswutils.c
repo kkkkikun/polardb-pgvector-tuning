@@ -17,9 +17,6 @@
 #include "utils/memdebug.h"
 #include "utils/rel.h"
 
-/* 函数声明 */
-static inline double HnswGetDistance(Datum a, Datum b, HnswSupport * support);
-
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
 #endif
@@ -44,6 +41,11 @@ typedef struct HnswQuantizedTuple
 #define HNSW_QV_SIZE(dim) (offsetof(HnswQuantizedTuple, data) + (dim) * sizeof(uint8_t))
 
 /* ======================================================= */
+
+/* 函数声明 */
+static inline double HnswGetDistance(Datum a, Datum b, HnswSupport * support);
+void QuantizeVector(Vector *vec, HnswQuantizedTuple *dest);
+float l2_sq8_avx512(const float *query, const HnswQuantizedTuple *node, int dim);
 
 /* 将原始向量压缩为 HnswQuantizedTuple 格式 */
 void

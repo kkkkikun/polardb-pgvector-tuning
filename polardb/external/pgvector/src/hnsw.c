@@ -22,24 +22,13 @@
 
 /* ================== 比赛专用 Hack 结构 ================== */
 
-/*
- * 压缩后的 HNSW 节点结构
- * 内存布局: [Header 6B] [Padding 2B] [Scale 4B] [Bias 4B] [Uint8 Data...]
- * 总开销: 16字节头部 + 维度字节数
- */
-typedef struct HnswQuantizedTuple
-{
-	ItemPointerData heaptid;	/* 6 bytes (pgvector 原有字段) */
-	uint16_t		unused;		/* 2 bytes (凑齐 8 字节对齐，防 crash) */
-	float			scale;		/* 量化参数 Scale */
-	float			bias;		/* 量化参数 Bias */
-	uint8_t			data[FLEXIBLE_ARRAY_MEMBER];	/* 变长数组 */
-} HnswQuantizedTuple;
+/* 前向声明：量化结构定义在 hnswutils.c 中 */
+typedef struct HnswQuantizedTuple HnswQuantizedTuple;
 
 /* 计算存储所需大小的宏 */
 #define HNSW_QV_SIZE(dim) (offsetof(HnswQuantizedTuple, data) + (dim) * sizeof(uint8_t))
 
-/* 从 hnswutils.c 引入的外部函数声明 */
+/* 外部函数声明 */
 extern void QuantizeVector(Vector *vec, HnswQuantizedTuple *dest);
 extern float l2_sq8_avx512(const float *query, const HnswQuantizedTuple *node, int dim);
 
