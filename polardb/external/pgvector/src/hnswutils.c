@@ -94,13 +94,66 @@ QuantizeVectorToPayload(Vector *src, Vector *dest)
         dest->unused = 0;
     }
 }
-
+#include <stdio.h> /* 必须包含，用于 fprintf */
 
 /* 比赛专用：通用距离计算函数，支持量化和非量化数据 */
 __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
 static float
 HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
 {
+
+	/* 定义静态变量，确保只打印一次，防止日志爆炸 */
+    static bool debug_dumped = false;
+
+    if (!debug_dumped) {
+        debug_dumped = true;
+
+        /* 1.以此处为原点，获取原始指针 */
+        /* 注意：这里我们故意不使用 DatumGetVector，为了看最原始的内存 */
+        unsigned char *raw = (unsigned char *)DatumGetPointer(v2);
+        
+        /* 2. 尝试解析头部 (假设是 varlena) */
+        int32_t *header_p = (int32_t *)raw;
+        int32_t len = *header_p; // 读取前4字节作为长度
+        
+        /* 3. 尝试读取不同偏移量的 float */
+        float *f_off0 = (float *)(raw);
+        float *f_off4 = (float *)(raw + 4);
+        float *f_off8 = (float *)(raw + 8);
+        float *f_off12 = (float *)(raw + 12);
+        float *f_off16 = (float *)(raw + 16);
+
+        /* 4. 【核心】直接写到标准错误流 (stderr) */
+        /* 这通常会出现在你的 docker logs 或者启动日志里 */
+        fprintf(stderr, "\n==================== [DEBUG PROBE START] ====================\n");
+        fprintf(stderr, "1. Vector Header Check:\n");
+        fprintf(stderr, "   Raw Length (int32 at offset 0): %d\n", len);
+        fprintf(stderr, "   Expected Length (~216 for SQ8): %d\n", len >> 2); // varlena 长度通常左移了2位
+        
+        fprintf(stderr, "2. Float Interpretation (Looking for Scale/Bias):\n");
+        fprintf(stderr, "   [Offset 0]: %e\n", *f_off0);
+        fprintf(stderr, "   [Offset 4]: %e\n", *f_off4);
+        fprintf(stderr, "   [Offset 8]: %e\n", *f_off8);
+        fprintf(stderr, "   [Offset 12]: %e\n", *f_off12);
+        fprintf(stderr, "   [Offset 16]: %e\n", *f_off16);
+
+        fprintf(stderr, "3. Raw Hex Dump (First 24 bytes):\n");
+        fprintf(stderr, "   ");
+        for(int k=0; k<24; k++) fprintf(stderr, "%02X ", raw[k]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "==================== [DEBUG PROBE END] ====================\n");
+        
+        /* 强制刷新缓冲区，确保日志输出 */
+        fflush(stderr);
+
+        /* 5. 双重保险：如果你在大屏日志里看不到 stderr，用这个 FATAL 错误强制报错 */
+        /* 这会让程序崩溃，并在错误日志里留下这句话。*/
+        /* 这里的数字就是 Scale，如果它是 0.000，那就破案了 */
+        elog(FATAL, "[DEBUG KILL] Scale at Offset 0: %e, Scale at Offset 8: %e", *f_off0, *f_off8);
+    }
+
+    /* --- 为了编译通过，下面随便返回个 0 --- */
+    return 0.0f;
     /* C90 变量声明 */
     Vector     *query = DatumGetVector(v1);
     Vector     *index_vec = DatumGetVector(v2);
