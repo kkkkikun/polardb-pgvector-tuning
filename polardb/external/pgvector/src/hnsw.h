@@ -517,7 +517,49 @@ typedef struct HnswSQ8Payload {
     uint8_t data[FLEXIBLE_ARRAY_MEMBER];
 } HnswSQ8Payload;
 
-/* 声明量化函数，实现在 hnswutils.c 中 */
-static void QuantizeVectorToPayload(Vector *src, Vector *dest);
+#include <immintrin.h>
+#include <string.h>
+
+static inline void
+QuantizeAndSerialize(Vector *src, Vector *dest)
+{
+    int dim = src->dim;
+    half *hdata = (half *)src->x;
+
+    char *buffer = (char *)dest->x; /* 指向 Offset 8 */
+
+    float min_v = 1e30f, max_v = -1e30f;
+    for(int i=0; i<dim; i++) {
+        float val = HalfToFloat4(hdata[i]);
+        if(val < min_v) min_v = val;
+        if(val > max_v) max_v = val;
+    }
+
+    float scale = (max_v - min_v) / 255.0f;
+    float bias = min_v;
+
+    /* 协议写入：Scale(4) + Bias(4) + Data(dim) */
+    memcpy(buffer, &scale, sizeof(float));
+    memcpy(buffer + sizeof(float), &bias, sizeof(float));
+
+    uint8_t *code_ptr = (uint8_t *)(buffer + sizeof(float) * 2);
+
+    if (scale == 0.0f) {
+        memset(code_ptr, 0, dim);
+    } else {
+        float inv_scale = 1.0f / scale;
+        for (int i = 0; i < dim; i++) {
+            float val = HalfToFloat4(hdata[i]);
+            int32_t q = (int32_t)((val - bias) * inv_scale + 0.5f);
+            if (q < 0) q = 0; else if (q > 255) q = 255;
+            code_ptr[i] = (uint8_t)q;
+        }
+    }
+
+    dest->dim = dim;
+    dest->unused = 0;
+    /* 设置总长度：Header + Scale + Bias + Data */
+    SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) + sizeof(float)*2 + dim);
+}
 
 #endif

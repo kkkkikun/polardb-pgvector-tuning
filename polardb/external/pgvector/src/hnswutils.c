@@ -94,119 +94,53 @@ QuantizeVectorToPayload(Vector *src, Vector *dest)
         dest->unused = 0;
     }
 }
-#include <stdio.h> /* 必须包含，用于 fprintf */
 
 /* 比赛专用：通用距离计算函数，支持量化和非量化数据 */
 __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
 static float
 HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
 {
+    /* 1. 解包 Query */
+    Vector *query = DatumGetVector(v1);
+    int dim = query->dim;
+    float query_f[2048];
+    half *h_query = (half *)query->x;
+    int i;
 
-	/* 定义静态变量，确保只打印一次，防止日志爆炸 */
-    static bool debug_dumped = false;
-
-    if (!debug_dumped) {
-        debug_dumped = true;
-
-        /* 1.以此处为原点，获取原始指针 */
-        /* 注意：这里我们故意不使用 DatumGetVector，为了看最原始的内存 */
-        unsigned char *raw = (unsigned char *)DatumGetPointer(v2);
-        
-        /* 2. 尝试解析头部 (假设是 varlena) */
-        int32_t *header_p = (int32_t *)raw;
-        int32_t len = *header_p; // 读取前4字节作为长度
-        
-        /* 3. 尝试读取不同偏移量的 float */
-        float *f_off0 = (float *)(raw);
-        float *f_off4 = (float *)(raw + 4);
-        float *f_off8 = (float *)(raw + 8);
-        float *f_off12 = (float *)(raw + 12);
-        float *f_off16 = (float *)(raw + 16);
-
-        /* 4. 【核心】直接写到标准错误流 (stderr) */
-        /* 这通常会出现在你的 docker logs 或者启动日志里 */
-        fprintf(stderr, "\n==================== [DEBUG PROBE START] ====================\n");
-        fprintf(stderr, "1. Vector Header Check:\n");
-        fprintf(stderr, "   Raw Length (int32 at offset 0): %d\n", len);
-        fprintf(stderr, "   Expected Length (~216 for SQ8): %d\n", len >> 2); // varlena 长度通常左移了2位
-        
-        fprintf(stderr, "2. Float Interpretation (Looking for Scale/Bias):\n");
-        fprintf(stderr, "   [Offset 0]: %e\n", *f_off0);
-        fprintf(stderr, "   [Offset 4]: %e\n", *f_off4);
-        fprintf(stderr, "   [Offset 8]: %e\n", *f_off8);
-        fprintf(stderr, "   [Offset 12]: %e\n", *f_off12);
-        fprintf(stderr, "   [Offset 16]: %e\n", *f_off16);
-
-        fprintf(stderr, "3. Raw Hex Dump (First 24 bytes):\n");
-        fprintf(stderr, "   ");
-        for(int k=0; k<24; k++) fprintf(stderr, "%02X ", raw[k]);
-        fprintf(stderr, "\n");
-        fprintf(stderr, "==================== [DEBUG PROBE END] ====================\n");
-        
-        /* 强制刷新缓冲区，确保日志输出 */
-        fflush(stderr);
-
-        /* 5. 双重保险：如果你在大屏日志里看不到 stderr，用这个 FATAL 错误强制报错 */
-        /* 这会让程序崩溃，并在错误日志里留下这句话。*/
-        /* 这里的数字就是 Scale，如果它是 0.000，那就破案了 */
-        elog(FATAL, "[DEBUG KILL] Scale at Offset 0: %e, Scale at Offset 8: %e", *f_off0, *f_off8);
-    }
-
-    /* --- 为了编译通过，下面随便返回个 0 --- */
-    return 0.0f;
-    /* C90 变量声明 */
-    Vector     *query = DatumGetVector(v1);
-    Vector     *index_vec = DatumGetVector(v2);
-    int         dim = query->dim;
-    float       query_f[2048];
-    half       *h_query;
-    int         i;
-    
-    char       *raw_data;
-    float       scale;
-    float       bias;
-    uint8_t    *data;
-
-    __m512      v_scale;
-    __m512      v_bias;
-    __m512      v_sum;
-    __mmask16   mask;
-    __m128i     v_u8;
-    __m512i     v_i32;
-    __m512      v_f_idx;
-    __m512      v_rec;
-    __m512      v_q;
-    __m512      v_diff;
-
-    /* 1. Query 转换 */
-    h_query = (half *)query->x;
     for(i = 0; i < dim; i++) {
         query_f[i] = HalfToFloat4(h_query[i]);
     }
 
-    /* 2. Index 解析 (字节级操作，避免任何结构体对齐问题) */
-    /* index_vec->x 是数据区的起始地址 */
-    raw_data = (char *)index_vec->x;
-    
-    /* 安全读取 Scale 和 Bias (使用 memcpy 防止未对齐崩溃/错误) */
-    memcpy(&scale, raw_data, sizeof(float));
-    memcpy(&bias, raw_data + sizeof(float), sizeof(float));
-    
-    /* Data 指针指向偏移 8 字节的位置 */
-    data = (uint8_t *)(raw_data + sizeof(float) * 2);
+    /* 2. 解包 Index (基于崩溃日志验证的 Offset 8 理论) */
+    /* DatumGetVector 返回的指针指向 Header (Offset 0) */
+    Vector *index_vec = DatumGetVector(v2);
 
-    /* 调试保护：如果 Scale 为 0，说明读错了或者数据有问题 */
-    if (scale == 0.0f) scale = 1.0f; // 防止后续除零或无效计算，虽然这里是乘法
+    /* index_vec->x 指向 Header 之后的区域 (Offset 8) */
+    /* 这正是我们 QuantizeAndSerialize 写入 buffer 的起始位置 */
+    char *buffer = (char *)index_vec->x;
 
-    /* 3. AVX-512 计算 */
+    float scale, bias;
+    uint8_t *data;
+    __m512 v_scale, v_bias, v_sum;
+    __mmask16 mask;
+    __m128i v_u8;
+    __m512i v_i32;
+    __m512 v_f_idx, v_rec, v_q, v_diff;
+
+    /* 从 buffer (Offset 8) 读取 Scale */
+    memcpy(&scale, buffer, sizeof(float));
+    /* 从 buffer + 4 (Offset 12) 读取 Bias */
+    memcpy(&bias, buffer + sizeof(float), sizeof(float));
+    /* 从 buffer + 8 (Offset 16) 读取 Data */
+    data = (uint8_t *)(buffer + sizeof(float) * 2);
+
+    /* 3. 计算 (逻辑不变) */
     v_scale = _mm512_set1_ps(scale);
     v_bias  = _mm512_set1_ps(bias);
     v_sum   = _mm512_setzero_ps();
 
     for (i = 0; i <= dim - 16; i += 16) {
-        /* 非对齐加载是安全的，因为 data 是 uint8 指针 */
         v_u8 = _mm_loadu_si128((const __m128i *)&data[i]);
-        
         v_i32 = _mm512_cvtepu8_epi32(v_u8);
         v_f_idx = _mm512_cvtepi32_ps(v_i32);
         v_rec = _mm512_fmadd_ps(v_f_idx, v_scale, v_bias);
@@ -214,7 +148,7 @@ HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
         v_diff = _mm512_sub_ps(v_q, v_rec);
         v_sum = _mm512_fmadd_ps(v_diff, v_diff, v_sum);
     }
-    
+
     if (i < dim) {
         mask = (1U << (dim - i)) - 1;
         v_u8 = _mm_mask_loadu_epi8(_mm_setzero_si128(), mask, &data[i]);
@@ -637,11 +571,11 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 	int			dim = vec->dim;
 	Size		payload_size = sizeof(float)*2 + dim; /* scale + bias + data */
 
-	/* 创建新的"合法"Vector用于存储量化数据 */
+	/* 创建新的Vector用于存储量化数据 */
 	Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
 
-	/* 执行量化，会正确设置Vector头部 */
-	QuantizeVectorToPayload(vec, quantized_vec);
+	/* 执行量化序列化，严格按照数据流写入 */
+	QuantizeAndSerialize(vec, quantized_vec);
 
 	*out = PointerGetDatum(quantized_vec);
 
