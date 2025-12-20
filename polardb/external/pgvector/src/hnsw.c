@@ -68,7 +68,6 @@ HnswInitLockTranche(void)
 #endif
 }
 
-
 /*
  * Initialize index options and variables
  */

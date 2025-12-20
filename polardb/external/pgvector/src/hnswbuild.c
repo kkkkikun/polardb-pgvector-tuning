@@ -53,15 +53,6 @@
 #include "tcop/tcopprot.h"
 #include "utils/datum.h"
 #include "utils/memutils.h"
-// /* === 探测逻辑：头文件与全局变量 === */
-#include "halfutils.h" /* 必须包含 */
-#include "vector.h"    /* 必须包含 */
-// #include <stdio.h>     /* 用于 fprintf */
-
-// static float global_probe_min = 1e30f;
-// static float global_probe_max = -1e30f;
-// static long  global_probe_count = 0;
-// /* ================================= */
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
@@ -587,31 +578,6 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
 	if (isnull[0])
 		return;
 
-	// /* === 探测逻辑 START === */
-    // if (global_probe_count < 100000)
-    // {
-    //     Vector *vec = DatumGetVector(values[0]);
-    //     int dim = vec->dim;
-    //     half *hvec = (half *) vec->x;
-
-    //     for (int i = 0; i < dim; i++)
-    //     {
-    //         float val = HalfToFloat4(hvec[i]); /* 确保使用正确的转换函数 */
-    //         if (val < global_probe_min) global_probe_min = val;
-    //         if (val > global_probe_max) global_probe_max = val;
-    //     }
-
-    //     global_probe_count++;
-
-    //     /* === 关键修改：攒够了直接报错，强行把数据吐出来 === */
-    //     if (global_probe_count == 100000)
-    //     {
-    //         /* 使用 ERROR 级别，这会导致构建中断，但一定会打印日志！ */
-    //         elog(ERROR, "DATA PROBE SUCCESS: MIN=%f, MAX=%f", global_probe_min, global_probe_max);
-    //     }
-    // }
-    // /* === 探测逻辑 END === */
-
 	/* Use memory context */
 	oldCtx = MemoryContextSwitchTo(buildstate->tmpCtx);
 
@@ -688,62 +654,6 @@ HnswSharedMemoryAlloc(Size size, void *state)
 	return chunk;
 }
 
-// /* 新增：初始化 CXL 存储空间映射 */
-// static void
-// SetupCxlMemory(HnswBuildState *buildstate)
-// {
-//     int fd;
-//     /* 比赛环境下的 CXL 设备路径，通常为 DAX 模式以获取最佳性能 */
-//     fd = open(CXL_DEVICE_PATH, O_RDWR);
-//     if (fd < 0)
-//     {
-//         buildstate->use_cxl = false;
-//         elog(INFO, "CXL device not found, falling back to DRAM");
-//         return;
-//     }
-
-//     /* * 设定一个足以容纳你向量索引的大小。
-//      * 假设比赛数据集需要 128GB，CXL 可以轻松提供 8TB 级别的空间
-//      */
-//     buildstate->cxl_size = (Size) 128 * 1024 * 1024 * 1024; 
-
-//     /* 使用 mmap 获取直接访问地址，延迟仅 100~300ns */
-//     buildstate->cxl_base_addr = mmap(NULL, buildstate->cxl_size, 
-//                                      PROT_READ | PROT_WRITE, 
-//                                      MAP_SHARED, fd, 0);
-
-//     if (buildstate->cxl_base_addr == MAP_FAILED)
-//     {
-//         buildstate->use_cxl = false;
-//         close(fd);
-//         elog(ERROR, "Failed to mmap CXL memory");
-//         return;
-//     }
-
-//     buildstate->use_cxl = true;
-//     close(fd);
-//     elog(INFO, "Successfully mapped %zu GB of CXL memory", buildstate->cxl_size / (1024*1024*1024));
-// }
-
-// /* 新增：从 CXL 映射区分配内存 */
-// static void *
-// HnswCxlMemoryAlloc(Size size, void *state)
-// {
-//     HnswBuildState *buildstate = (HnswBuildState *) state;
-//     void *chunk;
-
-//     /* 确保对齐，这对 CXL/PCIe 传输性能至关重要 */
-//     size = MAXALIGN(size);
-
-//     if (buildstate->graph->memoryUsed + size > buildstate->cxl_size)
-//         ereport(ERROR, (errmsg("CXL memory pool exhausted")));
-
-//     chunk = (char *)buildstate->cxl_base_addr + buildstate->graph->memoryUsed;
-//     buildstate->graph->memoryUsed += size;
-
-//     return chunk;
-// }
-
 /*
  * Initialize the build state
  */
@@ -788,21 +698,7 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	/* Get support functions */
 	HnswInitSupport(&buildstate->support, index);
 
-	// /* --- 2. 修改点：初始化 CXL 映射并根据结果初始化图 --- */
-    // SetupCxlMemory(buildstate); /* 这里调用我们第一步写在 hnswbuild.c 里的函数 */
-
-    // if (buildstate->use_cxl)
-    // {
-    //     /* 如果 CXL 开启成功，传入映射后的基地址和 TB 级的大小 */
-    //     InitGraph(&buildstate->graphData, buildstate->cxl_base_addr, buildstate->cxl_size);
-    // }
-    // else
-    {
-        /* 否则回退到原始 DRAM 模式，大小受限于 maintenance_work_mem */
-        InitGraph(&buildstate->graphData, NULL, (Size) maintenance_work_mem * 1024L);
-    }
-
-	// InitGraph(&buildstate->graphData, NULL, (Size) maintenance_work_mem * 1024L);
+	InitGraph(&buildstate->graphData, NULL, (Size) maintenance_work_mem * 1024L);
 	buildstate->graph = &buildstate->graphData;
 	buildstate->ml = HnswGetMl(buildstate->m);
 	buildstate->maxLevel = HnswGetMaxLevel(buildstate->m);
@@ -817,18 +713,7 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 											   "Hnsw build temporary context",
 											   ALLOCSET_DEFAULT_SIZES);
 
-	// /* --- 修改点：根据 CXL 状态选择分配器 --- */
-    // if (buildstate->use_cxl)
-    // {
-    //     /* 启用 CXL 专用分配器，实现 100~300ns 的低延迟写入 */
-    //     InitAllocator(&buildstate->allocator, &HnswCxlMemoryAlloc, buildstate);
-    // }
-    // else
-    {
-        /* 默认 DRAM 分配器 */
-        InitAllocator(&buildstate->allocator, &HnswMemoryContextAlloc, buildstate);
-    }
-	// InitAllocator(&buildstate->allocator, &HnswMemoryContextAlloc, buildstate);
+	InitAllocator(&buildstate->allocator, &HnswMemoryContextAlloc, buildstate);
 
 	buildstate->hnswleader = NULL;
 	buildstate->hnswshared = NULL;
@@ -841,12 +726,6 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 static void
 FreeBuildState(HnswBuildState * buildstate)
 {
-	// /* 新增：解除 CXL 映射 */
-    // if (buildstate->use_cxl && buildstate->cxl_base_addr != NULL)
-    // {
-    //     munmap(buildstate->cxl_base_addr, buildstate->cxl_size);
-    // }
-
 	MemoryContextDelete(buildstate->graphCtx);
 	MemoryContextDelete(buildstate->tmpCtx);
 }

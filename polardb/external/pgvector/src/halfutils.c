@@ -50,142 +50,65 @@ HalfvecL2SquaredDistanceDefault(int dim, half * ax, half * bx)
  * 逻辑：200 维 = 32 * 6 + 8
  * 1000 万数据量下，手动展开能极大减少分支预测开销
  */
-/* * 200 维 halfvec 极速版 (4路 ILP + 纯 AVX-512)
- * 核心优化：使用 4 个累加器打破 FMA 延迟链，榨干 CPU 流水线
- */
 __attribute__((target("avx512f,avx512dq,avx512bw,avx512vl,fma")))
 float
 HalfvecL2SquaredDistance200_Avx512(int dim, half *ax, half *bx)
 {
-    const uint16_t *a = (const uint16_t *)ax;
-    const uint16_t *b = (const uint16_t *)bx;
+    const uint16_t *a = (const uint16_t *) ax;
+    const uint16_t *b = (const uint16_t *) bx;
     
-    // 策略：使用4个独立的累加器，完全掩盖 FMA 指令延迟 (Latency Hiding)
-    __m512 sum0 = _mm512_setzero_ps();
-    __m512 sum1 = _mm512_setzero_ps();
-    __m512 sum2 = _mm512_setzero_ps();
-    __m512 sum3 = _mm512_setzero_ps();
-    
-    // ==================== 主循环：192维 (6个32元素块) ====================
-    // 我们手动展开并交错执行，最大化流水线利用率
+    __m512 sum = _mm512_setzero_ps();
 
-    // --- Block 0 & 1 (0-63) ---
-    {
-        // 加载数据
-        __m512i ra0 = _mm512_loadu_si512((__m512i *)(a + 0));
-        __m512i rb0 = _mm512_loadu_si512((__m512i *)(b + 0));
-        __m512i ra1 = _mm512_loadu_si512((__m512i *)(a + 32));
-        __m512i rb1 = _mm512_loadu_si512((__m512i *)(b + 32));
-
-        // Block 0 计算 -> 累加到 sum0
-        __m512 fa0_low = _mm512_cvtph_ps(_mm512_castsi512_si256(ra0));
-        __m512 fb0_low = _mm512_cvtph_ps(_mm512_castsi512_si256(rb0));
-        __m512 diff0_low = _mm512_sub_ps(fa0_low, fb0_low);
-        sum0 = _mm512_fmadd_ps(diff0_low, diff0_low, sum0);
-
-        __m512 fa0_high = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(ra0, 1));
-        __m512 fb0_high = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(rb0, 1));
-        __m512 diff0_high = _mm512_sub_ps(fa0_high, fb0_high);
-        sum0 = _mm512_fmadd_ps(diff0_high, diff0_high, sum0);
-
-        // Block 1 计算 -> 累加到 sum1
-        __m512 fa1_low = _mm512_cvtph_ps(_mm512_castsi512_si256(ra1));
-        __m512 fb1_low = _mm512_cvtph_ps(_mm512_castsi512_si256(rb1));
-        __m512 diff1_low = _mm512_sub_ps(fa1_low, fb1_low);
-        sum1 = _mm512_fmadd_ps(diff1_low, diff1_low, sum1);
-
-        __m512 fa1_high = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(ra1, 1));
-        __m512 fb1_high = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(rb1, 1));
-        __m512 diff1_high = _mm512_sub_ps(fa1_high, fb1_high);
-        sum1 = _mm512_fmadd_ps(diff1_high, diff1_high, sum1);
+    // 内部宏：处理 32 个元素 (64字节)
+    #define PROCESS_BLOCK_32(off) { \
+        __m512i ra = _mm512_loadu_si512((__m512i *)(a + (off))); \
+        __m512i rb = _mm512_loadu_si512((__m512i *)(b + (off))); \
+        /* 转换低 16 个 half */ \
+        __m512 fa1 = _mm512_cvtph_ps(_mm512_castsi512_si256(ra)); \
+        __m512 fb1 = _mm512_cvtph_ps(_mm512_castsi512_si256(rb)); \
+        __m512 d1 = _mm512_sub_ps(fa1, fb1); \
+        sum = _mm512_fmadd_ps(d1, d1, sum); \
+        /* 转换高 16 个 half */ \
+        __m512 fa2 = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(ra, 1)); \
+        __m512 fb2 = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(rb, 1)); \
+        __m512 d2 = _mm512_sub_ps(fa2, fb2); \
+        sum = _mm512_fmadd_ps(d2, d2, sum); \
     }
-    
-    // --- Block 2 & 3 (64-127) ---
-    {
-        __m512i ra2 = _mm512_loadu_si512((__m512i *)(a + 64));
-        __m512i rb2 = _mm512_loadu_si512((__m512i *)(b + 64));
-        __m512i ra3 = _mm512_loadu_si512((__m512i *)(a + 96));
-        __m512i rb3 = _mm512_loadu_si512((__m512i *)(b + 96));
 
-        // Block 2 -> sum2
-        __m512 fa2_low = _mm512_cvtph_ps(_mm512_castsi512_si256(ra2));
-        __m512 fb2_low = _mm512_cvtph_ps(_mm512_castsi512_si256(rb2));
-        __m512 diff2_low = _mm512_sub_ps(fa2_low, fb2_low);
-        sum2 = _mm512_fmadd_ps(diff2_low, diff2_low, sum2);
+    // 1. 处理前 192 维
+    PROCESS_BLOCK_32(0);   PROCESS_BLOCK_32(32);
+    PROCESS_BLOCK_32(64);  PROCESS_BLOCK_32(96);
+    PROCESS_BLOCK_32(128); PROCESS_BLOCK_32(160);
 
-        __m512 fa2_high = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(ra2, 1));
-        __m512 fb2_high = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(rb2, 1));
-        __m512 diff2_high = _mm512_sub_ps(fa2_high, fb2_high);
-        sum2 = _mm512_fmadd_ps(diff2_high, diff2_high, sum2);
-
-        // Block 3 -> sum3
-        __m512 fa3_low = _mm512_cvtph_ps(_mm512_castsi512_si256(ra3));
-        __m512 fb3_low = _mm512_cvtph_ps(_mm512_castsi512_si256(rb3));
-        __m512 diff3_low = _mm512_sub_ps(fa3_low, fb3_low);
-        sum3 = _mm512_fmadd_ps(diff3_low, diff3_low, sum3);
-
-        __m512 fa3_high = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(ra3, 1));
-        __m512 fb3_high = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(rb3, 1));
-        __m512 diff3_high = _mm512_sub_ps(fa3_high, fb3_high);
-        sum3 = _mm512_fmadd_ps(diff3_high, diff3_high, sum3);
-    }
-    
-    // --- Block 4 & 5 (128-191) ---
-    {
-        __m512i ra4 = _mm512_loadu_si512((__m512i *)(a + 128));
-        __m512i rb4 = _mm512_loadu_si512((__m512i *)(b + 128));
-        __m512i ra5 = _mm512_loadu_si512((__m512i *)(a + 160));
-        __m512i rb5 = _mm512_loadu_si512((__m512i *)(b + 160));
-
-        // Block 4 -> sum0 (复用 sum0)
-        __m512 fa4_low = _mm512_cvtph_ps(_mm512_castsi512_si256(ra4));
-        __m512 fb4_low = _mm512_cvtph_ps(_mm512_castsi512_si256(rb4));
-        __m512 diff4_low = _mm512_sub_ps(fa4_low, fb4_low);
-        sum0 = _mm512_fmadd_ps(diff4_low, diff4_low, sum0);
-
-        __m512 fa4_high = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(ra4, 1));
-        __m512 fb4_high = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(rb4, 1));
-        __m512 diff4_high = _mm512_sub_ps(fa4_high, fb4_high);
-        sum0 = _mm512_fmadd_ps(diff4_high, diff4_high, sum0);
-
-        // Block 5 -> sum1 (复用 sum1)
-        __m512 fa5_low = _mm512_cvtph_ps(_mm512_castsi512_si256(ra5));
-        __m512 fb5_low = _mm512_cvtph_ps(_mm512_castsi512_si256(rb5));
-        __m512 diff5_low = _mm512_sub_ps(fa5_low, fb5_low);
-        sum1 = _mm512_fmadd_ps(diff5_low, diff5_low, sum1);
-
-        __m512 fa5_high = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(ra5, 1));
-        __m512 fb5_high = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(rb5, 1));
-        __m512 diff5_high = _mm512_sub_ps(fa5_high, fb5_high);
-        sum1 = _mm512_fmadd_ps(diff5_high, diff5_high, sum1);
-    }
-    
-    // ==================== 尾部处理 (192-199) ====================
-    // 使用“零扩展”技术，避免 NaN，兼容纯 AVX512F
+    // 2. 处理尾部 8 维 (使用纯 AVX-512 技巧)
+    // 加载 128 位 (8个half)
     __m128i ra_tail_128 = _mm_loadu_si128((__m128i *)(a + 192));
     __m128i rb_tail_128 = _mm_loadu_si128((__m128i *)(b + 192));
     
-    // 扩展到 256 位，高位强制为 0
+    // 显式构建 256 位寄存器：低128位是数据，高128位是0
+    // 这样就无需担心高位 Garbage 产生 NaN
     __m256i ra_tail_256 = _mm256_set_m128i(_mm_setzero_si128(), ra_tail_128);
     __m256i rb_tail_256 = _mm256_set_m128i(_mm_setzero_si128(), rb_tail_128);
 
-    // 转换：结果低8个float有效，高8个float是0.0
-    // _mm512_cvtph_ps 需要 AVX512F，PolarDB 肯定支持
+    // 使用 avx512f 的转换指令
+    // 结果：低8个float是有效差值，高8个float是 0.0
     __m512 fa_tail = _mm512_cvtph_ps(ra_tail_256);
     __m512 fb_tail = _mm512_cvtph_ps(rb_tail_256);
     
-    __m512 diff_tail = _mm512_sub_ps(fa_tail, fb_tail);
+    __m512 d_tail = _mm512_sub_ps(fa_tail, fb_tail);
     
-    // 累加到 sum2 (高位0.0累加无影响)
-    sum2 = _mm512_fmadd_ps(diff_tail, diff_tail, sum2);
+    // 累加。因为高位是 0.0*0.0=0.0，所以可以直接加到 sum 里，不影响结果
+    sum = _mm512_fmadd_ps(d_tail, d_tail, sum);
 
-    // ==================== 最终归约 ====================
-    // 合并4个累加器
-    __m512 sum01 = _mm512_add_ps(sum0, sum1);
-    __m512 sum23 = _mm512_add_ps(sum2, sum3);
-    __m512 sum_total = _mm512_add_ps(sum01, sum23);
+    // 3. 稳健的水平归约 (Manual Reduction)
+    __m256 ymm_sum = _mm256_add_ps(_mm512_castps512_ps256(sum), _mm512_extractf32x8_ps(sum, 1));
+    __m128 xmm_sum = _mm_add_ps(_mm256_castps256_ps128(ymm_sum), _mm256_extractf128_ps(ymm_sum, 1));
+    __m128 xmm_shuf = _mm_movehdup_ps(xmm_sum);
+    xmm_sum = _mm_add_ps(xmm_sum, xmm_shuf);
+    xmm_shuf = _mm_movehl_ps(xmm_shuf, xmm_sum);
+    xmm_sum = _mm_add_ss(xmm_sum, xmm_shuf);
     
-    return _mm512_reduce_add_ps(sum_total);
+    return _mm_cvtss_f32(xmm_sum);
 }
 
 // #ifdef HALFVEC_DISPATCH
@@ -475,27 +398,23 @@ SupportsCpuFeature(unsigned int feature)
 void
 HalfvecInit(void)
 {
-    /* 1. 设置默认实现 (纯 C 语言慢速版) */
-    HalfvecL2SquaredDistance = HalfvecL2SquaredDistanceDefault;
-    HalfvecInnerProduct = HalfvecInnerProductDefault;
-    HalfvecCosineSimilarity = HalfvecCosineSimilarityDefault;
-    HalfvecL1Distance = HalfvecL1DistanceDefault;
+	/*
+	 * Could skip pointer when single function, but no difference in
+	 * performance
+	 */
+	HalfvecL2SquaredDistance = HalfvecL2SquaredDistanceDefault;
+	HalfvecInnerProduct = HalfvecInnerProductDefault;
+	HalfvecCosineSimilarity = HalfvecCosineSimilarityDefault;
+	HalfvecL1Distance = HalfvecL1DistanceDefault;
 
 #ifdef HALFVEC_DISPATCH
-    /* 2. 如果支持 F16C (标准优化)，则启用 F16C 版本 */
-    /* 这里的 SupportsCpuFeature 是 pgvector 原带的检测函数，不用改 */
-    if (SupportsCpuFeature(CPU_FEATURE_AVX | CPU_FEATURE_F16C | CPU_FEATURE_FMA))
-    {
-        HalfvecL2SquaredDistance = HalfvecL2SquaredDistanceF16c;
-        HalfvecInnerProduct = HalfvecInnerProductF16c;
-        HalfvecCosineSimilarity = HalfvecCosineSimilarityF16c;
-        HalfvecL1Distance = HalfvecL1DistanceF16c;
-    }
+	if (SupportsCpuFeature(CPU_FEATURE_AVX | CPU_FEATURE_F16C | CPU_FEATURE_FMA))
+	{
+		HalfvecL2SquaredDistance = HalfvecL2SquaredDistanceF16c;
+		HalfvecInnerProduct = HalfvecInnerProductF16c;
+		HalfvecCosineSimilarity = HalfvecCosineSimilarityF16c;
+		/* Does not require FMA, but keep logic simple */
+		HalfvecL1Distance = HalfvecL1DistanceF16c;
+	}
 #endif
-
-    /* * 注意：
-     * 这里不再强制指派 HalfvecL2SquaredDistance200_Avx512。
-     * 因为我们已经在 HnswSearchLayer (src/hnswutils.c) 里
-     * 通过 l2_distance_sq8 直接拦截了计算。
-     */
 }

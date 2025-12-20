@@ -1,17 +1,5 @@
 #include "postgres.h"
-/* 1. 定义宏：让 <immintrin.h> 乖乖交出 __m512i 类型定义 */
-#undef __AVX512F__
-#define __AVX512F__ 1
-#undef __AVX512BW__
-#define __AVX512BW__ 1
-#undef __AVX512VL__
-#define __AVX512VL__ 1
 
-/* 2. Pragma 强制编译器后端生成 AVX-512 指令 */
-#pragma GCC target("avx512f,avx512bw,avx512vl")
-#include <immintrin.h>
-#include "halfutils.h"
-#include "vector.h"
 #include <math.h>
 
 #include "access/generic_xlog.h"
@@ -26,13 +14,11 @@
 #include "utils/datum.h"
 #include "utils/memdebug.h"
 #include "utils/rel.h"
+
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
 #endif
-/* SQ8 参数 */
-#define SQ_MIN -0.5f
-#define SQ_MAX 0.5f
-#define SQ_RANGE (SQ_MAX - SQ_MIN)
+
 #if PG_VERSION_NUM < 170000
 static inline uint64
 murmurhash64(uint64 data)
@@ -48,50 +34,6 @@ murmurhash64(uint64 data)
 	return h;
 }
 #endif
-
-static inline uint8
-float_to_u8(float val)
-{
-    if (val <= SQ_MIN) return 0;
-    if (val >= SQ_MAX) return 255;
-    return (uint8)((val - SQ_MIN) / SQ_RANGE * 255.0f);
-}
-
-/* === AVX-512BW 极速距离计算 === */
-__attribute__((target("avx512f,avx512bw,avx512vl")))
-static float
-l2_distance_sq8(uint8 *a, uint8 *b, int dim)
-{
-    int i = 0;
-    long long result = 0;
-    __m512i sum = _mm512_setzero_si512();
-
-    /* 200 维循环展开 */
-    for (; i <= dim - 64; i += 64) {
-        __m512i va = _mm512_loadu_si512((const void*)&a[i]);
-        __m512i vb = _mm512_loadu_si512((const void*)&b[i]);
-        
-        /* 升位 uint8 -> int16 */
-        __m512i va_lo = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(va));
-        __m512i vb_lo = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(vb));
-        __m512i va_hi = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(va, 1));
-        __m512i vb_hi = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(vb, 1));
-
-        /* 减法 & 累加 */
-        __m512i diff_lo = _mm512_sub_epi16(va_lo, vb_lo);
-        __m512i diff_hi = _mm512_sub_epi16(va_hi, vb_hi);
-        sum = _mm512_add_epi32(sum, _mm512_madd_epi16(diff_lo, diff_lo));
-        sum = _mm512_add_epi32(sum, _mm512_madd_epi16(diff_hi, diff_hi));
-    }
-
-    result = _mm512_reduce_add_epi32(sum);
-    for (; i < dim; i++) {
-        int d = (int)a[i] - (int)b[i];
-        result += d * d;
-    }
-    float scale = SQ_RANGE / 255.0f;
-    return (float)result * (scale * scale);
-}
 
 /* TID hash table */
 static uint32
@@ -571,52 +513,6 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 		Datum		value = datumCopy(PointerGetDatum(&etup->data), false, -1);
 
 		HnswPtrStore(base, element->value, DatumGetPointer(value));
-
-		/* === SQ8 注入点：加载时顺便量化 === */
-		/* 获取原始数据指针 */
-        void *raw_data = DatumGetPointer(value);
-		/* * 安全获取维度：
-         * Vector 和 HalfVector 的头部布局一致 (vl_len_, dim, unused)，
-         * 所以先强转为 Vector* 读取 dim 是安全的。
-         */
-        int dim = ((Vector *)raw_data)->dim;
-
-          if (dim == 200) /* 只针对 200 维处理，安全 */
-          {
-              /* 使用 malloc 或 palloc 均可，这里跟随 PG 内存上下文 */
-              element->dataSq = (uint8 *) MemoryContextAlloc(CurrentMemoryContext, dim * sizeof(uint8));
-
-              // 检查类型标识符：通过比较vector类型表或调用类型检查函数
-              // 由于我们在HnswLoadElementFromTuple中无法直接获取类型信息，
-              // 我们通过更安全的方式来判断
-
-              // 方法1: 检查数据大小来推断类型
-              Size data_size = VARSIZE_ANY(raw_data);
-              Size expected_vector_size = offsetof(Vector, x) + dim * sizeof(float);
-              Size expected_halfvec_size = offsetof(HalfVector, x) + dim * sizeof(half);
-
-              if (data_size == expected_halfvec_size) {
-                  // 这是HalfVector类型
-                  HalfVector *hvec = (HalfVector *) raw_data;
-                  for (int i = 0; i < dim; i++)
-                	  element->dataSq[i] = float_to_u8(HalfToFloat4(hvec->x[i]));
-              } else if (data_size == expected_vector_size) {
-                  // 这是Vector类型
-                  Vector *vec = (Vector *) raw_data;
-                  for (int i = 0; i < dim; i++)
-                      element->dataSq[i] = float_to_u8(vec->x[i]);
-              } else {
-                  // 未知类型，不进行量化
-                  pfree(element->dataSq);
-                  element->dataSq = NULL;
-              }
-          }
-          else
-          {
-              element->dataSq = NULL;
-          }
-          /* ================================ */
-
 	}
 }
 
@@ -934,40 +830,6 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	int			unvisitedLength;
 	bool		inMemory = index == NULL;
 
-	/* === SQ8 预处理 === */
-    bool free_q_sq = false;
-    int dim = 0;
-
-    /* 量化 Query 向量 */
-    if (q->value != (Datum) 0 && q->dataSq == NULL)
-    {
-        void *raw_data = DatumGetPointer(q->value);
-        dim = ((Vector *)raw_data)->dim; // 安全读取 dim
-        
-        /* 仅在维度匹配时启用 */
-        if (dim == 200)
-		{
-            Size data_size = VARSIZE_ANY(raw_data);
-            Size size_half = offsetof(HalfVector, x) + dim * sizeof(half);
-            
-            /* 只有大小匹配 HalfVector 才处理 (比赛场景主要是 HalfVector Query) */
-            if (data_size == size_half)
-            {
-                HalfVector *hvec = (HalfVector *)raw_data;
-                q->dataSq = (uint8 *) palloc(dim * sizeof(uint8));
-                free_q_sq = true;
-                
-                for (int i = 0; i < dim; i++)
-                    q->dataSq[i] = float_to_u8(HalfToFloat4(hvec->x[i]));
-            }
-        }
-    }
-	else if (q->value != (Datum) 0)
-    {
-    	dim = ((Vector *)DatumGetPointer(q->value))->dim;
-    }
-    /* ================= */
-
 	if (v == NULL)
 	{
 		v = &vh;
@@ -1055,31 +917,22 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
                     HnswElement next_el = unvisited[i + prefetch_step].element;
                     if (next_el)
                     {
-
-						/* 1. 预取节点元数据 */
+                        // 1. 预取节点元数据
                         __builtin_prefetch(next_el, 0, 3);
-                        
-                        /* 2. 预取量化数据 (dataSq) */
-                        /* dataSq 只有 200 字节，3-4 个 cache line 足矣，一次 prefetch 大概率够用 */
-                        if (next_el->dataSq) 
-                            __builtin_prefetch(next_el->dataSq, 0, 3);
-						
-                        // // 1. 预取节点元数据
-                        // __builtin_prefetch(next_el, 0, 3);
 
-                        // void *next_vec = HnswPtrAccess(base, next_el->value);
-                        // if (next_vec)
-                        // {
-                        //     /* * 2. 深度预取向量数据：
-                        //      * 200维占 800字节，即 12.5 个 Cache Line。
-                        //      * 我们不需要全部预取（以免浪费带宽），预取前 3-4 个 Line 通常收益最高。
-                        //      */
-                        //     char *ptr = (char *)next_vec;
-                        //     __builtin_prefetch(ptr, 0, 3);       // 第 1-16 维
-                        //     __builtin_prefetch(ptr + 64, 0, 3);  // 第 17-32 维
-                        //     __builtin_prefetch(ptr + 128, 0, 3); // 第 33-48 维
-                        //     __builtin_prefetch(ptr + 192, 0, 3); // 第 49-64 维
-                        // }
+                        void *next_vec = HnswPtrAccess(base, next_el->value);
+                        if (next_vec)
+                        {
+                            /* * 2. 深度预取向量数据：
+                             * 200维占 800字节，即 12.5 个 Cache Line。
+                             * 我们不需要全部预取（以免浪费带宽），预取前 3-4 个 Line 通常收益最高。
+                             */
+                            char *ptr = (char *)next_vec;
+                            __builtin_prefetch(ptr, 0, 3);       // 第 1-16 维
+                            __builtin_prefetch(ptr + 64, 0, 3);  // 第 17-32 维
+                            __builtin_prefetch(ptr + 128, 0, 3); // 第 33-48 维
+                            __builtin_prefetch(ptr + 192, 0, 3); // 第 49-64 维
+                        }
                     }
                 }
             }
@@ -1090,14 +943,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			if (inMemory)
 			{
 				eElement = unvisited[i].element;
-
-                /* === SQ8 拦截 === */
-                /* 必须满足：是内存模式、Query已量化、节点已量化 */
-                if (q->dataSq != NULL && eElement->dataSq != NULL)
-                    eDistance = (double) l2_distance_sq8(eElement->dataSq, q->dataSq, dim);
-                else
-                    eDistance = GetElementDistance(base, eElement, q, support);
-                /* =============== */
+				eDistance = GetElementDistance(base, eElement, q, support);
 			}
 			else
 			{
@@ -1162,13 +1008,6 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 		w = lappend(w, sc);
 	}
-	/* === 修复 Warning：清理内存 === */
-    if (free_q_sq && q->dataSq != NULL)
-    {
-        pfree(q->dataSq);
-        q->dataSq = NULL;
-    }
-    /* ============================ */
 
 	return w;
 }
