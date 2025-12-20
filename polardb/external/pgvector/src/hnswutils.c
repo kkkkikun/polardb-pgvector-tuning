@@ -702,47 +702,32 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
             *distance = 0;
         else
         {
-            /* === 比赛专用 Hack：量化距离计算 === */
             Vector     *query_vec = DatumGetVector(q->value);
-            /* 注意：etup->data 是变长数组起始位置，强转为 Vector* 是为了获取头部信息 */
+            /* 获取数据区指针 */
             Vector     *index_vec = (Vector *) & etup->data;
             float       result;
 
-            /* * 1. 精确计算期望的量化大小 
-             * Payload = Scale(4) + Bias(4) + Data(dim) = 8 + dim
-             * Vector Overhead (在 VARSIZE_ANY_EXHDR 中包含) = dim(2) + unused(2) = 4
-             * Total Expected = 12 + dim
-             */
-            Size payload_size = sizeof(float) * 2 + query_vec->dim;
-            Size vec_overhead = sizeof(int16) + sizeof(uint16); /* dim + unused */
-            Size expected_size = vec_overhead + payload_size;
+            /* === 鲁棒的判断逻辑 === */
+            /* 获取实际数据载荷大小 (不含 4字节头部) */
+            Size actual_payload_size = VARSIZE_ANY_EXHDR(index_vec);
             
-            /* 获取实际存储的数据大小 (不含 varlena 4字节头部) */
-            Size actual_size = VARSIZE_ANY_EXHDR(index_vec);
+            /* 标准 Halfvec 大小 = 维度 * 2字节 */
+            Size standard_half_size = query_vec->dim * sizeof(half);
 
-            /* [DEBUG 探针] 打印大小检查结果 (提交时可保留，用于排查) */
-            /* 如果你在服务器日志看到 [FALLBACK]，说明这就是 Recall 0 的原因 */
-            fprintf(stderr, "[CHECK] Dim=%d, Actual=%zu, Expected=%zu\n", 
-                    query_vec->dim, actual_size, expected_size);
-
-            /* 2. 检查是否为量化格式 */
-            /* 只要实际大小足够容纳 Payload，就认为是 SQ8 */
-            if (actual_size >= expected_size)
+            /* 判断：如果实际大小 显著小于 标准大小，说明是被压缩过的 SQ8 */
+            /* 例如：200维，标准是400字节，SQ8是208字节。208 < 400 成立。 */
+            /* 这种判断方式容错率极高，不怕 padding 差异 */
+            if (actual_payload_size < standard_half_size)
             {
-                /* 量化格式：现在index_vec是合法的Vector，可以安全传入 */
-                /* 注意：必须传入 PointerGetDatum(index_vec)，它是头部指针 */
+                /* [Fast Path] 它是 SQ8 数据 -> 走 AVX-512 优化 */
                 result = HnswGetDistanceOptimized(PointerGetDatum(query_vec),
                                                   PointerGetDatum(index_vec), 
                                                   support);
             }
             else
             {
-                /* [DEBUG 探针] 警告：回退到慢速路径 */
-                fprintf(stderr, "[FALLBACK] Size mismatch! Actual(%zu) < Expected(%zu). using slow path.\n", 
-                        actual_size, expected_size);
-
-                /* 非量化格式：使用原始计算 */
-                /* 警告：如果数据其实是 SQ8 但误入了这里，计算结果就是错的 (Recall=0) */
+                /* [Slow Path] 它是标准数据 -> 走原始逻辑 */
+                /* 只有当数据真的没压缩时才会进这里，保证了兼容性 */
                 result = (float) HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
             }
 
