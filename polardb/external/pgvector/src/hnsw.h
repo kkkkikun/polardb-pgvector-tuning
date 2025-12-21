@@ -522,45 +522,107 @@ typedef struct HnswSQ8Payload {
 #include <immintrin.h>
 #include <string.h>
 
+/*
+ * 针对 HalfVector 的专用熔断量化函数
+ * 优势：
+ * 1. 零内存分配 (Zero Allocation)
+ * 2. 只需要遍历 2 次
+ * 3. 避免了 FP16 -> FP32 的数组展开开销
+ */
+static inline void
+HnswQuantizeHalfVector(HalfVector *src, Vector *dest)
+{
+	int dim = src->dim;
+	half *hdata = src->x;
+
+	/* dest->x 指向 Vector 数据区的起始位置 */
+	char *buffer = (char *)dest->x;
+
+	float min_v = 1e30f;
+	float max_v = -1e30f;
+	int i;
+
+	/* 第一遍循环：直接读取 half 计算统计量 */
+	for(i = 0; i < dim; i++) {
+		float val = HalfToFloat4(hdata[i]); /* 寄存器内转换，不占内存 */
+		if(val < min_v) min_v = val;
+		if(val > max_v) max_v = val;
+	}
+
+	float scale, bias;
+	if (max_v == min_v) {
+		scale = 0.0f;
+		bias = min_v;
+	} else {
+		scale = (max_v - min_v) / 255.0f;
+		bias = min_v;
+	}
+
+	/* 序列化元数据 */
+	memcpy(buffer, &scale, sizeof(float));
+	memcpy(buffer + sizeof(float), &bias, sizeof(float));
+
+	/* 定位量化数据写入区 */
+	uint8_t *code_ptr = (uint8_t *)(buffer + sizeof(float) * 2);
+
+	/* 第二遍循环：直接读取 half -> 量化 -> 写入 */
+	if (scale == 0.0f) {
+		memset(code_ptr, 0, dim);
+	} else {
+		float inv_scale = 1.0f / scale;
+		for (i = 0; i < dim; i++) {
+			float val = HalfToFloat4(hdata[i]);
+			int32_t q = (int32_t)((val - bias) * inv_scale + 0.5f);
+			if (q < 0) q = 0; else if (q > 255) q = 255;
+			code_ptr[i] = (uint8_t)q;
+		}
+	}
+
+	/* 伪造 Vector 头部信息 */
+	dest->dim = dim;
+	dest->unused = 0;
+	SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) + sizeof(float)*2 + dim);
+}
+
 static inline void
 QuantizeAndSerialize(Vector *src, Vector *dest)
 {
     int dim = src->dim;
-    half *hdata = (half *)src->x;
-    
+    float *fdata = src->x;  /* 修正：这里应该是float*，不是half* */
+
     /* dest->x 指向 Vector 数据区的起始位置 (Offset 8) */
     char *buffer = (char *)dest->x;
-    
+
     float min_v = 1e30f;
     float max_v = -1e30f;
     for(int i=0; i<dim; i++) {
-        float val = HalfToFloat4(hdata[i]);
+        float val = fdata[i];  /* 修正：直接使用float值 */
         if(val < min_v) min_v = val;
         if(val > max_v) max_v = val;
     }
-    
+
     float scale = (max_v - min_v) / 255.0f;
     float bias = min_v;
 
     /* 序列化元数据 (Scale + Bias) */
     memcpy(buffer, &scale, sizeof(float));
     memcpy(buffer + sizeof(float), &bias, sizeof(float));
-    
+
     /* 量化数据区从 buffer + 8 开始 */
     uint8_t *code_ptr = (uint8_t *)(buffer + sizeof(float) * 2);
-    
+
     if (scale == 0.0f) {
         memset(code_ptr, 0, dim);
     } else {
         float inv_scale = 1.0f / scale;
         for (int i = 0; i < dim; i++) {
-            float val = HalfToFloat4(hdata[i]);
+            float val = fdata[i];  /* 修正：直接使用float值 */
             int32_t q = (int32_t)((val - bias) * inv_scale + 0.5f);
             if (q < 0) q = 0; else if (q > 255) q = 255;
             code_ptr[i] = (uint8_t)q;
         }
     }
-    
+
     dest->dim = dim;
     dest->unused = 0;
     /* 设置总长度：Scale(4) + Bias(4) + Data(dim) */

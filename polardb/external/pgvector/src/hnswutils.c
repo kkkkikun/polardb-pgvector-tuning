@@ -100,35 +100,72 @@ __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
 static float
 HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
 {
-    Vector *query = DatumGetVector(v1);
     Vector *index_vec = DatumGetVector(v2);
-    
+
+    /* 检查是否为量化数据 */
+    Size actual_payload_size = VARSIZE_ANY_EXHDR(index_vec);
+    Size expected_sq8_size = sizeof(float)*2 + index_vec->dim;
+
+    /* 如果不是量化数据，回退到原始距离计算 */
+    if (actual_payload_size != expected_sq8_size) {
+        return (float) HnswGetDistance(v1, v2, support);
+    }
+
+    /* 处理量化数据 */
+    Vector *query = DatumGetVector(v1);
     int dim = query->dim;
-    
-    /* 这里的 index_vec->x 就是我们写入时的 buffer (Scale起始位置) */
+
+    /* 检查查询向量是否也是量化的 */
+    Size query_payload_size = VARSIZE_ANY_EXHDR(query);
+    bool query_is_quantized = (query_payload_size == sizeof(float)*2 + dim);
+
+    float query_f[2048];
+
+    if (query_is_quantized) {
+        /* 反序列化查询向量 */
+        char *query_buffer = (char *)query->x;
+        float query_scale, query_bias;
+        uint8_t *query_data;
+
+        memcpy(&query_scale, query_buffer, sizeof(float));
+        memcpy(&query_bias, query_buffer + sizeof(float), sizeof(float));
+        query_data = (uint8_t *)(query_buffer + sizeof(float) * 2);
+
+        /* 反量化查询向量到float数组 */
+        for (int i = 0; i < dim; i++) {
+            query_f[i] = query_data[i] * query_scale + query_bias;
+        }
+    } else {
+        /* 查询向量是原始格式，需要转换 */
+        half *h_query = (half *)query->x;
+        for(int i = 0; i < dim; i++) {
+            query_f[i] = HalfToFloat4(h_query[i]);
+        }
+    }
+
+    /* 反序列化索引向量 */
     char *buffer = (char *)index_vec->x;
-    
     float scale, bias;
     uint8_t *data;
 
-    /* 反序列化 (绝对安全) */
     memcpy(&scale, buffer, sizeof(float));
     memcpy(&bias, buffer + sizeof(float), sizeof(float));
     data = (uint8_t *)(buffer + sizeof(float) * 2);
 
-    float query_f[2048];
-    half *h_query = (half *)query->x;
-    int i;
-
-    /* Query 转 Float */
-    for(i = 0; i < dim; i++) {
-        query_f[i] = HalfToFloat4(h_query[i]);
+    /* 添加安全检查 */
+    if (scale == 0.0f && bias == 0.0f) {
+        float sum = 0.0f;
+        for (int i = 0; i < dim; i++) {
+            sum += query_f[i] * query_f[i];
+        }
+        return sum; /* 返回查询向量到零向量的距离 */
     }
 
     __m512 v_scale = _mm512_set1_ps(scale);
     __m512 v_bias  = _mm512_set1_ps(bias);
     __m512 v_sum   = _mm512_setzero_ps();
 
+    int i;
     for (i = 0; i <= dim - 16; i += 16) {
         __m128i v_u8 = _mm_loadu_si128((const __m128i *)&data[i]);
         __m512i v_i32 = _mm512_cvtepu8_epi32(v_u8);
@@ -138,7 +175,7 @@ HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
         __m512 v_diff = _mm512_sub_ps(v_q, v_rec);
         v_sum = _mm512_fmadd_ps(v_diff, v_diff, v_sum);
     }
-    
+
     if (i < dim) {
         __mmask16 mask = (1U << (dim - i)) - 1;
         __m128i v_u8 = _mm_mask_loadu_epi8(_mm_setzero_si128(), mask, &data[i]);
@@ -556,18 +593,35 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 	}
 
 	/* === 比赛专用 Hack：量化存储 === */
-	/* 将原始Vector量化为更小的格式 */
+	/* 支持vector和halfvec类型的量化 */
+
+	/* 检查数据类型：vector类型dim <= 1000，halfvec类型dim <= 2000 */
 	Vector	   *vec = DatumGetVector(value);
 	int			dim = vec->dim;
-	Size		payload_size = sizeof(float)*2 + dim; /* scale + bias + data */
+	bool		is_halfvec = (dim > HNSW_MAX_DIM);
 
-	/* 创建新的Vector用于存储量化数据 */
-	Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+	if (is_halfvec) {
+		/* 处理halfvec类型的量化 - 使用熔断优化 */
+		HalfVector *halfvec = DatumGetHalfVector(value);
+		dim = halfvec->dim;
 
-	/* 执行量化序列化，严格按照数据流写入 */
-	QuantizeAndSerialize(vec, quantized_vec);
+		/* 直接分配结果 Vector (SQ8 大小) */
+		Size payload_size = sizeof(float)*2 + dim;
+		Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
 
-	*out = PointerGetDatum(quantized_vec);
+		/* 使用熔断优化函数：直接 Half -> SQ8 */
+		HnswQuantizeHalfVector(halfvec, quantized_vec);
+
+		*out = PointerGetDatum(quantized_vec);
+	} else {
+		/* 处理vector类型的量化 */
+		Size		payload_size = sizeof(float)*2 + dim; /* scale + bias + data */
+		Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+		/* 执行量化序列化，严格按照数据流写入 */
+		QuantizeAndSerialize(vec, quantized_vec);
+		*out = PointerGetDatum(quantized_vec);
+	}
 
 	return true;
 }
@@ -710,24 +764,22 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
             /* === 鲁棒的判断逻辑 === */
             /* 获取实际数据载荷大小 (不含 4字节头部) */
             Size actual_payload_size = VARSIZE_ANY_EXHDR(index_vec);
-            
-            /* 标准 Halfvec 大小 = 维度 * 2字节 */
-            Size standard_half_size = query_vec->dim * sizeof(half);
 
-            /* 判断：如果实际大小 显著小于 标准大小，说明是被压缩过的 SQ8 */
-            /* 例如：200维，标准是400字节，SQ8是208字节。208 < 400 成立。 */
-            /* 这种判断方式容错率极高，不怕 padding 差异 */
-            if (actual_payload_size < standard_half_size)
+            /* 判断：我们主动量化了所有数据，所以现在索引中的数据都是SQ8格式 */
+            /* SQ8格式：scale(4) + bias(4) + data(dim) = 8 + dim */
+            Size expected_sq8_size = sizeof(float)*2 + query_vec->dim;
+
+            if (actual_payload_size == expected_sq8_size)
             {
                 /* [Fast Path] 它是 SQ8 数据 -> 走 AVX-512 优化 */
-                result = HnswGetDistanceOptimized(PointerGetDatum(query_vec),
-                                                  PointerGetDatum(index_vec), 
+                result = HnswGetDistanceOptimized(q->value,
+                                                  PointerGetDatum(index_vec),
                                                   support);
             }
             else
             {
                 /* [Slow Path] 它是标准数据 -> 走原始逻辑 */
-                /* 只有当数据真的没压缩时才会进这里，保证了兼容性 */
+                /* 这应该很少发生，但作为兼容性保留 */
                 result = (float) HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
             }
 

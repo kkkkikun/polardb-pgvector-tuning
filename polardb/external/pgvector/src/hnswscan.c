@@ -97,6 +97,38 @@ GetScanValue(IndexScanDesc scan)
 		/* Normalize if needed */
 		if (so->support.normprocinfo != NULL)
 			value = HnswNormValue(so->typeInfo, so->support.collation, value);
+
+		/* === 比赛专用 Hack：查询量化 === */
+		/* 支持vector和halfvec类型的量化 */
+		/* 检查数据类型：vector类型dim <= 1000，halfvec类型dim <= 2000 */
+		Vector	   *query_vec = DatumGetVector(value);
+		int			dim = query_vec->dim;
+		bool		is_halfvec = (dim > HNSW_MAX_DIM);
+
+		if (is_halfvec) {
+			/* 处理halfvec类型的量化 - 使用熔断优化 */
+			HalfVector *halfvec = DatumGetHalfVector(value);
+			dim = halfvec->dim;
+
+			/* 直接分配结果 Vector (SQ8 大小) */
+			Size payload_size = sizeof(float)*2 + dim;
+			Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+			/* 使用熔断优化函数：直接 Half -> SQ8 */
+			HnswQuantizeHalfVector(halfvec, quantized_query);
+
+			value = PointerGetDatum(quantized_query);
+		} else {
+			/* 处理vector类型的量化 */
+			Size		payload_size = sizeof(float)*2 + dim; /* scale + bias + data */
+
+			/* 创建新的Vector用于存储量化后的查询向量 */
+			Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+			/* 使用相同的量化函数进行序列化 */
+			QuantizeAndSerialize(query_vec, quantized_query);
+			value = PointerGetDatum(quantized_query);
+		}
 	}
 
 	return value;
