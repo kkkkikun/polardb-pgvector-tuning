@@ -595,15 +595,13 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 	/* === 比赛专用 Hack：量化存储 === */
 	/* 支持vector和halfvec类型的量化 */
 
-	/* 检查数据类型：vector类型dim <= 1000，halfvec类型dim <= 2000 */
-	Vector	   *vec = DatumGetVector(value);
-	int			dim = vec->dim;
-	bool		is_halfvec = (dim > HNSW_MAX_DIM);
+	/* 【关键修复】先检测格式，再解包，避免halfvec误入vector分支 */
+	HnswValueFormat fmt = HnswDetectFormat(value);
 
-	if (is_halfvec) {
+	if (fmt == HNSW_FMT_RAW_HALFVEC) {
 		/* 处理halfvec类型的量化 - 使用熔断优化 */
 		HalfVector *halfvec = DatumGetHalfVector(value);
-		dim = halfvec->dim;
+		int			dim = halfvec->dim;
 
 		/* 直接分配结果 Vector (SQ8 大小) */
 		Size payload_size = sizeof(float)*2 + dim;
@@ -613,14 +611,28 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 		HnswQuantizeHalfVector(halfvec, quantized_vec);
 
 		*out = PointerGetDatum(quantized_vec);
-	} else {
+
+	} else if (fmt == HNSW_FMT_RAW_FLOAT_VEC) {
 		/* 处理vector类型的量化 */
+		Vector	   *vec = DatumGetVector(value);
+		int			dim = vec->dim;
+
 		Size		payload_size = sizeof(float)*2 + dim; /* scale + bias + data */
 		Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
 
 		/* 执行量化序列化，严格按照数据流写入 */
 		QuantizeAndSerialize(vec, quantized_vec);
 		*out = PointerGetDatum(quantized_vec);
+
+	} else if (fmt == HNSW_FMT_SQ8) {
+		/* 已经是SQ8格式，直接返回（理论上不应该在heap value中出现） */
+		elog(DEBUG1, "Heap value is already SQ8 quantized, using directly");
+		*out = value;
+
+	} else {
+		/* 不应该到达这里 */
+		elog(ERROR, "Unsupported vector format in HnswFormIndexValue: %d", fmt);
+		return false;
 	}
 
 	return true;
@@ -723,22 +735,39 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 
 /*
  * Calculate the distance between values
+ *
+ * 【关键修复】同时检查a和b的类型，支持混合距离计算
+ * 这解决了"查询向量是halfvec，索引节点是SQ8"时的recall=0问题
  */
 static inline double
 HnswGetDistance(Datum a, Datum b, HnswSupport * support)
 {
-	/* 检查是否为 SQ8 量化数据 */
-	Vector *vec_a = (Vector *) DatumGetPointer(a);
+	/* 使用可靠的SQ8检测函数 */
+	bool a_sq8 = HnswIsSQ8(a);
+	bool b_sq8 = HnswIsSQ8(b);
 
-	/* SQ8 数据的长度特征: VARHDRSZ + sizeof(int16) + sizeof(uint16) + sizeof(float)*2 + dim */
-	int expected_sq8_size = VARHDRSZ + sizeof(int16) + sizeof(uint16) + sizeof(float)*2 + vec_a->dim;
+	/* 调试统计（采样记录，避免性能影响） */
+	static uint32 debug_counter = 0;
+	if ((++debug_counter % 100000) == 0) {
+		elog(LOG, "HnswGetDistance debug: a_sq8=%d b_sq8=%d counter=%u",
+			 a_sq8 ? 1 : 0, b_sq8 ? 1 : 0, debug_counter);
+	}
 
-	if (VARSIZE(vec_a) == expected_sq8_size) {
-		/* 这是 SQ8 量化数据，使用专用的距离计算函数 */
+	if (!a_sq8 && !b_sq8) {
+		/* case 1: 原始 vs 原始 - 使用标准距离函数 */
+		return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
+	} else if (a_sq8 && b_sq8) {
+		/* case 2: SQ8 vs SQ8 - 使用SQ8专用距离函数 */
 		return HnswSQ8Distance(a, b);
 	} else {
-		/* 这是原始数据，使用标准的距离计算函数 */
-		return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
+		/* case 3: 混合类型 - SQ8 vs halfvec（这是关键修复！） */
+		if (a_sq8) {
+			/* a=SQ8, b=halfvec */
+			return HnswSQ8HalfvecDistance(a, b);
+		} else {
+			/* b=SQ8, a=halfvec */
+			return HnswSQ8HalfvecDistance(b, a);
+		}
 	}
 }
 
@@ -768,32 +797,15 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
             *distance = 0;
         else
         {
+            /* 【修正】避免 varlena 偏移错误 */
             Vector     *query_vec = DatumGetVector(q->value);
-            /* 获取数据区指针 */
-            Vector     *index_vec = (Vector *) & etup->data;
-            float       result;
 
-            /* === 鲁棒的判断逻辑 === */
-            /* 获取实际数据载荷大小 (不含 4字节头部) */
-            Size actual_payload_size = VARSIZE_ANY_EXHDR(index_vec);
+            /* 从 HnswElementTuple 的 data 字段构造正确的 Datum */
+            /* 注意：etup->data 是一个 Vector 结构体，不是指针 */
+            Datum       index_datum = PointerGetDatum(&etup->data);
 
-            /* 判断：我们主动量化了所有数据，所以现在索引中的数据都是SQ8格式 */
-            /* SQ8格式：scale(4) + bias(4) + data(dim) = 8 + dim */
-            Size expected_sq8_size = sizeof(float)*2 + query_vec->dim;
-
-            if (actual_payload_size == expected_sq8_size)
-            {
-                /* [Fast Path] 它是 SQ8 数据 -> 走 AVX-512 优化 */
-                result = HnswGetDistanceOptimized(q->value,
-                                                  PointerGetDatum(index_vec),
-                                                  support);
-            }
-            else
-            {
-                /* [Slow Path] 它是标准数据 -> 走原始逻辑 */
-                /* 这应该很少发生，但作为兼容性保留 */
-                result = (float) HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
-            }
+            /* 使用统一的距离计算函数，它会自动判断 SQ8 vs 原始数据 */
+            double      result = HnswGetDistance(q->value, index_datum, support);
 
             *distance = result;
         }

@@ -522,6 +522,99 @@ typedef struct HnswSQ8Payload {
 #include <immintrin.h>
 #include <string.h>
 
+/* SQ8 量化数据的魔数标记，用于可靠识别 */
+#define SQ8_TAG 0x5158  /* 'QX' - 量化标记 */
+
+/* HNSW值格式枚举 */
+typedef enum
+{
+	HNSW_FMT_RAW_FLOAT_VEC,    /* 原始vector：4字节float/元素 */
+	HNSW_FMT_RAW_HALFVEC,      /* 原始halfvec：2字节half/元素 */
+	HNSW_FMT_SQ8               /* SQ8量化：scale(4) + bias(4) + codes(dim) */
+} HnswValueFormat;
+
+/*
+ * 统一的格式检测函数
+ * 在解包之前判断数据类型，避免把halfvec误认为vector
+ * 关键：必须在调用DatumGetVector/DatumGetHalfVector之前使用
+ */
+static inline HnswValueFormat
+HnswDetectFormat(Datum d)
+{
+	Pointer p = (Pointer) PG_DETOAST_DATUM_PACKED(d);
+
+	/* 头部布局：vl_len + int16 dim + uint16 unused */
+	int16 dim = ((Vector *)p)->dim;
+	int sz = VARSIZE_ANY(p);
+
+	int hdr = VARHDRSZ + sizeof(int16) + sizeof(uint16);
+	int payload = sz - hdr;
+
+	if (dim <= 0 || payload < 0)
+		elog(ERROR, "bad vector header: dim=%d size=%d payload=%d", dim, sz, payload);
+
+	/* 原始float vector：payload == 4 * dim */
+	if (payload == (int)(sizeof(float) * dim)) {
+		/* 进一步检查：确保不是误判的SQ8（SQ8也有payload可能接近4*dim） */
+		Vector *v = (Vector *)p;
+		if (v->unused == SQ8_TAG) {
+			/* 这是SQ8数据，但payload意外匹配 */
+			elog(WARNING, "SQ8 data detected with vector-like payload, treating as SQ8");
+			return HNSW_FMT_SQ8;
+		}
+		return HNSW_FMT_RAW_FLOAT_VEC;
+	}
+
+	/* 原始halfvec：payload == 2 * dim */
+	if (payload == (int)(sizeof(uint16_t) * dim)) {
+		return HNSW_FMT_RAW_HALFVEC;
+	}
+
+	/* SQ8量化：payload == 8 + dim (scale+bias+codes) */
+	if (payload == (int)(sizeof(float) * 2 + dim)) {
+		/* 进一步检查SQ8魔数标记 */
+		Vector *v = (Vector *)p;
+		if (v->unused == SQ8_TAG) {
+			return HNSW_FMT_SQ8;
+		} else {
+			elog(WARNING, "SQ8-like payload without proper tag, treating as SQ8 anyway");
+			return HNSW_FMT_SQ8;
+		}
+	}
+
+	/* 无法识别的格式 */
+	elog(ERROR, "unknown vector format: dim=%d size=%d payload=%d", dim, sz, payload);
+	return HNSW_FMT_RAW_FLOAT_VEC; /* unreachable */
+}
+
+/*
+ * 基于VARSIZE安全检测datum类型是vector还是halfvec
+ * 不依赖维度阈值，而是通过实际的字节长度判断元素宽度
+ */
+static inline bool
+IsHalfvecDatum(Datum d)
+{
+    void *p = PG_DETOAST_DATUM_PACKED(d);
+
+    /* Vector和HalfVector的dim偏移相同（int16 dim），但x[]元素宽度不同 */
+    int16 dim = ((Vector *)p)->dim;  /* 只用来取dim，不去读x[] */
+    int sz = VARSIZE_ANY(p);
+
+    /* 计算期望的字节大小 */
+    int sz_vec  = VARHDRSZ + sizeof(int16) + sizeof(int16) + sizeof(float) * dim;
+    int sz_half = VARHDRSZ + sizeof(int16) + sizeof(int16) + sizeof(uint16) * dim;
+
+    if (sz == sz_half)
+        return true;   /* halfvec: 2字节/元素 */
+    if (sz == sz_vec)
+        return false;  /* vector: 4字节/元素 */
+
+    /* 如果都不匹配，说明数据格式有问题 */
+    elog(ERROR, "unexpected datum size: dim=%d size=%d (expected vec=%d half=%d)",
+         dim, sz, sz_vec, sz_half);
+    return false;  /* 不会到达这里 */
+}
+
 /*
  * 针对 HalfVector 的专用熔断量化函数
  * 优势：
@@ -578,9 +671,9 @@ HnswQuantizeHalfVector(HalfVector *src, Vector *dest)
 		}
 	}
 
-	/* 伪造 Vector 头部信息 */
+	/* 设置 Vector 头部信息，包含SQ8魔数标记 */
 	dest->dim = dim;
-	dest->unused = 0;
+	dest->unused = SQ8_TAG;  /* 添加SQ8识别标记 */
 	SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) + sizeof(float)*2 + dim);
 }
 
@@ -624,9 +717,44 @@ QuantizeAndSerialize(Vector *src, Vector *dest)
     }
 
     dest->dim = dim;
-    dest->unused = 0;
+    dest->unused = SQ8_TAG;  /* 添加SQ8识别标记 */
     /* 设置总长度：Scale(4) + Bias(4) + Data(dim) */
     SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) + sizeof(float)*2 + dim);
+}
+
+/*
+ * 安全检测是否为SQ8量化数据
+ * 使用多重验证避免误判，提高识别可靠性
+ */
+static inline bool
+HnswIsSQ8(Datum d)
+{
+    Vector *v = (Vector *) PG_DETOAST_DATUM_PACKED(d);
+
+    int dim = v->dim;
+    if (dim <= 0 || dim > 2048)
+        return false;
+
+    /* 检查SQ8魔数标记 */
+    if (v->unused != SQ8_TAG)
+        return false;
+
+    /* 检查数据大小是否符合SQ8格式 */
+    int expected = VARHDRSZ + sizeof(int16) + sizeof(uint16) + sizeof(float)*2 + dim;
+    if (VARSIZE_ANY(v) != expected)
+        return false;
+
+    /* 校验scale/bias是否为有限值 */
+    char *buffer = (char *) v->x;
+    float scale, bias;
+    memcpy(&scale, buffer, sizeof(float));
+    memcpy(&bias,  buffer + sizeof(float), sizeof(float));
+    if (!isfinite(scale) || !isfinite(bias))
+        return false;
+    if (scale < 0.0f)  /* L2映射scale理应>=0 */
+        return false;
+
+    return true;
 }
 
 /*
@@ -659,37 +787,109 @@ HnswDequantizeSQ8(Vector *quantized_vec, float *dequantized_data)
 }
 
 /*
- * 计算两个 SQ8 量化向量之间的 L2 距离
+ * 计算 SQ8 与 halfvec 之间的混合距离
+ * a_sq8: SQ8量化的向量
+ * b_half: 原始的halfvec向量
+ * 返回: L2距离（不需要开方，用于排序）
+ */
+static inline double
+HnswSQ8HalfvecDistance(Datum a_sq8, Datum b_half)
+{
+    Vector *sq8_vec = (Vector *) PG_DETOAST_DATUM_PACKED(a_sq8);
+    HalfVector *half_vec = (HalfVector *) PG_DETOAST_DATUM_PACKED(b_half);
+
+    int dim = sq8_vec->dim;
+    if (half_vec->dim != dim)
+        elog(ERROR, "dimension mismatch: sq8=%d halfvec=%d", dim, half_vec->dim);
+
+    /* 解 SQ8 的 scale/bias + codes */
+    char *buffer = (char *) sq8_vec->x;
+    float scale, bias;
+    memcpy(&scale, buffer, sizeof(float));
+    memcpy(&bias,  buffer + sizeof(float), sizeof(float));
+    uint8_t *code_ptr = (uint8_t *)(buffer + sizeof(float) * 2);
+
+    double sum = 0.0;
+
+    if (scale == 0.0f) {
+        /* SQ8 全部是 bias */
+        for (int i = 0; i < dim; i++) {
+            float bval = HalfToFloat4(half_vec->x[i]);
+            float diff = bias - bval;
+            sum += (double)diff * (double)diff;
+        }
+    } else {
+        for (int i = 0; i < dim; i++) {
+            float aval = (float)code_ptr[i] * scale + bias;
+            float bval = HalfToFloat4(half_vec->x[i]);
+            float diff = aval - bval;
+            sum += (double)diff * (double)diff;
+        }
+    }
+
+    return sum;  /* L2排序不需要sqrt */
+}
+
+/*
+ * 计算两个 SQ8 量化向量之间的 L2 距离（优化版本，无内存分配）
  * 这个函数专门用于 HNSW 索引中的距离计算
  */
 static inline double
 HnswSQ8Distance(Datum a, Datum b)
 {
-    Vector *vec_a = (Vector *) DatumGetPointer(a);
-    Vector *vec_b = (Vector *) DatumGetPointer(b);
+    Vector *vec_a = (Vector *) PG_DETOAST_DATUM_PACKED(a);
+    Vector *vec_b = (Vector *) PG_DETOAST_DATUM_PACKED(b);
 
+    /* 检查维度一致性 */
+    Assert(vec_a->dim == vec_b->dim);
     int dim = vec_a->dim;
 
-    /* 创建临时数组用于解码 */
-    float *data_a = (float *) palloc(sizeof(float) * dim);
-    float *data_b = (float *) palloc(sizeof(float) * dim);
+    /* 解码第一个向量 */
+    char *buffer_a = (char *) vec_a->x;
+    float scale_a, bias_a;
+    memcpy(&scale_a, buffer_a, sizeof(float));
+    memcpy(&bias_a,  buffer_a + sizeof(float), sizeof(float));
+    uint8_t *code_a = (uint8_t *)(buffer_a + sizeof(float) * 2);
 
-    /* 解码两个量化向量 */
-    HnswDequantizeSQ8(vec_a, data_a);
-    HnswDequantizeSQ8(vec_b, data_b);
+    /* 解码第二个向量 */
+    char *buffer_b = (char *) vec_b->x;
+    float scale_b, bias_b;
+    memcpy(&scale_b, buffer_b, sizeof(float));
+    memcpy(&bias_b,  buffer_b + sizeof(float), sizeof(float));
+    uint8_t *code_b = (uint8_t *)(buffer_b + sizeof(float) * 2);
 
-    /* 计算 L2 距离 */
-    double sum_squared = 0.0;
-    for (int i = 0; i < dim; i++) {
-        float diff = data_a[i] - data_b[i];
-        sum_squared += (double)diff * (double)diff;
+    double sum = 0.0;
+
+    /* 直接计算距离，避免分配临时数组 */
+    if (scale_a == 0.0f && scale_b == 0.0f) {
+        /* 两个向量都是常数 */
+        float diff = bias_a - bias_b;
+        sum = (double)dim * (double)diff * (double)diff;
+    } else if (scale_a == 0.0f) {
+        /* 向量A是常数 */
+        for (int i = 0; i < dim; i++) {
+            float bval = (float)code_b[i] * scale_b + bias_b;
+            float diff = bias_a - bval;
+            sum += (double)diff * (double)diff;
+        }
+    } else if (scale_b == 0.0f) {
+        /* 向量B是常数 */
+        for (int i = 0; i < dim; i++) {
+            float aval = (float)code_a[i] * scale_a + bias_a;
+            float diff = aval - bias_b;
+            sum += (double)diff * (double)diff;
+        }
+    } else {
+        /* 两个向量都是变量 */
+        for (int i = 0; i < dim; i++) {
+            float aval = (float)code_a[i] * scale_a + bias_a;
+            float bval = (float)code_b[i] * scale_b + bias_b;
+            float diff = aval - bval;
+            sum += (double)diff * (double)diff;
+        }
     }
 
-    /* 释放临时数组 */
-    pfree(data_a);
-    pfree(data_b);
-
-    return sqrt(sum_squared);
+    return sum;  /* L2排序不需要sqrt */
 }
 
 #endif

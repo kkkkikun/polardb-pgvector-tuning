@@ -100,15 +100,14 @@ GetScanValue(IndexScanDesc scan)
 
 		/* === 比赛专用 Hack：查询量化 === */
 		/* 支持vector和halfvec类型的量化 */
-		/* 检查数据类型：vector类型dim <= 1000，halfvec类型dim <= 2000 */
-		Vector	   *query_vec = DatumGetVector(value);
-		int			dim = query_vec->dim;
-		bool		is_halfvec = (dim > HNSW_MAX_DIM);
 
-		if (is_halfvec) {
+		/* 【关键修复】先检测格式，再解包，避免halfvec误入vector分支 */
+		HnswValueFormat fmt = HnswDetectFormat(value);
+
+		if (fmt == HNSW_FMT_RAW_HALFVEC) {
 			/* 处理halfvec类型的量化 - 使用熔断优化 */
 			HalfVector *halfvec = DatumGetHalfVector(value);
-			dim = halfvec->dim;
+			int			dim = halfvec->dim;
 
 			/* 直接分配结果 Vector (SQ8 大小) */
 			Size payload_size = sizeof(float)*2 + dim;
@@ -118,8 +117,12 @@ GetScanValue(IndexScanDesc scan)
 			HnswQuantizeHalfVector(halfvec, quantized_query);
 
 			value = PointerGetDatum(quantized_query);
-		} else {
+
+		} else if (fmt == HNSW_FMT_RAW_FLOAT_VEC) {
 			/* 处理vector类型的量化 */
+			Vector	   *query_vec = DatumGetVector(value);
+			int			dim = query_vec->dim;
+
 			Size		payload_size = sizeof(float)*2 + dim; /* scale + bias + data */
 
 			/* 创建新的Vector用于存储量化后的查询向量 */
@@ -128,6 +131,14 @@ GetScanValue(IndexScanDesc scan)
 			/* 使用相同的量化函数进行序列化 */
 			QuantizeAndSerialize(query_vec, quantized_query);
 			value = PointerGetDatum(quantized_query);
+
+		} else if (fmt == HNSW_FMT_SQ8) {
+			/* 已经是SQ8格式，无需重复量化 */
+			elog(DEBUG1, "Query vector is already SQ8 quantized, skipping quantization");
+
+		} else {
+			/* 不应该到达这里 */
+			elog(ERROR, "Unsupported vector format in GetScanValue: %d", fmt);
 		}
 	}
 
