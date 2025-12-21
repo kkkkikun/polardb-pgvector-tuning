@@ -787,18 +787,24 @@ HnswDequantizeSQ8(Vector *quantized_vec, float *dequantized_data)
 }
 
 /*
- * 【性能优化】零分配的SQ8 vs SQ8距离计算（平方距离，无sqrt）
- * 边解码边累加，无内存分配，适用于高频调用场景
+ * 【AVX-512优化】SQ8 vs SQ8距离计算配置
+ *
+ * 强制启用AVX-512优化（根据评测环境CPU支持情况）
+ * 如果需要兼容性，可以设为0启用运行期检测
  */
+#ifndef HNSW_SQ8_FORCE_AVX512
+#define HNSW_SQ8_FORCE_AVX512 1
+#endif
+
+/* ---- 标量版本：保留原有逻辑，作为 fallback ---- */
 static inline float
-HnswSQ8Distance2_Vector(Vector *a, Vector *b)
+HnswSQ8Distance2_Vector_scalar(Vector *a, Vector *b)
 {
     int dim = a->dim;
 
     char *bufa = (char *) a->x;
     char *bufb = (char *) b->x;
 
-    /* 提取scale和bias */
     float sa, ba, sb, bb;
     memcpy(&sa, bufa, sizeof(float));
     memcpy(&ba, bufa + sizeof(float), sizeof(float));
@@ -810,27 +816,22 @@ HnswSQ8Distance2_Vector(Vector *a, Vector *b)
 
     double sum = 0.0;
 
-    /* 边解码边计算，避免中间数组 */
     if (sa == 0.0f && sb == 0.0f) {
-        /* 两个都是常数向量 */
         float diff = ba - bb;
         sum = (double)dim * (double)diff * (double)diff;
     } else if (sa == 0.0f) {
-        /* 向量A是常数 */
         for (int i = 0; i < dim; i++) {
             float vb = (float)qb[i] * sb + bb;
             float d = ba - vb;
             sum += (double)d * (double)d;
         }
     } else if (sb == 0.0f) {
-        /* 向量B是常数 */
         for (int i = 0; i < dim; i++) {
             float va = (float)qa[i] * sa + ba;
             float d = va - bb;
             sum += (double)d * (double)d;
         }
     } else {
-        /* 两个都是变量向量 */
         for (int i = 0; i < dim; i++) {
             float va = (float)qa[i] * sa + ba;
             float vb = (float)qb[i] * sb + bb;
@@ -839,7 +840,244 @@ HnswSQ8Distance2_Vector(Vector *a, Vector *b)
         }
     }
 
-    return (float)sum;  /* 返回平方距离，无需sqrt */
+    return (float)sum;
+}
+
+/* ---- AVX-512 reduce add：避免编译器版本依赖 ---- */
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
+static inline float
+hnsw_reduce_add_ps(__m512 v)
+{
+    __m256 lo = _mm512_castps512_ps256(v);
+    __m256 hi = _mm512_extractf32x8_ps(v, 1);
+    __m256 s  = _mm256_add_ps(lo, hi);
+    __m128 lo2 = _mm256_castps256_ps128(s);
+    __m128 hi2 = _mm256_extractf128_ps(s, 1);
+    __m128 s2 = _mm_add_ps(lo2, hi2);
+    s2 = _mm_hadd_ps(s2, s2);
+    s2 = _mm_hadd_ps(s2, s2);
+    return _mm_cvtss_f32(s2);
+}
+
+/* ---- AVX-512版本：SQ8 vs SQ8的平方L2距离 ---- */
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,fma")))
+static inline float
+HnswSQ8Distance2_Vector_avx512(Vector *a, Vector *b)
+{
+    int dim = a->dim;
+
+    char *bufa = (char *) a->x;
+    char *bufb = (char *) b->x;
+
+    float sa, ba, sb, bb;
+    memcpy(&sa, bufa, sizeof(float));
+    memcpy(&ba, bufa + sizeof(float), sizeof(float));
+    memcpy(&sb, bufb, sizeof(float));
+    memcpy(&bb, bufb + sizeof(float), sizeof(float));
+
+    uint8_t *qa = (uint8_t *)(bufa + sizeof(float) * 2);
+    uint8_t *qb = (uint8_t *)(bufb + sizeof(float) * 2);
+
+    /* 常数向量快速路径 */
+    if (sa == 0.0f && sb == 0.0f) {
+        float diff = ba - bb;
+        return (float)dim * diff * diff;
+    }
+
+    __m512 vsum = _mm512_setzero_ps();
+    int i = 0;
+
+    if (sa == 0.0f) {
+        /* A常数，B变量：d = ba - (qb*sb + bb) */
+        __m512 v_ba = _mm512_set1_ps(ba);
+        __m512 v_sb = _mm512_set1_ps(sb);
+        __m512 v_bb = _mm512_set1_ps(bb);
+
+        /* 32路展开（2x16） */
+        for (; i <= dim - 32; i += 32) {
+            __m128i ub1 = _mm_loadu_si128((const __m128i *)(qb + i));
+            __m128i ub2 = _mm_loadu_si128((const __m128i *)(qb + i + 16));
+
+            __m512 fb1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(ub1));
+            __m512 fb2 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(ub2));
+
+            __m512 vb1 = _mm512_fmadd_ps(fb1, v_sb, v_bb);
+            __m512 vb2 = _mm512_fmadd_ps(fb2, v_sb, v_bb);
+
+            __m512 d1 = _mm512_sub_ps(v_ba, vb1);
+            __m512 d2 = _mm512_sub_ps(v_ba, vb2);
+
+            vsum = _mm512_fmadd_ps(d1, d1, vsum);
+            vsum = _mm512_fmadd_ps(d2, d2, vsum);
+        }
+
+        /* 16路处理剩余 */
+        for (; i <= dim - 16; i += 16) {
+            __m128i ub = _mm_loadu_si128((const __m128i *)(qb + i));
+            __m512 fb = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(ub));
+            __m512 vb = _mm512_fmadd_ps(fb, v_sb, v_bb);
+            __m512 d  = _mm512_sub_ps(v_ba, vb);
+            vsum = _mm512_fmadd_ps(d, d, vsum);
+        }
+
+        /* 处理尾部 */
+        int rem = dim - i;
+        if (rem > 0) {
+            __mmask16 m = (1u << rem) - 1u;
+            __m128i ub = _mm_maskz_loadu_epi8(m, (const void *)(qb + i));
+            __m512 fb = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(ub));
+            __m512 vb = _mm512_fmadd_ps(fb, v_sb, v_bb);
+            __m512 d  = _mm512_sub_ps(v_ba, vb);
+            __m512 d2 = _mm512_mul_ps(d, d);
+            vsum = _mm512_mask_add_ps(vsum, m, vsum, d2);
+        }
+
+        return hnsw_reduce_add_ps(vsum);
+    }
+
+    if (sb == 0.0f) {
+        /* B常数，A变量：d = (qa*sa + ba) - bb */
+        __m512 v_sa = _mm512_set1_ps(sa);
+        __m512 v_ba = _mm512_set1_ps(ba);
+        __m512 v_bb = _mm512_set1_ps(bb);
+
+        for (; i <= dim - 32; i += 32) {
+            __m128i ua1 = _mm_loadu_si128((const __m128i *)(qa + i));
+            __m128i ua2 = _mm_loadu_si128((const __m128i *)(qa + i + 16));
+
+            __m512 fa1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(ua1));
+            __m512 fa2 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(ua2));
+
+            __m512 va1 = _mm512_fmadd_ps(fa1, v_sa, v_ba);
+            __m512 va2 = _mm512_fmadd_ps(fa2, v_sa, v_ba);
+
+            __m512 d1 = _mm512_sub_ps(va1, v_bb);
+            __m512 d2 = _mm512_sub_ps(va2, v_bb);
+
+            vsum = _mm512_fmadd_ps(d1, d1, vsum);
+            vsum = _mm512_fmadd_ps(d2, d2, vsum);
+        }
+
+        for (; i <= dim - 16; i += 16) {
+            __m128i ua = _mm_loadu_si128((const __m128i *)(qa + i));
+            __m512 fa = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(ua));
+            __m512 va = _mm512_fmadd_ps(fa, v_sa, v_ba);
+            __m512 d  = _mm512_sub_ps(va, v_bb);
+            vsum = _mm512_fmadd_ps(d, d, vsum);
+        }
+
+        int rem = dim - i;
+        if (rem > 0) {
+            __mmask16 m = (1u << rem) - 1u;
+            __m128i ua = _mm_maskz_loadu_epi8(m, (const void *)(qa + i));
+            __m512 fa = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(ua));
+            __m512 va = _mm512_fmadd_ps(fa, v_sa, v_ba);
+            __m512 d  = _mm512_sub_ps(va, v_bb);
+            __m512 d2 = _mm512_mul_ps(d, d);
+            vsum = _mm512_mask_add_ps(vsum, m, vsum, d2);
+        }
+
+        return hnsw_reduce_add_ps(vsum);
+    }
+
+    /* 最常见情况：sa!=0 && sb!=0 */
+    __m512 v_sa = _mm512_set1_ps(sa);
+    __m512 v_ba = _mm512_set1_ps(ba);
+    __m512 v_sb = _mm512_set1_ps(sb);
+    __m512 v_bb = _mm512_set1_ps(bb);
+
+    for (; i <= dim - 32; i += 32) {
+        __m128i ua1 = _mm_loadu_si128((const __m128i *)(qa + i));
+        __m128i ub1 = _mm_loadu_si128((const __m128i *)(qb + i));
+        __m128i ua2 = _mm_loadu_si128((const __m128i *)(qa + i + 16));
+        __m128i ub2 = _mm_loadu_si128((const __m128i *)(qb + i + 16));
+
+        __m512 fa1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(ua1));
+        __m512 fb1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(ub1));
+        __m512 fa2 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(ua2));
+        __m512 fb2 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(ub2));
+
+        __m512 va1 = _mm512_fmadd_ps(fa1, v_sa, v_ba);
+        __m512 vb1 = _mm512_fmadd_ps(fb1, v_sb, v_bb);
+        __m512 va2 = _mm512_fmadd_ps(fa2, v_sa, v_ba);
+        __m512 vb2 = _mm512_fmadd_ps(fb2, v_sb, v_bb);
+
+        __m512 d1 = _mm512_sub_ps(va1, vb1);
+        __m512 d2 = _mm512_sub_ps(va2, vb2);
+
+        vsum = _mm512_fmadd_ps(d1, d1, vsum);
+        vsum = _mm512_fmadd_ps(d2, d2, vsum);
+    }
+
+    for (; i <= dim - 16; i += 16) {
+        __m128i ua = _mm_loadu_si128((const __m128i *)(qa + i));
+        __m128i ub = _mm_loadu_si128((const __m128i *)(qb + i));
+
+        __m512 fa = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(ua));
+        __m512 fb = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(ub));
+
+        __m512 va = _mm512_fmadd_ps(fa, v_sa, v_ba);
+        __m512 vb = _mm512_fmadd_ps(fb, v_sb, v_bb);
+
+        __m512 d = _mm512_sub_ps(va, vb);
+        vsum = _mm512_fmadd_ps(d, d, vsum);
+    }
+
+    int rem = dim - i;
+    if (rem > 0) {
+        __mmask16 m = (1u << rem) - 1u;
+
+        __m128i ua = _mm_maskz_loadu_epi8(m, (const void *)(qa + i));
+        __m128i ub = _mm_maskz_loadu_epi8(m, (const void *)(qb + i));
+
+        __m512 fa = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(ua));
+        __m512 fb = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(ub));
+
+        __m512 va = _mm512_fmadd_ps(fa, v_sa, v_ba);
+        __m512 vb = _mm512_fmadd_ps(fb, v_sb, v_bb);
+        __m512 d  = _mm512_sub_ps(va, vb);
+
+        __m512 d2 = _mm512_mul_ps(d, d);
+        vsum = _mm512_mask_add_ps(vsum, m, vsum, d2);
+    }
+
+    return hnsw_reduce_add_ps(vsum);
+}
+
+/* ---- 运行期CPU特性检测：缓存检测结果 ---- */
+static inline int
+HnswAvx512EnabledCached(void)
+{
+#if defined(__x86_64__) && defined(__GNUC__)
+    static int cached = -1;
+    if (__builtin_expect(cached < 0, 0)) {
+        cached = (__builtin_cpu_supports("avx512f") &&
+                  __builtin_cpu_supports("avx512bw") &&
+                  __builtin_cpu_supports("avx512vl") &&
+                  __builtin_cpu_supports("avx512dq") &&
+                  __builtin_cpu_supports("fma")) ? 1 : 0;
+    }
+    return cached;
+#else
+    return 0;
+#endif
+}
+
+/*
+ * 【主入口】AVX-512优化的SQ8距离计算
+ * 保持原有签名和返回语义，内部自动选择最优实现
+ */
+static inline float
+HnswSQ8Distance2_Vector(Vector *a, Vector *b)
+{
+#if HNSW_SQ8_FORCE_AVX512
+    return HnswSQ8Distance2_Vector_avx512(a, b);
+#else
+    if (__builtin_expect(HnswAvx512EnabledCached(), 1))
+        return HnswSQ8Distance2_Vector_avx512(a, b);
+    else
+        return HnswSQ8Distance2_Vector_scalar(a, b);
+#endif
 }
 
 /*
