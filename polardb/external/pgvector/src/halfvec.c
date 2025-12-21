@@ -1,7 +1,12 @@
 #include "postgres.h"
 
 #include <math.h>
-
+/*----新增----*/
+#include <string.h>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+/*-----------*/
 #include "bitvec.h"
 #include "catalog/pg_type.h"
 #include "common/shortest_dec.h"
@@ -65,6 +70,253 @@ CheckDims(HalfVector * a, HalfVector * b)
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("different halfvec dimensions %d and %d", a->dim, b->dim)));
 }
+
+/*--------------------新增------------------*/
+static inline float
+half_to_float_soft(uint16 h)
+{
+    uint32 sign = ((uint32)h & 0x8000u) << 16;
+    uint32 exp  = ((uint32)h & 0x7C00u) >> 10;
+    uint32 mant =  (uint32)h & 0x03FFu;
+
+    uint32 f;
+    if (exp == 0)
+    {
+        if (mant == 0)
+        {
+            f = sign; /* +/-0 */
+        }
+        else
+        {
+            /* subnormal -> normal */
+            exp = 1;
+            while ((mant & 0x0400u) == 0)
+            {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x03FFu;
+            uint32 exp_f  = (exp + (127 - 15)) << 23;
+            uint32 mant_f = mant << 13;
+            f = sign | exp_f | mant_f;
+        }
+    }
+    else if (exp == 0x1F)
+    {
+        /* Inf/NaN */
+        uint32 exp_f  = 0xFFu << 23;
+        uint32 mant_f = mant << 13;
+        f = sign | exp_f | mant_f;
+    }
+    else
+    {
+        uint32 exp_f  = (exp + (127 - 15)) << 23;
+        uint32 mant_f = mant << 13;
+        f = sign | exp_f | mant_f;
+    }
+
+    float out;
+    memcpy(&out, &f, sizeof(out));
+    return out;
+}
+
+static inline double
+halfvec_l2_squared_scalar(const HalfVector *a, const HalfVector *b)
+{
+    /* 维度检查仍然由外层 CheckDims 负责，这里假定 dim 已一致 */
+    const int dim = a->dim;
+    const uint16 *ax = (const uint16 *) a->x;
+    const uint16 *bx = (const uint16 *) b->x;
+
+    double acc = 0.0;
+    for (int i = 0; i < dim; i++)
+    {
+        float fa = half_to_float_soft(ax[i]);
+        float fb = half_to_float_soft(bx[i]);
+        float d = fa - fb;
+        acc += (double)d * (double)d;
+    }
+    return acc;
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+
+static inline void
+cpuid_ex(unsigned leaf, unsigned subleaf,
+         unsigned *eax, unsigned *ebx, unsigned *ecx, unsigned *edx)
+{
+#if defined(_MSC_VER)
+    int regs[4];
+    __cpuidex(regs, (int)leaf, (int)subleaf);
+    *eax = (unsigned)regs[0];
+    *ebx = (unsigned)regs[1];
+    *ecx = (unsigned)regs[2];
+    *edx = (unsigned)regs[3];
+#else
+    unsigned a, b, c, d;
+    __asm__ volatile("cpuid"
+                     : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                     : "a"(leaf), "c"(subleaf));
+    *eax = a; *ebx = b; *ecx = c; *edx = d;
+#endif
+}
+
+static inline unsigned long long
+xgetbv_u32(unsigned int index)
+{
+#if defined(_MSC_VER)
+    return _xgetbv(index);
+#else
+    unsigned int eax, edx;
+    __asm__ volatile("xgetbv" : "=a"(eax), "=d"(edx) : "c"(index));
+    return ((unsigned long long)edx << 32) | eax;
+#endif
+}
+
+/*
+ * 检测：OS 是否启用 AVX 状态保存 + CPU 是否支持 AVX2 + F16C
+ * - AVX2: CPUID.(EAX=7,ECX=0):EBX bit 5
+ * - F16C: CPUID.(EAX=1):ECX bit 29
+ * - OSXSAVE: CPUID.(EAX=1):ECX bit 27
+ * - AVX: CPUID.(EAX=1):ECX bit 28
+ * - XCR0 SSE+AVX enabled: bits 1 and 2 set
+ */
+static inline int
+cpu_has_avx2_f16c(void)
+{
+    unsigned eax, ebx, ecx, edx;
+
+    cpuid_ex(1, 0, &eax, &ebx, &ecx, &edx);
+    const int osxsave = (ecx >> 27) & 1;
+    const int avx     = (ecx >> 28) & 1;
+    const int f16c    = (ecx >> 29) & 1;
+
+    if (!(osxsave && avx && f16c))
+        return 0;
+
+    unsigned long long xcr0 = xgetbv_u32(0);
+    /* XMM (bit1) + YMM (bit2) */
+    if ((xcr0 & 0x6) != 0x6)
+        return 0;
+
+    cpuid_ex(7, 0, &eax, &ebx, &ecx, &edx);
+    const int avx2 = (ebx >> 5) & 1;
+
+    return avx2;
+}
+
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+/*
+ * AVX2+F16C path. Use target attribute to avoid global -mavx2 flags.
+ * Note: we accumulate in float for speed; half precision input makes this acceptable.
+ */
+__attribute__((target("avx2,f16c")))
+static inline double
+halfvec_l2_squared_avx2_f16c(const HalfVector *a, const HalfVector *b)
+{
+    const int dim = a->dim;
+    const uint16 *ax = (const uint16 *) a->x;
+    const uint16 *bx = (const uint16 *) b->x;
+
+    __m256 vacc0 = _mm256_setzero_ps();
+    __m256 vacc1 = _mm256_setzero_ps();
+    __m256 vacc2 = _mm256_setzero_ps();
+    __m256 vacc3 = _mm256_setzero_ps();
+
+    int i = 0;
+
+    /* unroll 32 dims */
+    for (; i + 32 <= dim; i += 32)
+    {
+        __m128i ha0 = _mm_loadu_si128((const __m128i *)(ax + i));
+        __m128i hb0 = _mm_loadu_si128((const __m128i *)(bx + i));
+        __m256 fa0 = _mm256_cvtph_ps(ha0);
+        __m256 fb0 = _mm256_cvtph_ps(hb0);
+        __m256 d0  = _mm256_sub_ps(fa0, fb0);
+        vacc0 = _mm256_add_ps(vacc0, _mm256_mul_ps(d0, d0));
+
+        __m128i ha1 = _mm_loadu_si128((const __m128i *)(ax + i + 8));
+        __m128i hb1 = _mm_loadu_si128((const __m128i *)(bx + i + 8));
+        __m256 fa1 = _mm256_cvtph_ps(ha1);
+        __m256 fb1 = _mm256_cvtph_ps(hb1);
+        __m256 d1  = _mm256_sub_ps(fa1, fb1);
+        vacc1 = _mm256_add_ps(vacc1, _mm256_mul_ps(d1, d1));
+
+        __m128i ha2 = _mm_loadu_si128((const __m128i *)(ax + i + 16));
+        __m128i hb2 = _mm_loadu_si128((const __m128i *)(bx + i + 16));
+        __m256 fa2 = _mm256_cvtph_ps(ha2);
+        __m256 fb2 = _mm256_cvtph_ps(hb2);
+        __m256 d2  = _mm256_sub_ps(fa2, fb2);
+        vacc2 = _mm256_add_ps(vacc2, _mm256_mul_ps(d2, d2));
+
+        __m128i ha3 = _mm_loadu_si128((const __m128i *)(ax + i + 24));
+        __m128i hb3 = _mm_loadu_si128((const __m128i *)(bx + i + 24));
+        __m256 fa3 = _mm256_cvtph_ps(ha3);
+        __m256 fb3 = _mm256_cvtph_ps(hb3);
+        __m256 d3  = _mm256_sub_ps(fa3, fb3);
+        vacc3 = _mm256_add_ps(vacc3, _mm256_mul_ps(d3, d3));
+    }
+
+    __m256 vacc = _mm256_add_ps(_mm256_add_ps(vacc0, vacc1), _mm256_add_ps(vacc2, vacc3));
+
+    /* remaining blocks of 8 */
+    for (; i + 8 <= dim; i += 8)
+    {
+        __m128i ha = _mm_loadu_si128((const __m128i *)(ax + i));
+        __m128i hb = _mm_loadu_si128((const __m128i *)(bx + i));
+        __m256 fa = _mm256_cvtph_ps(ha);
+        __m256 fb = _mm256_cvtph_ps(hb);
+        __m256 d  = _mm256_sub_ps(fa, fb);
+        vacc = _mm256_add_ps(vacc, _mm256_mul_ps(d, d));
+    }
+
+    /* horizontal sum of vacc */
+    __m128 vlow  = _mm256_castps256_ps128(vacc);
+    __m128 vhigh = _mm256_extractf128_ps(vacc, 1);
+    __m128 vsum  = _mm_add_ps(vlow, vhigh);
+    vsum = _mm_hadd_ps(vsum, vsum);
+    vsum = _mm_hadd_ps(vsum, vsum);
+    float acc = _mm_cvtss_f32(vsum);
+
+    /* tail */
+    for (; i < dim; i++)
+    {
+        float fa = half_to_float_soft(ax[i]);
+        float fb = half_to_float_soft(bx[i]);
+        float d = fa - fb;
+        acc += d * d;
+    }
+
+    return (double)acc;
+}
+#endif
+
+static inline double
+halfvec_l2_squared_fast(const HalfVector *a, const HalfVector *b)
+{
+#if defined(__x86_64__) || defined(_M_X64)
+    static int use_simd = -1;
+    if (use_simd < 0)
+    {
+        #if defined(__x86_64__) || defined(_M_X64)
+			static int use_simd = -1;
+			if (use_simd < 0)
+				use_simd = cpu_has_avx2_f16c();
+			if (use_simd)
+				return halfvec_l2_squared_avx2_f16c(a, b);
+		#endif
+
+    }
+    if (use_simd)
+        return halfvec_l2_squared_avx2_f16c(a, b);
+#endif
+    return halfvec_l2_squared_scalar(a, b);
+}
+
+/*--------------------------------------------------------------------*/
+
 
 /*
  * Ensure expected dimensions
@@ -551,7 +803,9 @@ halfvec_l2_distance(PG_FUNCTION_ARGS)
 
 	CheckDims(a, b);
 
-	PG_RETURN_FLOAT8(sqrt((double) HalfvecL2SquaredDistance(a->dim, a->x, b->x)));
+	/*----------新增+修改------------*/
+	double dist2 = halfvec_l2_squared_fast(a, b);
+	PG_RETURN_FLOAT8(sqrt(dist2));
 }
 
 /*
@@ -571,8 +825,9 @@ halfvec_l2_squared_distance(PG_FUNCTION_ARGS)
         // 直接调用写好的极致加速版
         return Float8GetDatum((double) HalfvecL2SquaredDistance200_Avx512(a->dim, a->x, b->x));
     }
-
-	PG_RETURN_FLOAT8((double) HalfvecL2SquaredDistance(a->dim, a->x, b->x));
+	/*---------新增+修改---------*/
+	double dist2 = halfvec_l2_squared_fast(a, b);
+	PG_RETURN_FLOAT8(dist2);
 }
 
 /*
