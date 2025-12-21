@@ -32,68 +32,9 @@
 static inline double HnswGetDistance(Datum a, Datum b, HnswSupport * support);
 static float HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support);
 
-/* * 压缩函数：生成一个符合 pgvector 标准的 Vector，但在内部存储 SQ8 数据
- * dest: 已经分配好内存的 Vector 指针
+/* 已删除未使用的QuantizeVectorToPayload函数
+ * 现在使用统一的QuantizeAndSerialize和HnswQuantizeHalfVector函数
  */
-static void
-QuantizeVectorToPayload(Vector *src, Vector *dest)
-{
-    /* C90 变量声明 */
-    int dim;
-    int i;
-    float min_v;
-    float max_v;
-    float scale;
-    float bias;
-    float inv_scale;
-    HnswSQ8Payload *payload;
-    half *hdata;
-
-    dim = src->dim;
-    hdata = (half *)src->x;
-
-    /* 1. 计算统计量 */
-    min_v = 1e30f;
-    max_v = -1e30f;
-    for(i = 0; i < dim; i++) {
-        float val = HalfToFloat4(hdata[i]);
-        if(val < min_v) min_v = val;
-        if(val > max_v) max_v = val;
-    }
-
-    scale = (max_v - min_v) / 255.0f;
-    bias = min_v;
-
-    /* 2. 定位 Payload 写入区 (即 dest->x 的位置) */
-    payload = (HnswSQ8Payload *)dest->x;
-    payload->scale = scale;
-    payload->bias = bias;
-
-    /* 3. 量化写入 */
-    if (scale == 0.0f) {
-        memset(payload->data, 0, dim);
-    } else {
-        inv_scale = 1.0f / scale;
-        for (i = 0; i < dim; i++) {
-            float val = HalfToFloat4(hdata[i]);
-            int32_t q = (int32_t)((val - bias) * inv_scale + 0.5f);
-            if (q < 0) q = 0; else if (q > 255) q = 255;
-            payload->data[i] = (uint8_t)q;
-        }
-    }
-
-    /* 4. 关键：设置 Vector 头部信息，欺骗 pgvector 宏 */
-    /* * 数据总大小 = scale(4) + bias(4) + data(dim) = 8 + dim
-     * Vector 头部 = 8 bytes (vl_len_ + dim + unused)
-     * Total VARSIZE = 8 + 8 + dim = 16 + dim
-     */
-    {
-        int data_size = sizeof(float)*2 + dim;
-        SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) + data_size);
-        dest->dim = dim;
-        dest->unused = 0;
-    }
-}
 #include <stdio.h> // 必须加在文件头
 /* 比赛专用：通用距离计算函数，支持量化和非量化数据 */
 __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
@@ -736,38 +677,42 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 /*
  * Calculate the distance between values
  *
- * 【关键修复】同时检查a和b的类型，支持混合距离计算
- * 这解决了"查询向量是halfvec，索引节点是SQ8"时的recall=0问题
+ * 【性能优化】优化分支预测，使用likely()减少分支预测失败
+ * 零分配的距离计算，显著提升性能
  */
 static inline double
 HnswGetDistance(Datum a, Datum b, HnswSupport * support)
 {
-	/* 使用可靠的SQ8检测函数 */
-	bool a_sq8 = HnswIsSQ8(a);
-	bool b_sq8 = HnswIsSQ8(b);
+	/* 【优化】使用更快速的SQ8检测 - 直接检查unused字段避免复杂计算 */
+	Vector *va = (Vector *) PG_DETOAST_DATUM_PACKED(a);
+	Vector *vb = (Vector *) PG_DETOAST_DATUM_PACKED(b);
 
-	/* 调试统计（采样记录，避免性能影响） */
-	static uint32 debug_counter = 0;
-	if ((++debug_counter % 100000) == 0) {
-		elog(LOG, "HnswGetDistance debug: a_sq8=%d b_sq8=%d counter=%u",
-			 a_sq8 ? 1 : 0, b_sq8 ? 1 : 0, debug_counter);
+	bool a_sq8 = (va->unused == SQ8_TAG);
+	bool b_sq8 = (vb->unused == SQ8_TAG);
+
+	/* 【优化】最常见情况优先：SQ8 vs SQ8（索引内部比较） */
+	if (likely(a_sq8 && b_sq8)) {
+		/* case 1: SQ8 vs SQ8 - 使用零分配优化版本 */
+		return HnswSQ8Distance(a, b);
 	}
 
-	if (!a_sq8 && !b_sq8) {
-		/* case 1: 原始 vs 原始 - 使用标准距离函数 */
+	/* 【优化】次常见情况：原始 vs 原始（纯原始数据比较） */
+	if (likely(!a_sq8 && !b_sq8)) {
+		/* case 2: 原始 vs 原始 - 使用标准距离函数 */
 		return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
-	} else if (a_sq8 && b_sq8) {
-		/* case 2: SQ8 vs SQ8 - 使用SQ8专用距离函数 */
-		return HnswSQ8Distance(a, b);
+	}
+
+	/* 【较少情况】混合类型：SQ8 vs halfvec（查询时发生） */
+	if (a_sq8) {
+		/* a=SQ8, b=halfvec - 使用零分配混合距离 */
+		Vector *sq8_vec = (Vector *) PG_DETOAST_DATUM_PACKED(a);
+		HalfVector *half_vec = (HalfVector *) PG_DETOAST_DATUM_PACKED(b);
+		return (double)HnswSQ8HalfvecDistance2(sq8_vec, half_vec);
 	} else {
-		/* case 3: 混合类型 - SQ8 vs halfvec（这是关键修复！） */
-		if (a_sq8) {
-			/* a=SQ8, b=halfvec */
-			return HnswSQ8HalfvecDistance(a, b);
-		} else {
-			/* b=SQ8, a=halfvec */
-			return HnswSQ8HalfvecDistance(b, a);
-		}
+		/* b=SQ8, a=halfvec - 使用零分配混合距离 */
+		Vector *sq8_vec = (Vector *) PG_DETOAST_DATUM_PACKED(b);
+		HalfVector *half_vec = (HalfVector *) PG_DETOAST_DATUM_PACKED(a);
+		return (double)HnswSQ8HalfvecDistance2(sq8_vec, half_vec);
 	}
 }
 

@@ -787,10 +787,101 @@ HnswDequantizeSQ8(Vector *quantized_vec, float *dequantized_data)
 }
 
 /*
- * 计算 SQ8 与 halfvec 之间的混合距离
- * a_sq8: SQ8量化的向量
- * b_half: 原始的halfvec向量
- * 返回: L2距离（不需要开方，用于排序）
+ * 【性能优化】零分配的SQ8 vs SQ8距离计算（平方距离，无sqrt）
+ * 边解码边累加，无内存分配，适用于高频调用场景
+ */
+static inline float
+HnswSQ8Distance2_Vector(Vector *a, Vector *b)
+{
+    int dim = a->dim;
+
+    char *bufa = (char *) a->x;
+    char *bufb = (char *) b->x;
+
+    /* 提取scale和bias */
+    float sa, ba, sb, bb;
+    memcpy(&sa, bufa, sizeof(float));
+    memcpy(&ba, bufa + sizeof(float), sizeof(float));
+    memcpy(&sb, bufb, sizeof(float));
+    memcpy(&bb, bufb + sizeof(float), sizeof(float));
+
+    uint8_t *qa = (uint8_t *)(bufa + sizeof(float) * 2);
+    uint8_t *qb = (uint8_t *)(bufb + sizeof(float) * 2);
+
+    double sum = 0.0;
+
+    /* 边解码边计算，避免中间数组 */
+    if (sa == 0.0f && sb == 0.0f) {
+        /* 两个都是常数向量 */
+        float diff = ba - bb;
+        sum = (double)dim * (double)diff * (double)diff;
+    } else if (sa == 0.0f) {
+        /* 向量A是常数 */
+        for (int i = 0; i < dim; i++) {
+            float vb = (float)qb[i] * sb + bb;
+            float d = ba - vb;
+            sum += (double)d * (double)d;
+        }
+    } else if (sb == 0.0f) {
+        /* 向量B是常数 */
+        for (int i = 0; i < dim; i++) {
+            float va = (float)qa[i] * sa + ba;
+            float d = va - bb;
+            sum += (double)d * (double)d;
+        }
+    } else {
+        /* 两个都是变量向量 */
+        for (int i = 0; i < dim; i++) {
+            float va = (float)qa[i] * sa + ba;
+            float vb = (float)qb[i] * sb + bb;
+            float d = va - vb;
+            sum += (double)d * (double)d;
+        }
+    }
+
+    return (float)sum;  /* 返回平方距离，无需sqrt */
+}
+
+/*
+ * 【性能优化】零分配的SQ8 vs halfvec混合距离计算（平方距离，无sqrt）
+ * 边解码边half->float转换，无内存分配
+ */
+static inline float
+HnswSQ8HalfvecDistance2(Vector *sq8, HalfVector *hv)
+{
+    int dim = sq8->dim;
+    char *buf = (char *) sq8->x;
+
+    /* 提取scale和bias */
+    float s, b;
+    memcpy(&s, buf, sizeof(float));
+    memcpy(&b, buf + sizeof(float), sizeof(float));
+    uint8_t *q = (uint8_t *)(buf + sizeof(float) * 2);
+
+    double sum = 0.0;
+
+    if (s == 0.0f) {
+        /* SQ8全是bias，优化计算 */
+        for (int i = 0; i < dim; i++) {
+            float vb = HalfToFloat4(hv->x[i]);
+            float d = b - vb;
+            sum += (double)d * (double)d;
+        }
+    } else {
+        /* 边解码边转换计算 */
+        for (int i = 0; i < dim; i++) {
+            float va = (float)q[i] * s + b;
+            float vb = HalfToFloat4(hv->x[i]);
+            float d = va - vb;
+            sum += (double)d * (double)d;
+        }
+    }
+
+    return (float)sum;  /* 返回平方距离，无需sqrt */
+}
+
+/*
+ * 计算 SQ8 与 halfvec 之间的混合距离（保留版本，用于兼容）
  */
 static inline double
 HnswSQ8HalfvecDistance(Datum a_sq8, Datum b_half)
@@ -802,37 +893,13 @@ HnswSQ8HalfvecDistance(Datum a_sq8, Datum b_half)
     if (half_vec->dim != dim)
         elog(ERROR, "dimension mismatch: sq8=%d halfvec=%d", dim, half_vec->dim);
 
-    /* 解 SQ8 的 scale/bias + codes */
-    char *buffer = (char *) sq8_vec->x;
-    float scale, bias;
-    memcpy(&scale, buffer, sizeof(float));
-    memcpy(&bias,  buffer + sizeof(float), sizeof(float));
-    uint8_t *code_ptr = (uint8_t *)(buffer + sizeof(float) * 2);
-
-    double sum = 0.0;
-
-    if (scale == 0.0f) {
-        /* SQ8 全部是 bias */
-        for (int i = 0; i < dim; i++) {
-            float bval = HalfToFloat4(half_vec->x[i]);
-            float diff = bias - bval;
-            sum += (double)diff * (double)diff;
-        }
-    } else {
-        for (int i = 0; i < dim; i++) {
-            float aval = (float)code_ptr[i] * scale + bias;
-            float bval = HalfToFloat4(half_vec->x[i]);
-            float diff = aval - bval;
-            sum += (double)diff * (double)diff;
-        }
-    }
-
-    return sum;  /* L2排序不需要sqrt */
+    /* 调用优化版本 */
+    return (double)HnswSQ8HalfvecDistance2(sq8_vec, half_vec);
 }
 
 /*
- * 计算两个 SQ8 量化向量之间的 L2 距离（优化版本，无内存分配）
- * 这个函数专门用于 HNSW 索引中的距离计算
+ * 计算两个 SQ8 量化向量之间的距离（零分配版本）
+ * 直接调用优化版本，返回平方距离
  */
 static inline double
 HnswSQ8Distance(Datum a, Datum b)
@@ -842,54 +909,9 @@ HnswSQ8Distance(Datum a, Datum b)
 
     /* 检查维度一致性 */
     Assert(vec_a->dim == vec_b->dim);
-    int dim = vec_a->dim;
 
-    /* 解码第一个向量 */
-    char *buffer_a = (char *) vec_a->x;
-    float scale_a, bias_a;
-    memcpy(&scale_a, buffer_a, sizeof(float));
-    memcpy(&bias_a,  buffer_a + sizeof(float), sizeof(float));
-    uint8_t *code_a = (uint8_t *)(buffer_a + sizeof(float) * 2);
-
-    /* 解码第二个向量 */
-    char *buffer_b = (char *) vec_b->x;
-    float scale_b, bias_b;
-    memcpy(&scale_b, buffer_b, sizeof(float));
-    memcpy(&bias_b,  buffer_b + sizeof(float), sizeof(float));
-    uint8_t *code_b = (uint8_t *)(buffer_b + sizeof(float) * 2);
-
-    double sum = 0.0;
-
-    /* 直接计算距离，避免分配临时数组 */
-    if (scale_a == 0.0f && scale_b == 0.0f) {
-        /* 两个向量都是常数 */
-        float diff = bias_a - bias_b;
-        sum = (double)dim * (double)diff * (double)diff;
-    } else if (scale_a == 0.0f) {
-        /* 向量A是常数 */
-        for (int i = 0; i < dim; i++) {
-            float bval = (float)code_b[i] * scale_b + bias_b;
-            float diff = bias_a - bval;
-            sum += (double)diff * (double)diff;
-        }
-    } else if (scale_b == 0.0f) {
-        /* 向量B是常数 */
-        for (int i = 0; i < dim; i++) {
-            float aval = (float)code_a[i] * scale_a + bias_a;
-            float diff = aval - bias_b;
-            sum += (double)diff * (double)diff;
-        }
-    } else {
-        /* 两个向量都是变量 */
-        for (int i = 0; i < dim; i++) {
-            float aval = (float)code_a[i] * scale_a + bias_a;
-            float bval = (float)code_b[i] * scale_b + bias_b;
-            float diff = aval - bval;
-            sum += (double)diff * (double)diff;
-        }
-    }
-
-    return sum;  /* L2排序不需要sqrt */
+    /* 直接调用零分配优化版本 */
+    return (double)HnswSQ8Distance2_Vector(vec_a, vec_b);
 }
 
 #endif
