@@ -1279,7 +1279,7 @@ CheckElementCloser(char *base, HnswCandidate * e, List *r, HnswSupport * support
 		HnswElement riElement = HnswPtrAccess(base, ri->element);
 		Datum		riValue = HnswGetValue(base, riElement);
 		/* === 比赛专用 Hack：使用优化的距离计算 === */
-		float		distance = HnswGetDistanceOptimized(eValue, riValue, support);
+		float		distance = (float)HnswGetDistance(eValue, riValue, support);
 
 		if (distance <= e->distance)
 			return false;
