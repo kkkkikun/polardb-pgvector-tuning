@@ -629,4 +629,67 @@ QuantizeAndSerialize(Vector *src, Vector *dest)
     SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) + sizeof(float)*2 + dim);
 }
 
+/*
+ * 从 SQ8 量化的 Vector 中解码为 float 数组 (用于距离计算)
+ */
+static inline void
+HnswDequantizeSQ8(Vector *quantized_vec, float *dequantized_data)
+{
+    int dim = quantized_vec->dim;
+    char *buffer = (char *)quantized_vec->x;
+
+    /* 提取 scale 和 bias */
+    float scale, bias;
+    memcpy(&scale, buffer, sizeof(float));
+    memcpy(&bias, buffer + sizeof(float), sizeof(float));
+
+    /* 解码量化数据 */
+    uint8_t *code_ptr = (uint8_t *)(buffer + sizeof(float) * 2);
+
+    if (scale == 0.0f) {
+        /* 所有值都是 bias */
+        for (int i = 0; i < dim; i++) {
+            dequantized_data[i] = bias;
+        }
+    } else {
+        for (int i = 0; i < dim; i++) {
+            dequantized_data[i] = (float)code_ptr[i] * scale + bias;
+        }
+    }
+}
+
+/*
+ * 计算两个 SQ8 量化向量之间的 L2 距离
+ * 这个函数专门用于 HNSW 索引中的距离计算
+ */
+static inline double
+HnswSQ8Distance(Datum a, Datum b)
+{
+    Vector *vec_a = (Vector *) DatumGetPointer(a);
+    Vector *vec_b = (Vector *) DatumGetPointer(b);
+
+    int dim = vec_a->dim;
+
+    /* 创建临时数组用于解码 */
+    float *data_a = (float *) palloc(sizeof(float) * dim);
+    float *data_b = (float *) palloc(sizeof(float) * dim);
+
+    /* 解码两个量化向量 */
+    HnswDequantizeSQ8(vec_a, data_a);
+    HnswDequantizeSQ8(vec_b, data_b);
+
+    /* 计算 L2 距离 */
+    double sum_squared = 0.0;
+    for (int i = 0; i < dim; i++) {
+        float diff = data_a[i] - data_b[i];
+        sum_squared += (double)diff * (double)diff;
+    }
+
+    /* 释放临时数组 */
+    pfree(data_a);
+    pfree(data_b);
+
+    return sqrt(sum_squared);
+}
+
 #endif

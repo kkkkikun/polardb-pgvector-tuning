@@ -727,7 +727,19 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 static inline double
 HnswGetDistance(Datum a, Datum b, HnswSupport * support)
 {
-	return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
+	/* 检查是否为 SQ8 量化数据 */
+	Vector *vec_a = (Vector *) DatumGetPointer(a);
+
+	/* SQ8 数据的长度特征: VARHDRSZ + sizeof(int16) + sizeof(uint16) + sizeof(float)*2 + dim */
+	int expected_sq8_size = VARHDRSZ + sizeof(int16) + sizeof(uint16) + sizeof(float)*2 + vec_a->dim;
+
+	if (VARSIZE(vec_a) == expected_sq8_size) {
+		/* 这是 SQ8 量化数据，使用专用的距离计算函数 */
+		return HnswSQ8Distance(a, b);
+	} else {
+		/* 这是原始数据，使用标准的距离计算函数 */
+		return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
+	}
 }
 
 /*
