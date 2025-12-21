@@ -1080,42 +1080,153 @@ HnswSQ8Distance2_Vector(Vector *a, Vector *b)
 #endif
 }
 
+/* ---- 256-bit 水平求和：用于 _mm512 的 reduce ---- */
+__attribute__((target("avx,fma,avx2")))
+static inline float
+hsum256_ps(__m256 v)
+{
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 sum = _mm_add_ps(lo, hi);
+
+    sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+    sum = _mm_add_ss(sum, _mm_shuffle_ps(sum, sum, 0x55));
+    sum = _mm_add_ss(sum, _mm_shuffle_ps(sum, sum, 0xAA));
+    return _mm_cvtss_f32(sum);
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
+static inline float
+hsum512_ps(__m512 v)
+{
+    __m256 lo = _mm512_castps512_ps256(v);
+    __m256 hi = _mm512_extractf32x8_ps(v, 1);
+    __m256 sum = _mm256_add_ps(lo, hi);
+    return hsum256_ps(sum);
+}
+
 /*
- * 【性能优化】零分配的SQ8 vs halfvec混合距离计算（平方距离，无sqrt）
- * 边解码边half->float转换，无内存分配
+ * 【AVX-512优化】SQ8 vs halfvec混合距离计算（精确匹配HalfVector定义）
+ *
+ * 说明：
+ * - sq8: Vector*，其中 sq8->x 指向 payload，布局为：
+ *   [float scale][float bias][uint8 q[dim]]
+ * - hv : HalfVector*，hv->x 是 half(=uint16) 数组
+ *
+ * 返回：L2 平方距离（不做 sqrt）
+ */
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
+static inline float
+HnswSQ8HalfvecDistance2_AVX512(const Vector *sq8, const HalfVector *hv)
+{
+    const int dim = (int)sq8->dim;
+
+    /* payload 起点：sq8->x 被当作字节数组使用 */
+    const char *buf = (const char *)sq8->x;
+
+    float s, b;
+    memcpy(&s, buf, sizeof(float));
+    memcpy(&b, buf + sizeof(float), sizeof(float));
+
+    const uint8_t *q = (const uint8_t *)(buf + sizeof(float) * 2);
+    const half *hx = (const half *)hv->x; /* half == uint16 */
+
+    __m512 v_sum = _mm512_setzero_ps();
+
+    /* s==0：常数向量（全是 bias），不需要读取 q */
+    if (s == 0.0f)
+    {
+        const __m512 v_bias = _mm512_set1_ps(b);
+
+        int i = 0;
+        for (; i + 16 <= dim; i += 16)
+        {
+            /* load 16 half(=uint16) -> convert to 16 float */
+            __m256i h16 = _mm256_loadu_si256((const __m256i *)(hx + i));
+            __m512  v_h = _mm512_cvtph_ps(h16);
+
+            __m512 v_diff = _mm512_sub_ps(v_h, v_bias);
+            v_sum = _mm512_fmadd_ps(v_diff, v_diff, v_sum);
+        }
+
+        /* tail (<16) */
+        if (i < dim)
+        {
+            const int remain = dim - i;
+            const __mmask16 mask = (__mmask16)((1u << remain) - 1u);
+
+            __m256i h16 = _mm256_maskz_loadu_epi16(mask, (const void *)(hx + i));
+            __m512  v_h = _mm512_cvtph_ps(h16);
+
+            __m512 v_diff = _mm512_sub_ps(v_h, v_bias);
+
+            /* 只对 mask 内 lanes 累加 */
+            __m512 v_sq = _mm512_mul_ps(v_diff, v_diff);
+            v_sum = _mm512_add_ps(v_sum, _mm512_maskz_mov_ps(mask, v_sq));
+        }
+
+        return hsum512_ps(v_sum);
+    }
+
+    /* 一般情况：SQ8 解码 + half 转 float */
+    const __m512 v_scale = _mm512_set1_ps(s);
+    const __m512 v_bias  = _mm512_set1_ps(b);
+
+    int i = 0;
+    for (; i + 16 <= dim; i += 16)
+    {
+        /* ---- SQ8: load 16 bytes -> u8 to i32 -> float ---- */
+        __m128i u8_16 = _mm_loadu_si128((const __m128i *)(q + i));
+        __m512i i32   = _mm512_cvtepu8_epi32(u8_16);
+        __m512  v_q8  = _mm512_cvtepi32_ps(i32);
+
+        /* dequant: v_rec = v_q8 * scale + bias */
+        __m512 v_rec = _mm512_fmadd_ps(v_q8, v_scale, v_bias);
+
+        /* ---- halfvec: load 16 half -> float ---- */
+        __m256i h16 = _mm256_loadu_si256((const __m256i *)(hx + i));
+        __m512  v_h = _mm512_cvtph_ps(h16);
+
+        /* diff + accumulate */
+        __m512 v_diff = _mm512_sub_ps(v_h, v_rec);
+        v_sum = _mm512_fmadd_ps(v_diff, v_diff, v_sum);
+    }
+
+    /* tail (<16) */
+    if (i < dim)
+    {
+        const int remain = dim - i;
+        const __mmask16 mask = (__mmask16)((1u << remain) - 1u);
+
+        __m128i u8_16 = _mm_maskz_loadu_epi8(mask, (const void *)(q + i));
+        __m512i i32   = _mm512_cvtepu8_epi32(u8_16);
+        __m512  v_q8  = _mm512_cvtepi32_ps(i32);
+        __m512  v_rec = _mm512_fmadd_ps(v_q8, v_scale, v_bias);
+
+        __m256i h16 = _mm256_maskz_loadu_epi16(mask, (const void *)(hx + i));
+        __m512  v_h = _mm512_cvtph_ps(h16);
+
+        __m512 v_diff = _mm512_sub_ps(v_h, v_rec);
+
+        __m512 v_sq = _mm512_mul_ps(v_diff, v_diff);
+        v_sum = _mm512_add_ps(v_sum, _mm512_maskz_mov_ps(mask, v_sq));
+    }
+
+    return hsum512_ps(v_sum);
+}
+
+/*
+ * 【主入口】AVX-512优化的SQ8 vs halfvec混合距离计算
+ * 保持原有签名不变，内部直接调用AVX-512版本
  */
 static inline float
 HnswSQ8HalfvecDistance2(Vector *sq8, HalfVector *hv)
 {
-    int dim = sq8->dim;
-    char *buf = (char *) sq8->x;
+    /* 维度检查：保持原语义 */
+    if ((int)hv->dim != (int)sq8->dim)
+        elog(ERROR, "dimension mismatch: sq8=%d halfvec=%d", sq8->dim, hv->dim);
 
-    /* 提取scale和bias */
-    float s, b;
-    memcpy(&s, buf, sizeof(float));
-    memcpy(&b, buf + sizeof(float), sizeof(float));
-    uint8_t *q = (uint8_t *)(buf + sizeof(float) * 2);
-
-    double sum = 0.0;
-
-    if (s == 0.0f) {
-        /* SQ8全是bias，优化计算 */
-        for (int i = 0; i < dim; i++) {
-            float vb = HalfToFloat4(hv->x[i]);
-            float d = b - vb;
-            sum += (double)d * (double)d;
-        }
-    } else {
-        /* 边解码边转换计算 */
-        for (int i = 0; i < dim; i++) {
-            float va = (float)q[i] * s + b;
-            float vb = HalfToFloat4(hv->x[i]);
-            float d = va - vb;
-            sum += (double)d * (double)d;
-        }
-    }
-
-    return (float)sum;  /* 返回平方距离，无需sqrt */
+    return HnswSQ8HalfvecDistance2_AVX512(sq8, hv);
 }
 
 /*
