@@ -11,10 +11,41 @@ TESTS = $(wildcard test/sql/*.sql)
 REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
 REGRESS_OPTS = --inputdir=test --load-extension=$(EXTENSION)
 
-# To compile for portability, run: make OPTFLAGS=""
-# 强制开启针对你机器的所有 AVX512 优化
-# -mavx512bw 是关键，它支持 byte 到 int 的快速转换
-override CFLAGS += -march=native -O3 -funroll-loops -mavx512f -mavx512vl -mavx512bw -mavx512dq
+# =========================================================
+# 🚀 比赛专用编译配置 (支持 PGO + AVX512 + LTO)
+# =========================================================
+
+# 1. 基础极速参数 (Base Flags)
+# -march=native: 针对评测机 CPU 架构优化
+# -flto: 开启链接时全局优化 (关键!)
+# -mavx512...: 强制开启向量指令集
+BASE_FLAGS = -march=native -O3 -flto -funroll-loops \
+             -mavx512f -mavx512vl -mavx512bw -mavx512dq \
+             -mfma -ftree-vectorize -fassociative-math \
+             -fno-signed-zeros -fno-trapping-math
+
+# 2. PGO 模式控制 (由 build.sh 传入 PGO=xxx 参数控制)
+ifeq ($(PGO),generate)
+    # [阶段一] 插桩模式：生成执行统计信息
+    PGO_FLAGS = -fprofile-generate
+else ifeq ($(PGO),use)
+    # [阶段二] 应用模式：读取统计信息进行优化
+    # -Wno-missing-profile: 忽略部分未覆盖的代码警告
+    # -Wno-coverage-mismatch: 容忍微小的代码行号变化
+    PGO_FLAGS = -fprofile-use -Wno-missing-profile -Wno-coverage-mismatch
+else
+    # 默认模式 (普通编译)
+    PGO_FLAGS = 
+endif
+
+# 3. 注入编译器参数
+# 同时修改 CFLAGS (编译) 和 PG_CFLAGS (扩展编译)
+override CFLAGS += $(BASE_FLAGS) $(PGO_FLAGS)
+override PG_CFLAGS += $(BASE_FLAGS) $(PGO_FLAGS)
+
+# =========================================================
+# override BITCODE_CFLAGS += $(MY_COMPETITION_FLAGS)
+# override CFLAGS += -march=native -O3 -funroll-loops -mavx512f -mavx512vl -mavx512bw -mavx512dq
 
 # Mac ARM doesn't always support -march=native
 ifeq ($(shell uname -s), Darwin)
@@ -32,7 +63,7 @@ endif
 # For auto-vectorization:
 # - GCC (needs -ftree-vectorize OR -O3) - https://gcc.gnu.org/projects/tree-ssa/vectorization.html
 # - Clang (could use pragma instead) - https://llvm.org/docs/Vectorizers.html
-override PG_CFLAGS += -O3 -mfma -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
+# override PG_CFLAGS += -O3 -mfma -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
 
 all: sql/$(EXTENSION)--$(EXTVERSION).sql
 

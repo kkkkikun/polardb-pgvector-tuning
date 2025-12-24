@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # build.sh
-#	  Build and setup PolarDB demo cluster
+#   Build and setup PolarDB demo cluster
 #
 # Copyright (c) 2024, Alibaba Group Holding Limited
 #
@@ -18,7 +18,7 @@
 # limitations under the License.
 #
 # IDENTIFICATION
-#	  build.sh
+#   build.sh
 
 #------------------------------------------------------------------------------
 # 0.Logging and Error handling
@@ -193,6 +193,8 @@ for arg do
 done
 
 # 3.2 compiler and configure flags setting
+# 内核级 PGO 开关 (建议保持 off，因为内核编译太慢)
+PGO_MODE="off" 
 make_flag="-j$jobs"
 if [[ $debug == "on" ]]; then
   compiler_flag+=" -O0 -fstack-protector-strong --param=ssp-buffer-size=4"
@@ -202,6 +204,13 @@ else
   # 追加 -Wno-declaration-after-statement 来允许混合声明
   # 追加 -Wno-error 来防止其他非致命警告中断编译
   compiler_flag+=" -O3 -march=native -funroll-loops -flto -fno-semantic-interposition -Wno-declaration-after-statement -Wno-error"
+  
+  # 针对 PGO 的处理 (这里针对的是 Postgres 内核，我们主要用后面的 Online PGO 针对插件)
+  if [[ $PGO_MODE == "generate" ]]; then
+      compiler_flag+=" -fprofile-generate"
+  elif [[ $PGO_MODE == "use" ]]; then
+      compiler_flag+=" -fprofile-use -Wno-missing-profile -Wno-error=coverage-mismatch"
+  fi
 fi
 
 # Compile PolarDB in minimal mode, this will discard some strange dependencies
@@ -234,7 +243,8 @@ export LC_ALL=en_US.UTF-8
 export COPT="${COPT-}"
 export CFLAGS="$compiler_flag ${CFLAGS-}"
 export CXXFLAGS="$compiler_flag ${CXXFLAGS-}"
-export LDFLAGS="-Wl,-rpath,'\$\$ORIGIN/../lib:$base_dir/lib',--build-id=sha1 ${LDFLAGS-}"
+# 关键: 链接器也必须开启 LTO
+export LDFLAGS="-flto -Wl,-rpath,'\$\$ORIGIN/../lib:$base_dir/lib',--build-id=sha1 ${LDFLAGS-}"
 export PATH=$base_dir/bin:${PATH-}
 
 # For now, we have prepared all the options and envs, let's do the actual job.
@@ -265,6 +275,98 @@ if [[ $compile == "on" ]]; then
 else
   warn "Skip compile and install PolarDB"
 fi
+
+# ============================================================
+# 🛡️ Online PGO 自训练模块 (pgvector 专属)
+# 合规性说明：仅在构建阶段运行，不残留进程，不使用外部二进制
+# ============================================================
+if [[ $compile == "on" ]]; then
+    info ">>>>>> [PGO Stage] Starting Online Profile-Guided Optimization for pgvector..."
+
+    # --- 配置区 ---
+    # 定义临时训练目录 (绝对不能与 $pg_data_dir 冲突)
+    PGO_TMP_DIR=$prefix/tmp_pgo_training_env
+    # 使用偏僻端口，防止冲突
+    PGO_PORT=58888 
+    # ⚠️ 训练用向量维度 (必须与赛题半精度 200 维一致!)
+    REAL_DIM=200
+
+    # --- 0. 环境清理 (防残留) ---
+    $base_dir/bin/pg_ctl -D $PGO_TMP_DIR stop -m immediate >/dev/null 2>&1 || true
+    rm -rf $PGO_TMP_DIR
+
+    # --- 1. 第一轮编译: 插桩 (Instrumentation) ---
+    info ">>>>>> [PGO Stage 1/3] Instrumentation Build"
+    cd external/pgvector
+    make clean >/dev/null
+    # 传递 generate 参数，对应 Makefile 的 -fprofile-generate
+    make install PGO=generate >/dev/null
+    cd ../..
+
+    # --- 2. 准备训练环境 ---
+    info ">>>>>> [PGO Stage 2/3] Running Synthetic Workload (Halfvec Mode)"
+    # 初始化临时库
+    $base_dir/bin/initdb -D $PGO_TMP_DIR -A trust >/dev/null
+    # 启动临时库 (使用 -w 等待启动成功)
+    $base_dir/bin/pg_ctl -D $PGO_TMP_DIR -o "-p $PGO_PORT" -w start
+
+    # --- 3. 执行训练负载 (修正版: halfvec + 200维) ---
+    # 增加出错停止机制，防止假成功
+    time $base_dir/bin/psql -p $PGO_PORT -d postgres -v ON_ERROR_STOP=1 <<EOF
+\echo 'Creating extension...'
+CREATE EXTENSION IF NOT EXISTS vector;
+
+\echo 'Creating table (Using halfvec + 200 dims)...'
+-- ⚠️ 关键修改 1: 类型改为 halfvec(200)
+CREATE UNLOGGED TABLE pgo_train (id bigserial, embedding halfvec($REAL_DIM));
+
+\echo 'Inserting 5000 vectors...'
+-- ⚠️ 关键修改 2: 生成数据并强转为 halfvec
+-- random() 生成双精度 -> 转 vector (float32) -> 转 halfvec (float16)
+INSERT INTO pgo_train (embedding) 
+SELECT (SELECT array_agg(random())::vector::halfvec FROM generate_series(1,$REAL_DIM)) 
+FROM generate_series(1, 10000000);
+
+\echo 'Building HNSW index (Using halfvec_l2_ops)...'
+SET maintenance_work_mem = '10GB';
+SET max_parallel_maintenance_workers = 8;
+-- ⚠️ 关键修改 3: 必须使用 halfvec_l2_ops 算子
+-- 参数 m=12, ef=60 对齐比赛日志
+CREATE INDEX ON pgo_train USING hnsw (embedding halfvec_l2_ops) WITH (m=12, ef_construction=60);
+
+\echo 'Running warm-up queries...'
+SET hnsw.ef_search = 80;
+DO \$\$
+BEGIN
+    FOR i IN 1..1000000 LOOP
+        -- ⚠️ 关键修改 4: 查询向量也要转为 halfvec
+        PERFORM id FROM pgo_train 
+        ORDER BY embedding <-> (SELECT array_agg(random())::vector::halfvec FROM generate_series(1,$REAL_DIM)) 
+        LIMIT 10;
+    END LOOP;
+END \$\$;
+\echo 'Workload finished successfully!'
+EOF
+
+    # --- 4. 停止并清理临时环境 ---
+    # 必须彻底关闭，否则会留下 .gcda 数据无法写入磁盘的风险，且影响后续启动
+    $base_dir/bin/pg_ctl -D $PGO_TMP_DIR stop -m immediate
+    rm -rf $PGO_TMP_DIR
+
+    # --- 5. 第二轮编译: 应用优化 (Optimization) ---
+    info ">>>>>> [PGO Stage 3/3] Final Optimized Build"
+    cd external/pgvector
+    # ⚠️ 绝对不要 make clean！否则 .gcda 文件会被删掉
+    # 必须 touch 源文件，欺骗 make 工具重新编译
+    touch src/*.c
+    # 传递 use 参数，对应 Makefile 的 -fprofile-use
+    make install PGO=use >/dev/null
+    cd ../..
+
+    info ">>>>>> [PGO Stage] Complete! vector.so is now optimized."
+fi
+# ============================================================
+
 
 #------------------------------------------------------------------------------
 # 6.Init and Start DB
