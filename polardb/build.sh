@@ -193,6 +193,11 @@ for arg do
 done
 
 # 3.2 compiler and configure flags setting
+# ⚙️ 编译模式全局设置 (在这里快速切换)
+# ============================================================
+# "off"      : 普通编译，速度快，用于日常功能测试和 Bug 修复
+# "on"       : 满血 PGO 编译，速度慢，用于提交比赛或最终测速
+EXT_PGO_MODE="off"
 # 内核级 PGO 开关 (建议保持 off，因为内核编译太慢)
 PGO_MODE="off" 
 make_flag="-j$jobs"
@@ -280,7 +285,7 @@ fi
 # 🛡️ Online PGO 自训练模块 (pgvector 专属)
 # 合规性说明：仅在构建阶段运行，不残留进程，不使用外部二进制
 # ============================================================
-if [[ $compile == "on" ]]; then
+if [[ $compile == "on" ]] && [[ $EXT_PGO_MODE == "on" ]]; then
     info ">>>>>> [PGO Stage] Starting Online Profile-Guided Optimization for pgvector..."
 
     # --- 配置区 ---
@@ -364,6 +369,13 @@ EOF
     cd ../..
 
     info ">>>>>> [PGO Stage] Complete! vector.so is now optimized."
+else
+    # 如果 PGO 设为 off，则只进行一次普通编译，节省时间
+    info ">>>>>> [PGO Stage] PGO is DISABLED. Running normal build for pgvector..."
+    cd external/pgvector
+    make clean >/dev/null
+    make install >/dev/null
+    cd ../..
 fi
 # ============================================================
 
