@@ -32,7 +32,7 @@ endif
 # - GCC (needs -ftree-vectorize OR -O3) - https://gcc.gnu.org/projects/tree-ssa/vectorization.html
 # - Clang (could use pragma instead) - https://llvm.org/docs/Vectorizers.html
 # Added -O3 for maximum optimization, -ffast-math for aggressive floating-point optimization
-PG_CFLAGS += $(OPTFLAGS) -O3 -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math -funroll-loops
+PG_CFLAGS += $(OPTFLAGS) -O3 -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math -funroll-loops -Wno-error
 
 # Enable AVX-512 and FMA for x86_64 platforms
 ifeq ($(shell uname -m), x86_64)
