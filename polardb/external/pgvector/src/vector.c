@@ -26,6 +26,61 @@
 #include "varatt.h"
 #endif
 
+/* SIMD headers for AVX-512/AVX2 optimization */
+#ifdef __x86_64__
+#include <immintrin.h>
+#include <cpuid.h>
+#endif
+
+/* CPU feature detection flags */
+static int cpu_features_detected = 0;
+static int cpu_has_avx512 = 0;
+static int cpu_has_avx2 = 0;
+
+/*
+ * Detect CPU features at runtime
+ */
+static void
+detect_cpu_features(void)
+{
+	if (cpu_features_detected)
+		return;
+
+#ifdef __x86_64__
+	/* Use GCC/Clang built-in CPU detection */
+	__builtin_cpu_init();
+	
+	cpu_has_avx512 = __builtin_cpu_supports("avx512f") && 
+	                 __builtin_cpu_supports("avx512dq");
+	cpu_has_avx2 = __builtin_cpu_supports("avx2") && 
+	               __builtin_cpu_supports("fma");
+#endif
+
+	cpu_features_detected = 1;
+}
+
+/*
+ * Check if CPU supports AVX-512
+ */
+static inline int
+cpu_supports_avx512(void)
+{
+	if (!cpu_features_detected)
+		detect_cpu_features();
+	return cpu_has_avx512;
+}
+
+/*
+ * Check if CPU supports AVX2
+ */
+static inline int
+cpu_supports_avx2(void)
+{
+	if (!cpu_features_detected)
+		detect_cpu_features();
+	return cpu_has_avx2;
+}
+
 #define STATE_DIMS(x) (ARR_DIMS(x)[0] - 1)
 #define CreateStateDatums(dim) palloc(sizeof(Datum) * (dim + 1))
 
@@ -546,8 +601,11 @@ halfvec_to_vector(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(result);
 }
 
-VECTOR_TARGET_CLONES static float
-VectorL2SquaredDistance(int dim, float *ax, float *bx)
+/*
+ * Scalar L2 squared distance (fallback)
+ */
+static float
+VectorL2SquaredDistanceScalar(int dim, float *ax, float *bx)
 {
 	float		distance = 0.0;
 
@@ -560,6 +618,124 @@ VectorL2SquaredDistance(int dim, float *ax, float *bx)
 	}
 
 	return distance;
+}
+
+#ifdef __x86_64__
+/*
+ * AVX-512 optimized L2 squared distance
+ * Processes 16 floats per iteration using 512-bit registers
+ */
+__attribute__((target("avx512f,avx512dq,fma")))
+static float
+VectorL2SquaredDistanceAVX512(int dim, float *ax, float *bx)
+{
+	__m512		sum = _mm512_setzero_ps();
+	int			i = 0;
+	int			dim16 = dim - (dim % 16);
+
+	/* Prefetch next cache lines */
+	_mm_prefetch((const char *)(ax + 64), _MM_HINT_T0);
+	_mm_prefetch((const char *)(bx + 64), _MM_HINT_T0);
+
+	/* Process 16 floats at a time */
+	for (; i < dim16; i += 16)
+	{
+		__m512		a = _mm512_loadu_ps(ax + i);
+		__m512		b = _mm512_loadu_ps(bx + i);
+		__m512		diff = _mm512_sub_ps(a, b);
+
+		/* Prefetch ahead */
+		if (i + 64 < dim)
+		{
+			_mm_prefetch((const char *)(ax + i + 64), _MM_HINT_T0);
+			_mm_prefetch((const char *)(bx + i + 64), _MM_HINT_T0);
+		}
+
+		/* FMA: sum = sum + diff * diff */
+		sum = _mm512_fmadd_ps(diff, diff, sum);
+	}
+
+	/* Reduce 512-bit register to scalar */
+	float		result = _mm512_reduce_add_ps(sum);
+
+	/* Handle remaining elements */
+	for (; i < dim; i++)
+	{
+		float		diff = ax[i] - bx[i];
+
+		result += diff * diff;
+	}
+
+	return result;
+}
+
+/*
+ * AVX2 optimized L2 squared distance (fallback for non-AVX512 CPUs)
+ * Processes 8 floats per iteration using 256-bit registers
+ */
+__attribute__((target("avx2,fma")))
+static float
+VectorL2SquaredDistanceAVX2(int dim, float *ax, float *bx)
+{
+	__m256		sum = _mm256_setzero_ps();
+	int			i = 0;
+	int			dim8 = dim - (dim % 8);
+
+	/* Prefetch next cache lines */
+	_mm_prefetch((const char *)(ax + 32), _MM_HINT_T0);
+	_mm_prefetch((const char *)(bx + 32), _MM_HINT_T0);
+
+	/* Process 8 floats at a time */
+	for (; i < dim8; i += 8)
+	{
+		__m256		a = _mm256_loadu_ps(ax + i);
+		__m256		b = _mm256_loadu_ps(bx + i);
+		__m256		diff = _mm256_sub_ps(a, b);
+
+		/* Prefetch ahead */
+		if (i + 32 < dim)
+		{
+			_mm_prefetch((const char *)(ax + i + 32), _MM_HINT_T0);
+			_mm_prefetch((const char *)(bx + i + 32), _MM_HINT_T0);
+		}
+
+		/* FMA: sum = sum + diff * diff */
+		sum = _mm256_fmadd_ps(diff, diff, sum);
+	}
+
+	/* Reduce 256-bit register to scalar */
+	__m128		sum128 = _mm_add_ps(_mm256_castps256_ps128(sum),
+									_mm256_extractf128_ps(sum, 1));
+	sum128 = _mm_hadd_ps(sum128, sum128);
+	sum128 = _mm_hadd_ps(sum128, sum128);
+	float		result = _mm_cvtss_f32(sum128);
+
+	/* Handle remaining elements */
+	for (; i < dim; i++)
+	{
+		float		diff = ax[i] - bx[i];
+
+		result += diff * diff;
+	}
+
+	return result;
+}
+#endif /* __x86_64__ */
+
+/*
+ * L2 squared distance with runtime CPU dispatch
+ */
+VECTOR_TARGET_CLONES static float
+VectorL2SquaredDistance(int dim, float *ax, float *bx)
+{
+#ifdef __x86_64__
+	/* Runtime dispatch based on CPU features */
+	if (cpu_supports_avx512())
+		return VectorL2SquaredDistanceAVX512(dim, ax, bx);
+	else if (cpu_supports_avx2())
+		return VectorL2SquaredDistanceAVX2(dim, ax, bx);
+#endif
+	return VectorL2SquaredDistanceScalar(dim, ax, bx);
 }
 
 /*
@@ -593,8 +769,11 @@ vector_l2_squared_distance(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8((double) VectorL2SquaredDistance(a->dim, a->x, b->x));
 }
 
-VECTOR_TARGET_CLONES static float
-VectorInnerProduct(int dim, float *ax, float *bx)
+/*
+ * Scalar inner product (fallback)
+ */
+static float
+VectorInnerProductScalar(int dim, float *ax, float *bx)
 {
 	float		distance = 0.0;
 
@@ -603,6 +782,112 @@ VectorInnerProduct(int dim, float *ax, float *bx)
 		distance += ax[i] * bx[i];
 
 	return distance;
+}
+
+#ifdef __x86_64__
+/*
+ * AVX-512 optimized inner product
+ */
+__attribute__((target("avx512f,avx512dq,fma")))
+static float
+VectorInnerProductAVX512(int dim, float *ax, float *bx)
+{
+	__m512		sum = _mm512_setzero_ps();
+	int			i = 0;
+	int			dim16 = dim - (dim % 16);
+
+	/* Prefetch next cache lines */
+	_mm_prefetch((const char *)(ax + 64), _MM_HINT_T0);
+	_mm_prefetch((const char *)(bx + 64), _MM_HINT_T0);
+
+	/* Process 16 floats at a time */
+	for (; i < dim16; i += 16)
+	{
+		__m512		a = _mm512_loadu_ps(ax + i);
+		__m512		b = _mm512_loadu_ps(bx + i);
+
+		/* Prefetch ahead */
+		if (i + 64 < dim)
+		{
+			_mm_prefetch((const char *)(ax + i + 64), _MM_HINT_T0);
+			_mm_prefetch((const char *)(bx + i + 64), _MM_HINT_T0);
+		}
+
+		/* FMA: sum = sum + a * b */
+		sum = _mm512_fmadd_ps(a, b, sum);
+	}
+
+	/* Reduce 512-bit register to scalar */
+	float		result = _mm512_reduce_add_ps(sum);
+
+	/* Handle remaining elements */
+	for (; i < dim; i++)
+		result += ax[i] * bx[i];
+
+	return result;
+}
+
+/*
+ * AVX2 optimized inner product
+ */
+__attribute__((target("avx2,fma")))
+static float
+VectorInnerProductAVX2(int dim, float *ax, float *bx)
+{
+	__m256		sum = _mm256_setzero_ps();
+	int			i = 0;
+	int			dim8 = dim - (dim % 8);
+
+	/* Prefetch next cache lines */
+	_mm_prefetch((const char *)(ax + 32), _MM_HINT_T0);
+	_mm_prefetch((const char *)(bx + 32), _MM_HINT_T0);
+
+	/* Process 8 floats at a time */
+	for (; i < dim8; i += 8)
+	{
+		__m256		a = _mm256_loadu_ps(ax + i);
+		__m256		b = _mm256_loadu_ps(bx + i);
+
+		/* Prefetch ahead */
+		if (i + 32 < dim)
+		{
+			_mm_prefetch((const char *)(ax + i + 32), _MM_HINT_T0);
+			_mm_prefetch((const char *)(bx + i + 32), _MM_HINT_T0);
+		}
+
+		/* FMA: sum = sum + a * b */
+		sum = _mm256_fmadd_ps(a, b, sum);
+	}
+
+	/* Reduce 256-bit register to scalar */
+	__m128		sum128 = _mm_add_ps(_mm256_castps256_ps128(sum),
+									_mm256_extractf128_ps(sum, 1));
+	sum128 = _mm_hadd_ps(sum128, sum128);
+	sum128 = _mm_hadd_ps(sum128, sum128);
+	float		result = _mm_cvtss_f32(sum128);
+
+	/* Handle remaining elements */
+	for (; i < dim; i++)
+		result += ax[i] * bx[i];
+
+	return result;
+}
+#endif /* __x86_64__ */
+
+/*
+ * Inner product with runtime CPU dispatch
+ */
+VECTOR_TARGET_CLONES static float
+VectorInnerProduct(int dim, float *ax, float *bx)
+{
+#ifdef __x86_64__
+	/* Runtime dispatch based on CPU features */
+	if (cpu_supports_avx512())
+		return VectorInnerProductAVX512(dim, ax, bx);
+	else if (cpu_supports_avx2())
+		return VectorInnerProductAVX2(dim, ax, bx);
+#endif
+	return VectorInnerProductScalar(dim, ax, bx);
 }
 
 /*
@@ -635,8 +920,11 @@ vector_negative_inner_product(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8((double) -VectorInnerProduct(a->dim, a->x, b->x));
 }
 
-VECTOR_TARGET_CLONES static double
-VectorCosineSimilarity(int dim, float *ax, float *bx)
+/*
+ * Scalar cosine similarity (fallback)
+ */
+static double
+VectorCosineSimilarityScalar(int dim, float *ax, float *bx)
 {
 	float		similarity = 0.0;
 	float		norma = 0.0;
@@ -652,6 +940,142 @@ VectorCosineSimilarity(int dim, float *ax, float *bx)
 
 	/* Use sqrt(a * b) over sqrt(a) * sqrt(b) */
 	return (double) similarity / sqrt((double) norma * (double) normb);
+}
+
+#ifdef __x86_64__
+/*
+ * AVX-512 optimized cosine similarity
+ */
+__attribute__((target("avx512f,avx512dq,fma")))
+static double
+VectorCosineSimilarityAVX512(int dim, float *ax, float *bx)
+{
+	__m512		sum_sim = _mm512_setzero_ps();
+	__m512		sum_norma = _mm512_setzero_ps();
+	__m512		sum_normb = _mm512_setzero_ps();
+	int			i = 0;
+	int			dim16 = dim - (dim % 16);
+
+	/* Prefetch next cache lines */
+	_mm_prefetch((const char *)(ax + 64), _MM_HINT_T0);
+	_mm_prefetch((const char *)(bx + 64), _MM_HINT_T0);
+
+	/* Process 16 floats at a time */
+	for (; i < dim16; i += 16)
+	{
+		__m512		a = _mm512_loadu_ps(ax + i);
+		__m512		b = _mm512_loadu_ps(bx + i);
+
+		/* Prefetch ahead */
+		if (i + 64 < dim)
+		{
+			_mm_prefetch((const char *)(ax + i + 64), _MM_HINT_T0);
+			_mm_prefetch((const char *)(bx + i + 64), _MM_HINT_T0);
+		}
+
+		/* FMA operations */
+		sum_sim = _mm512_fmadd_ps(a, b, sum_sim);
+		sum_norma = _mm512_fmadd_ps(a, a, sum_norma);
+		sum_normb = _mm512_fmadd_ps(b, b, sum_normb);
+	}
+
+	/* Reduce 512-bit registers to scalars */
+	float		similarity = _mm512_reduce_add_ps(sum_sim);
+	float		norma = _mm512_reduce_add_ps(sum_norma);
+	float		normb = _mm512_reduce_add_ps(sum_normb);
+
+	/* Handle remaining elements */
+	for (; i < dim; i++)
+	{
+		similarity += ax[i] * bx[i];
+		norma += ax[i] * ax[i];
+		normb += bx[i] * bx[i];
+	}
+
+	return (double) similarity / sqrt((double) norma * (double) normb);
+}
+
+/*
+ * AVX2 optimized cosine similarity
+ */
+__attribute__((target("avx2,fma")))
+static double
+VectorCosineSimilarityAVX2(int dim, float *ax, float *bx)
+{
+	__m256		sum_sim = _mm256_setzero_ps();
+	__m256		sum_norma = _mm256_setzero_ps();
+	__m256		sum_normb = _mm256_setzero_ps();
+	int			i = 0;
+	int			dim8 = dim - (dim % 8);
+
+	/* Prefetch next cache lines */
+	_mm_prefetch((const char *)(ax + 32), _MM_HINT_T0);
+	_mm_prefetch((const char *)(bx + 32), _MM_HINT_T0);
+
+	/* Process 8 floats at a time */
+	for (; i < dim8; i += 8)
+	{
+		__m256		a = _mm256_loadu_ps(ax + i);
+		__m256		b = _mm256_loadu_ps(bx + i);
+
+		/* Prefetch ahead */
+		if (i + 32 < dim)
+		{
+			_mm_prefetch((const char *)(ax + i + 32), _MM_HINT_T0);
+			_mm_prefetch((const char *)(bx + i + 32), _MM_HINT_T0);
+		}
+
+		/* FMA operations */
+		sum_sim = _mm256_fmadd_ps(a, b, sum_sim);
+		sum_norma = _mm256_fmadd_ps(a, a, sum_norma);
+		sum_normb = _mm256_fmadd_ps(b, b, sum_normb);
+	}
+
+	/* Reduce 256-bit registers to scalars */
+	__m128		sim128 = _mm_add_ps(_mm256_castps256_ps128(sum_sim),
+									_mm256_extractf128_ps(sum_sim, 1));
+	sim128 = _mm_hadd_ps(sim128, sim128);
+	sim128 = _mm_hadd_ps(sim128, sim128);
+	float		similarity = _mm_cvtss_f32(sim128);
+
+	__m128		norma128 = _mm_add_ps(_mm256_castps256_ps128(sum_norma),
+									  _mm256_extractf128_ps(sum_norma, 1));
+	norma128 = _mm_hadd_ps(norma128, norma128);
+	norma128 = _mm_hadd_ps(norma128, norma128);
+	float		norma = _mm_cvtss_f32(norma128);
+
+	__m128		normb128 = _mm_add_ps(_mm256_castps256_ps128(sum_normb),
+									  _mm256_extractf128_ps(sum_normb, 1));
+	normb128 = _mm_hadd_ps(normb128, normb128);
+	normb128 = _mm_hadd_ps(normb128, normb128);
+	float		normb = _mm_cvtss_f32(normb128);
+
+	/* Handle remaining elements */
+	for (; i < dim; i++)
+	{
+		similarity += ax[i] * bx[i];
+		norma += ax[i] * ax[i];
+		normb += bx[i] * bx[i];
+	}
+
+	return (double) similarity / sqrt((double) norma * (double) normb);
+}
+#endif /* __x86_64__ */
+
+/*
+ * Cosine similarity with runtime CPU dispatch
+ */
+VECTOR_TARGET_CLONES static double
+VectorCosineSimilarity(int dim, float *ax, float *bx)
+{
+#ifdef __x86_64__
+	/* Runtime dispatch based on CPU features */
+	if (cpu_supports_avx512())
+		return VectorCosineSimilarityAVX512(dim, ax, bx);
+	else if (cpu_supports_avx2())
+		return VectorCosineSimilarityAVX2(dim, ax, bx);
+#endif
+	return VectorCosineSimilarityScalar(dim, ax, bx);
 }
 
 /*
@@ -710,9 +1134,11 @@ vector_spherical_distance(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8(acos(distance) / M_PI);
 }
 
-/* Does not require FMA, but keep logic simple */
-VECTOR_TARGET_CLONES static float
-VectorL1Distance(int dim, float *ax, float *bx)
+/*
+ * Scalar L1 distance (fallback)
+ */
+static float
+VectorL1DistanceScalar(int dim, float *ax, float *bx)
 {
 	float		distance = 0.0;
 
@@ -721,6 +1147,119 @@ VectorL1Distance(int dim, float *ax, float *bx)
 		distance += fabsf(ax[i] - bx[i]);
 
 	return distance;
+}
+
+#ifdef __x86_64__
+/*
+ * AVX-512 optimized L1 distance
+ */
+__attribute__((target("avx512f,avx512dq")))
+static float
+VectorL1DistanceAVX512(int dim, float *ax, float *bx)
+{
+	__m512		sum = _mm512_setzero_ps();
+	__m512		sign_mask = _mm512_set1_ps(-0.0f);
+	int			i = 0;
+	int			dim16 = dim - (dim % 16);
+
+	/* Prefetch next cache lines */
+	_mm_prefetch((const char *)(ax + 64), _MM_HINT_T0);
+	_mm_prefetch((const char *)(bx + 64), _MM_HINT_T0);
+
+	/* Process 16 floats at a time */
+	for (; i < dim16; i += 16)
+	{
+		__m512		a = _mm512_loadu_ps(ax + i);
+		__m512		b = _mm512_loadu_ps(bx + i);
+		__m512		diff = _mm512_sub_ps(a, b);
+		/* Absolute value using AND NOT with sign mask */
+		__m512		abs_diff = _mm512_andnot_ps(sign_mask, diff);
+
+		/* Prefetch ahead */
+		if (i + 64 < dim)
+		{
+			_mm_prefetch((const char *)(ax + i + 64), _MM_HINT_T0);
+			_mm_prefetch((const char *)(bx + i + 64), _MM_HINT_T0);
+		}
+
+		sum = _mm512_add_ps(sum, abs_diff);
+	}
+
+	/* Reduce 512-bit register to scalar */
+	float		result = _mm512_reduce_add_ps(sum);
+
+	/* Handle remaining elements */
+	for (; i < dim; i++)
+		result += fabsf(ax[i] - bx[i]);
+
+	return result;
+}
+
+/*
+ * AVX2 optimized L1 distance
+ */
+__attribute__((target("avx2")))
+static float
+VectorL1DistanceAVX2(int dim, float *ax, float *bx)
+{
+	__m256		sum = _mm256_setzero_ps();
+	__m256		sign_mask = _mm256_set1_ps(-0.0f);
+	int			i = 0;
+	int			dim8 = dim - (dim % 8);
+
+	/* Prefetch next cache lines */
+	_mm_prefetch((const char *)(ax + 32), _MM_HINT_T0);
+	_mm_prefetch((const char *)(bx + 32), _MM_HINT_T0);
+
+	/* Process 8 floats at a time */
+	for (; i < dim8; i += 8)
+	{
+		__m256		a = _mm256_loadu_ps(ax + i);
+		__m256		b = _mm256_loadu_ps(bx + i);
+		__m256		diff = _mm256_sub_ps(a, b);
+		/* Absolute value using AND NOT with sign mask */
+		__m256		abs_diff = _mm256_andnot_ps(sign_mask, diff);
+
+		/* Prefetch ahead */
+		if (i + 32 < dim)
+		{
+			_mm_prefetch((const char *)(ax + i + 32), _MM_HINT_T0);
+			_mm_prefetch((const char *)(bx + i + 32), _MM_HINT_T0);
+		}
+
+		sum = _mm256_add_ps(sum, abs_diff);
+	}
+
+	/* Reduce 256-bit register to scalar */
+	__m128		sum128 = _mm_add_ps(_mm256_castps256_ps128(sum),
+									_mm256_extractf128_ps(sum, 1));
+	sum128 = _mm_hadd_ps(sum128, sum128);
+	sum128 = _mm_hadd_ps(sum128, sum128);
+	float		result = _mm_cvtss_f32(sum128);
+
+	/* Handle remaining elements */
+	for (; i < dim; i++)
+		result += fabsf(ax[i] - bx[i]);
+
+	return result;
+}
+#endif /* __x86_64__ */
+
+/*
+ * L1 distance with runtime CPU dispatch
+ */
+/* Does not require FMA, but keep logic simple */
+VECTOR_TARGET_CLONES static float
+VectorL1Distance(int dim, float *ax, float *bx)
+{
+#ifdef __x86_64__
+	/* Runtime dispatch based on CPU features */
+	if (cpu_supports_avx512())
+		return VectorL1DistanceAVX512(dim, ax, bx);
+	else if (cpu_supports_avx2())
+		return VectorL1DistanceAVX2(dim, ax, bx);
+#endif
+	return VectorL1DistanceScalar(dim, ax, bx);
 }
 
 /*

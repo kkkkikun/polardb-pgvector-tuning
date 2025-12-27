@@ -11,8 +11,9 @@ TESTS = $(wildcard test/sql/*.sql)
 REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
 REGRESS_OPTS = --inputdir=test --load-extension=$(EXTENSION)
 
+# Performance optimization flags for AVX-512 support
 # To compile for portability, run: make OPTFLAGS=""
-# OPTFLAGS = -march=native
+OPTFLAGS = -march=native -mtune=native
 
 # Mac ARM doesn't always support -march=native
 ifeq ($(shell uname -s), Darwin)
@@ -27,10 +28,20 @@ ifneq ($(filter ppc64%, $(shell uname -m)), )
 	OPTFLAGS =
 endif
 
-# For auto-vectorization:
+# For auto-vectorization and SIMD optimization:
 # - GCC (needs -ftree-vectorize OR -O3) - https://gcc.gnu.org/projects/tree-ssa/vectorization.html
 # - Clang (could use pragma instead) - https://llvm.org/docs/Vectorizers.html
-PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
+# Added -O3 for maximum optimization, -ffast-math for aggressive floating-point optimization
+PG_CFLAGS += $(OPTFLAGS) -O3 -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math -funroll-loops
+
+# Enable AVX-512 and FMA for x86_64 platforms
+ifeq ($(shell uname -m), x86_64)
+	PG_CFLAGS += -mavx512f -mavx512dq -mavx2 -mfma
+endif
+
+# Enable Link Time Optimization (LTO) for better cross-file optimization
+# Uncomment to enable: PG_CFLAGS += -flto
+# PG_LDFLAGS += -flto
 
 # Debug GCC auto-vectorization
 # PG_CFLAGS += -fopt-info-vec
