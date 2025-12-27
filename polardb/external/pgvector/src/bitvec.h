@@ -6,3 +6,4 @@
 VarBit	   *InitBitVector(int dim);
 
 #endif
+
