@@ -13,7 +13,7 @@ REGRESS_OPTS = --inputdir=test --load-extension=$(EXTENSION)
 
 # Performance optimization flags for AVX-512 support
 # To compile for portability, run: make OPTFLAGS=""
-OPTFLAGS = -march=native -mtune=native
+OPTFLAGS = -march=native -mtune=native -flto
 
 # Mac ARM doesn't always support -march=native
 ifeq ($(shell uname -s), Darwin)
@@ -32,7 +32,7 @@ endif
 # - GCC (needs -ftree-vectorize OR -O3) - https://gcc.gnu.org/projects/tree-ssa/vectorization.html
 # - Clang (could use pragma instead) - https://llvm.org/docs/Vectorizers.html
 # Added -O3 for maximum optimization, -ffast-math for aggressive floating-point optimization
-PG_CFLAGS += $(OPTFLAGS) -O3 -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math -funroll-loops -Wno-error
+PG_CFLAGS += $(OPTFLAGS) -O3 -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math -funroll-loops -Wno-error -flto
 
 # Enable AVX-512 and FMA for x86_64 platforms
 ifeq ($(shell uname -m), x86_64)

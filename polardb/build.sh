@@ -145,7 +145,7 @@ prefix=$HOME
 port=$(random_unused_port)
 
 # 2.2 complie options
-debug=on
+debug=off
 minimal=off
 compiler_flag="-g -pipe -Wall -fno-omit-frame-pointer -fsigned-char"
 # disable origin rpath config because of our own rpath config in LDFLAGS
@@ -198,7 +198,7 @@ if [[ $debug == "on" ]]; then
   compiler_flag+=" -O0 -fstack-protector-strong --param=ssp-buffer-size=4"
   configure_flag+=" --enable-debug --enable-cassert --enable-tap-tests --enable-fault-injector"
 else
-  compiler_flag+=" -O2"
+  compiler_flag+=" -O2 -flto"
 fi
 
 # Compile PolarDB in minimal mode, this will discard some strange dependencies
