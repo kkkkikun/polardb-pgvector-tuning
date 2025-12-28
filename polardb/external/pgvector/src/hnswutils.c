@@ -15,6 +15,11 @@
 #include "utils/memdebug.h"
 #include "utils/rel.h"
 
+/* SIMD headers for prefetch optimization */
+#ifdef __x86_64__
+#include <immintrin.h>
+#endif
+
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
 #endif
@@ -721,6 +726,28 @@ CountElement(HnswElement skipElement, HnswElement e)
 }
 
 /*
+ * Prefetch vector data for upcoming distance calculations
+ */
+static inline void
+HnswPrefetchVector(char *base, HnswElement element)
+{
+#ifdef __x86_64__
+	if (element != NULL)
+	{
+		Pointer valuePtr = HnswPtrAccess(base, element->value);
+		if (valuePtr != NULL)
+		{
+			/* Prefetch vector data into L1 cache */
+			_mm_prefetch((const char *)valuePtr, _MM_HINT_T0);
+			/* Prefetch next cache line for larger vectors */
+			_mm_prefetch((const char *)valuePtr + 64, _MM_HINT_T0);
+			_mm_prefetch((const char *)valuePtr + 128, _MM_HINT_T0);
+		}
+	}
+#endif
+}
+
+/*
  * Load unvisited neighbors from memory
  */
 static void
@@ -744,7 +771,13 @@ HnswLoadUnvisitedFromMemory(char *base, HnswElement element, HnswUnvisited * unv
 		AddToVisited(base, v, hc->element, true, &found);
 
 		if (!found)
-			unvisited[(*unvisitedLength)++].element = HnswPtrAccess(base, hc->element);
+		{
+			HnswElement neighborElement = HnswPtrAccess(base, hc->element);
+			unvisited[(*unvisitedLength)++].element = neighborElement;
+			
+			/* Prefetch vector data for upcoming distance calculation */
+			HnswPrefetchVector(base, neighborElement);
+		}
 	}
 }
 

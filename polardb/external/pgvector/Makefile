@@ -36,7 +36,7 @@ PG_CFLAGS += $(OPTFLAGS) -O3 -ftree-vectorize -fassociative-math -fno-signed-zer
 
 # Enable AVX-512 and FMA for x86_64 platforms
 ifeq ($(shell uname -m), x86_64)
-	PG_CFLAGS += -mavx512f -mavx512dq -mavx2 -mfma
+	PG_CFLAGS += -mavx512f -mavx512dq -mavx512bw -mavx512vl -mavx2 -mfma -mf16c
 endif
 
 # Enable Link Time Optimization (LTO) for better cross-file optimization
