@@ -530,7 +530,8 @@ typedef enum
 {
 	HNSW_FMT_RAW_FLOAT_VEC,    /* 原始vector：4字节float/元素 */
 	HNSW_FMT_RAW_HALFVEC,      /* 原始halfvec：2字节half/元素 */
-	HNSW_FMT_SQ8               /* SQ8量化：scale(4) + bias(4) + codes(dim) */
+	HNSW_FMT_SQ8,              /* SQ8量化：scale(4) + bias(4) + codes(dim) */
+	HNSW_FMT_UNKNOWN           /* 未知格式：bit, sparsevec等其他类型 */
 } HnswValueFormat;
 
 /*
@@ -582,9 +583,9 @@ HnswDetectFormat(Datum d)
 		}
 	}
 
-	/* 无法识别的格式 */
-	elog(ERROR, "unknown vector format: dim=%d size=%d payload=%d", dim, sz, payload);
-	return HNSW_FMT_RAW_FLOAT_VEC; /* unreachable */
+	/* 无法识别的格式 (bit, sparsevec等) - 返回UNKNOWN而非ERROR */
+	elog(DEBUG2, "Unknown vector format (bit/sparsevec/etc): dim=%d size=%d payload=%d", dim, sz, payload);
+	return HNSW_FMT_UNKNOWN;
 }
 
 /*

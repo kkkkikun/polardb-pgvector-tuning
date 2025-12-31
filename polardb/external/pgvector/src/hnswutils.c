@@ -534,7 +534,7 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 	}
 
 	/* === 比赛专用 Hack：量化存储 === */
-	/* 支持vector和halfvec类型的量化 */
+	/* 只对vector和halfvec类型进行量化，其他类型(bit, sparsevec)直接使用原值 */
 
 	/* 【关键修复】先检测格式，再解包，避免halfvec误入vector分支 */
 	HnswValueFormat fmt = HnswDetectFormat(value);
@@ -571,9 +571,9 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 		*out = value;
 
 	} else {
-		/* 不应该到达这里 */
-		elog(ERROR, "Unsupported vector format in HnswFormIndexValue: %d", fmt);
-		return false;
+		/* 未知格式(bit, sparsevec等)：不量化，直接使用原值 */
+		elog(DEBUG2, "Skipping quantization for unknown format (bit/sparsevec/etc), using original value");
+		*out = value;
 	}
 
 	return true;
@@ -865,16 +865,40 @@ CompareFurthestCandidates(const pairingheap_node *a, const pairingheap_node *b, 
 
 /*
  * Init visited
+ *
+ * 优化1.2: 改进hash table大小估算
+ * - 基于实际访问模式: ef个候选 + ~ef*m/2个邻居
+ * - 向上取整到2的幂次，优化hash性能
+ * - 减少rehashing和内存浪费
  */
 static inline void
 InitVisited(char *base, visited_hash * v, bool inMemory, int ef, int m)
 {
+	/*
+	 * 更精确的大小估算:
+	 * - ef: W中的元素数量
+	 * - ef*m/2: 平均访问的邻居数（不是所有邻居都会被访问）
+	 *
+	 * 旧方案: ef * m * 2 (过度分配)
+	 * 新方案: ef + ef*m/2，向上取整到2的幂次
+	 */
+	int estimated_size = ef + (ef * m) / 2;
+
+	/* 向上取整到下一个2的幂次，优化hash表性能 */
+	int hash_size = 1;
+	while (hash_size < estimated_size)
+		hash_size <<= 1;
+
+	/* 确保最小大小，避免过小的hash表 */
+	if (hash_size < 64)
+		hash_size = 64;
+
 	if (!inMemory)
-		v->tids = tidhash_create(CurrentMemoryContext, ef * m * 2, NULL);
+		v->tids = tidhash_create(CurrentMemoryContext, hash_size, NULL);
 	else if (base != NULL)
-		v->offsets = offsethash_create(CurrentMemoryContext, ef * m * 2, NULL);
+		v->offsets = offsethash_create(CurrentMemoryContext, hash_size, NULL);
 	else
-		v->pointers = pointerhash_create(CurrentMemoryContext, ef * m * 2, NULL);
+		v->pointers = pointerhash_create(CurrentMemoryContext, hash_size, NULL);
 }
 
 /*
@@ -1109,32 +1133,58 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			bool		alwaysAdd = wlen < ef;
 			
 			/* ==========================================================
-             * 【针对 200维 & M=10 优化的深度预取】
+             * 【针对 200维 & M=12 优化的深度预取】
+             * 优化1.1: 增强预取深度和覆盖范围
+             * - 步长从2增加到3（适配M=12）
+             * - 完整预取208字节SQ8数据（4个cache lines）
+             * - 添加邻居数组预取
+             * - 双重预取深度提升流水线效率
              * ========================================================== */
-            const int prefetch_step = 2; // M=10 时邻居少，步长不宜过大
+            const int prefetch_step = 3; // M=12优化: 增加步长
+            const int prefetch_depth = 2; // 双重预取深度
 
             if (i + prefetch_step < unvisitedLength)
             {
                 if (inMemory)
                 {
+                    // Primary prefetch: 当前+3位置
                     HnswElement next_el = unvisited[i + prefetch_step].element;
                     if (next_el)
                     {
-                        // 1. 预取节点元数据
+                        // 1. 预取节点元数据 (64字节cache line)
                         __builtin_prefetch(next_el, 0, 3);
 
                         void *next_vec = HnswPtrAccess(base, next_el->value);
                         if (next_vec)
                         {
-                            /* * 2. 深度预取向量数据：
-                             * 200维占 800字节，即 12.5 个 Cache Line。
-                             * 我们不需要全部预取（以免浪费带宽），预取前 3-4 个 Line 通常收益最高。
+                            /* 2. 深度预取向量数据：
+                             * 200维 SQ8格式 = 8字节header + 200字节data = 208字节
+                             * = 3.25 cache lines，完整预取4个cache lines
                              */
                             char *ptr = (char *)next_vec;
-                            __builtin_prefetch(ptr, 0, 3);       // 第 1-16 维
-                            __builtin_prefetch(ptr + 64, 0, 3);  // 第 17-32 维
-                            __builtin_prefetch(ptr + 128, 0, 3); // 第 33-48 维
-                            __builtin_prefetch(ptr + 192, 0, 3); // 第 49-64 维
+                            __builtin_prefetch(ptr, 0, 3);       // 字节 0-63
+                            __builtin_prefetch(ptr + 64, 0, 3);  // 字节 64-127
+                            __builtin_prefetch(ptr + 128, 0, 3); // 字节 128-191
+                            __builtin_prefetch(ptr + 192, 0, 3); // 字节 192-255 (完整覆盖208字节)
+                        }
+
+                        // 3. 预取邻居数组 (M=12时每层最多24个邻居)
+                        HnswNeighborArray *neighbors = HnswGetNeighbors(base, next_el, lc);
+                        if (neighbors)
+                        {
+                            // 较低优先级预取邻居数组
+                            __builtin_prefetch(neighbors, 0, 2);
+                        }
+                    }
+
+                    // 4. 双重预取: 当前+5位置，进一步提前加载
+                    if (i + prefetch_step + prefetch_depth < unvisitedLength)
+                    {
+                        HnswElement next_next = unvisited[i + prefetch_step + prefetch_depth].element;
+                        if (next_next)
+                        {
+                            // 最低优先级预取，避免缓存污染
+                            __builtin_prefetch(next_next, 0, 1);
                         }
                     }
                 }

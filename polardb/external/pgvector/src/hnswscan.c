@@ -99,7 +99,7 @@ GetScanValue(IndexScanDesc scan)
 			value = HnswNormValue(so->typeInfo, so->support.collation, value);
 
 		/* === 比赛专用 Hack：查询量化 === */
-		/* 支持vector和halfvec类型的量化 */
+		/* 只对vector和halfvec类型进行量化，其他类型(bit, sparsevec)直接使用原值 */
 
 		/* 【关键修复】先检测格式，再解包，避免halfvec误入vector分支 */
 		HnswValueFormat fmt = HnswDetectFormat(value);
@@ -137,8 +137,8 @@ GetScanValue(IndexScanDesc scan)
 			elog(DEBUG1, "Query vector is already SQ8 quantized, skipping quantization");
 
 		} else {
-			/* 不应该到达这里 */
-			elog(ERROR, "Unsupported vector format in GetScanValue: %d", fmt);
+			/* 未知格式(bit, sparsevec等)：不量化，直接使用原值 */
+			elog(DEBUG2, "Skipping quantization for unknown format (bit/sparsevec/etc), using original value");
 		}
 	}
 
