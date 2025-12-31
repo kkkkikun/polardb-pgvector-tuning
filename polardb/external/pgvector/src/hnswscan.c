@@ -99,46 +99,49 @@ GetScanValue(IndexScanDesc scan)
 			value = HnswNormValue(so->typeInfo, so->support.collation, value);
 
 		/* === 比赛专用 Hack：查询量化 === */
-		/* 支持vector和halfvec类型的量化 */
+		/* 只对vector和halfvec类型进行量化，其他类型(bit, sparsevec)直接使用原值 */
 
-		/* 【关键修复】先检测格式，再解包，避免halfvec误入vector分支 */
-		HnswValueFormat fmt = HnswDetectFormat(value);
+		if (so->support.allowQuantization)
+		{
+			/* 【关键修复】先检测格式，再解包，避免halfvec误入vector分支 */
+			HnswValueFormat fmt = HnswDetectFormat(value);
 
-		if (fmt == HNSW_FMT_RAW_HALFVEC) {
-			/* 处理halfvec类型的量化 - 使用熔断优化 */
-			HalfVector *halfvec = DatumGetHalfVector(value);
-			int			dim = halfvec->dim;
+			if (fmt == HNSW_FMT_RAW_HALFVEC) {
+				/* 处理halfvec类型的量化 - 使用熔断优化 */
+				HalfVector *halfvec = DatumGetHalfVector(value);
+				int			dim = halfvec->dim;
 
-			/* 直接分配结果 Vector (SQ8 大小) */
-			Size payload_size = sizeof(float)*2 + dim;
-			Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+				/* 直接分配结果 Vector (SQ8 大小) */
+				Size payload_size = sizeof(float)*2 + dim;
+				Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
 
-			/* 使用熔断优化函数：直接 Half -> SQ8 */
-			HnswQuantizeHalfVector(halfvec, quantized_query);
+				/* 使用熔断优化函数：直接 Half -> SQ8 */
+				HnswQuantizeHalfVector(halfvec, quantized_query);
 
-			value = PointerGetDatum(quantized_query);
+				value = PointerGetDatum(quantized_query);
 
-		} else if (fmt == HNSW_FMT_RAW_FLOAT_VEC) {
-			/* 处理vector类型的量化 */
-			Vector	   *query_vec = DatumGetVector(value);
-			int			dim = query_vec->dim;
+			} else if (fmt == HNSW_FMT_RAW_FLOAT_VEC) {
+				/* 处理vector类型的量化 */
+				Vector	   *query_vec = DatumGetVector(value);
+				int			dim = query_vec->dim;
 
-			Size		payload_size = sizeof(float)*2 + dim; /* scale + bias + data */
+				Size		payload_size = sizeof(float)*2 + dim; /* scale + bias + data */
 
-			/* 创建新的Vector用于存储量化后的查询向量 */
-			Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+				/* 创建新的Vector用于存储量化后的查询向量 */
+				Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
 
-			/* 使用相同的量化函数进行序列化 */
-			QuantizeAndSerialize(query_vec, quantized_query);
-			value = PointerGetDatum(quantized_query);
+				/* 使用相同的量化函数进行序列化 */
+				QuantizeAndSerialize(query_vec, quantized_query);
+				value = PointerGetDatum(quantized_query);
 
-		} else if (fmt == HNSW_FMT_SQ8) {
-			/* 已经是SQ8格式，无需重复量化 */
-			elog(DEBUG1, "Query vector is already SQ8 quantized, skipping quantization");
+			} else if (fmt == HNSW_FMT_SQ8) {
+				/* 已经是SQ8格式，无需重复量化 */
+				elog(DEBUG1, "Query vector is already SQ8 quantized, skipping quantization");
 
-		} else {
-			/* 不应该到达这里 */
-			elog(ERROR, "Unsupported vector format in GetScanValue: %d", fmt);
+			} else {
+				/* 未知格式(bit, sparsevec等)：不量化，直接使用原值 */
+				elog(DEBUG2, "Skipping quantization for unknown format (bit/sparsevec/etc), using original value");
+			}
 		}
 	}
 
