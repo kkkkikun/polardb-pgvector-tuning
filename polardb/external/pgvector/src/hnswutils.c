@@ -1220,10 +1220,10 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
                             __builtin_prefetch(ptr, 0, 3);         // 字节 0-63
                             __builtin_prefetch(ptr + 64, 0, 3);    // 字节 64-127
                             __builtin_prefetch(ptr + 128, 0, 3);   // 字节 128-191
-                            __builtin_prefetch(ptr + 192, 0, 3);   // 字节 192-255
-                            __builtin_prefetch(ptr + 256, 0, 2);   // 字节 256-319 (halfvec)
-                            __builtin_prefetch(ptr + 320, 0, 2);   // 字节 320-383 (halfvec)
-                            __builtin_prefetch(ptr + 384, 0, 1);   // 字节 384-447 (halfvec尾部)
+                            // __builtin_prefetch(ptr + 192, 0, 3);   // 字节 192-255
+                            // __builtin_prefetch(ptr + 256, 0, 2);   // 字节 256-319 (halfvec)
+                            // __builtin_prefetch(ptr + 320, 0, 2);   // 字节 320-383 (halfvec)
+                            // __builtin_prefetch(ptr + 384, 0, 1);   // 字节 384-447 (halfvec尾部)
                         }
 
                         // 3. 预取邻居数组 (M=12时每层最多24个邻居)
