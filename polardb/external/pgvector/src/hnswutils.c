@@ -1132,7 +1132,6 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	{
 		HnswSearchCandidate *c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
 		HnswSearchCandidate *f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
-		bool f_needs_update = false;  /* [优化1.1] 缓存f指针，减少pairingheap_first调用 */
 		HnswElement cElement;
 
 		if (c->distance > f->distance)
@@ -1164,11 +1163,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
              * - 添加邻居数组预取
              * - 双重预取深度提升流水线效率
              * ========================================================== */
-            /* [优化1.2] 增加预取深度以更好隐藏内存延迟
-             * 200维 halfvec = 400字节 = 7个cache lines
-             * 增加步长和深度以提前更多加载 */
-            const int prefetch_step = 1;   // 更激进的步长
-            const int prefetch_depth = 1;  // 三重预取深度
+            const int prefetch_step = 3; // M=12优化: 增加步长
+            const int prefetch_depth = 2; // 双重预取深度
 
             if (i + prefetch_step < unvisitedLength)
             {
@@ -1184,19 +1180,15 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
                         void *next_vec = HnswPtrAccess(base, next_el->value);
                         if (next_vec)
                         {
-                            /* [优化1.2] 深度预取向量数据：
-                             * 200维 SQ8格式 = 8字节header + 200字节data = 208字节 = 4 cache lines
-                             * 200维 halfvec = 4字节header + 400字节data = 404字节 = 7 cache lines
-                             * 预取7个cache lines以覆盖两种格式
+                            /* 2. 深度预取向量数据：
+                             * 200维 SQ8格式 = 8字节header + 200字节data = 208字节
+                             * = 3.25 cache lines，完整预取4个cache lines
                              */
                             char *ptr = (char *)next_vec;
-                            __builtin_prefetch(ptr, 0, 3);         // 字节 0-63
-                            __builtin_prefetch(ptr + 64, 0, 3);    // 字节 64-127
-                            __builtin_prefetch(ptr + 128, 0, 3);   // 字节 128-191
-                            // __builtin_prefetch(ptr + 192, 0, 3);   // 字节 192-255
-                            // __builtin_prefetch(ptr + 256, 0, 2);   // 字节 256-319 (halfvec)
-                            // __builtin_prefetch(ptr + 320, 0, 2);   // 字节 320-383 (halfvec)
-                            // __builtin_prefetch(ptr + 384, 0, 1);   // 字节 384-447 (halfvec尾部)
+                            __builtin_prefetch(ptr, 0, 3);       // 字节 0-63
+                            __builtin_prefetch(ptr + 64, 0, 3);  // 字节 64-127
+                            __builtin_prefetch(ptr + 128, 0, 3); // 字节 128-191
+                            __builtin_prefetch(ptr + 192, 0, 3); // 字节 192-255 (完整覆盖208字节)
                         }
 
                         // 3. 预取邻居数组 (M=12时每层最多24个邻居)
@@ -1222,11 +1214,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
             }
             /* ========================================================== */
 
-			/* [优化1.1] 仅在W改变后更新f，避免每次迭代都调用pairingheap_first */
-			if (f_needs_update) {
-				f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
-				f_needs_update = false;
-			}
+			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 
 			if (inMemory)
 			{
@@ -1267,7 +1255,6 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			e = HnswInitSearchCandidate(base, eElement, eDistance);
 			pairingheap_add(C, &e->c_node);
 			pairingheap_add(W, &e->w_node);
-			f_needs_update = true;  /* [优化1.1] W改变，标记需要更新f */
 
 			/*
 			 * Do not count elements being deleted towards ef when vacuuming.
@@ -1282,7 +1269,6 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 				if (wlen > ef)
 				{
 					HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
-					f_needs_update = true;  /* [优化1.1] W改变，标记需要更新f */
 
 					if (discarded != NULL)
 						pairingheap_add(*discarded, &d->w_node);
