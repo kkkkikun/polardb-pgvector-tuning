@@ -1163,7 +1163,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
              * - 添加邻居数组预取
              * - 双重预取深度提升流水线效率
              * ========================================================== */
-            const int prefetch_step = 3; // M=12优化: 增加步长
+            const int prefetch_step = 2; // M=12优化: 增加步长
             const int prefetch_depth = 2; // 双重预取深度
 
             if (i + prefetch_step < unvisitedLength)
