@@ -100,6 +100,7 @@ GetScanValue(IndexScanDesc scan)
 
 		/* === 比赛专用 Hack：查询量化 === */
 		/* 只对vector和halfvec类型进行量化，其他类型(bit, sparsevec)直接使用原值 */
+		/* 只对vector和halfvec类型进行量化，其他类型(bit, sparsevec)直接使用原值 */
 
 		if (so->support.allowQuantization)
 		{
