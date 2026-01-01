@@ -1063,9 +1063,6 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 
 /*
  * Algorithm 2 from paper
- *
- * [优化2.1] 预分配候选节点池
- * 减少搜索过程中的palloc调用，显著降低内存分配开销
  */
 List *
 HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples)
@@ -1082,30 +1079,6 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	HnswUnvisited *unvisited = palloc(lm * sizeof(HnswUnvisited));
 	int			unvisitedLength;
 	bool		inMemory = index == NULL;
-
-	/* [优化2.1] 候选节点池预分配
-	 * 池大小估算: ef + ef*m/2 (与visited hash大小相同)
-	 * 这避免了每次创建候选时的palloc调用
-	 */
-	int pool_size = ef + (ef * m) / 2;
-	if (pool_size < 128)
-		pool_size = 128;  /* 最小池大小 */
-	HnswSearchCandidate *candidate_pool = palloc(pool_size * sizeof(HnswSearchCandidate));
-	int pool_idx = 0;
-
-	/* 池分配宏：快速获取预分配的候选节点 */
-	#define POOL_ALLOC_CANDIDATE(_pbase, _pelem, _pdist) \
-		({ \
-			HnswSearchCandidate *_sc; \
-			if (likely(pool_idx < pool_size)) { \
-				_sc = &candidate_pool[pool_idx++]; \
-			} else { \
-				_sc = palloc(sizeof(HnswSearchCandidate)); /* fallback */ \
-			} \
-			HnswPtrStore(_pbase, _sc->element, _pelem); \
-			_sc->distance = _pdist; \
-			_sc; \
-		})
 
 	if (v == NULL)
 	{
@@ -1278,8 +1251,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			{
 				if (discarded != NULL)
 				{
-					/* [优化2.1] 使用预分配池创建候选节点 */
-					e = POOL_ALLOC_CANDIDATE(base, eElement, eDistance);
+					/* Create a new candidate */
+					e = HnswInitSearchCandidate(base, eElement, eDistance);
 					pairingheap_add(*discarded, &e->w_node);
 				}
 
@@ -1290,8 +1263,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			if (eElement->level < lc)
 				continue;
 
-			/* [优化2.1] 使用预分配池创建候选节点 */
-			e = POOL_ALLOC_CANDIDATE(base, eElement, eDistance);
+			/* Create a new candidate */
+			e = HnswInitSearchCandidate(base, eElement, eDistance);
 			pairingheap_add(C, &e->c_node);
 			pairingheap_add(W, &e->w_node);
 			f_needs_update = true;  /* [优化1.1] W改变，标记需要更新f */
@@ -1326,7 +1299,6 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		w = lappend(w, sc);
 	}
 
-	#undef POOL_ALLOC_CANDIDATE
 	return w;
 }
 
