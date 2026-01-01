@@ -584,8 +584,7 @@ HnswDetectFormat(Datum d)
 		}
 	}
 
-	/* 无法识别的格式 (bit, sparsevec等) - 返回UNKNOWN而非ERROR */
-	elog(DEBUG2, "Unknown vector format (bit/sparsevec/etc): dim=%d size=%d payload=%d", dim, sz, payload);
+	/* 无法识别的格式 (bit, sparsevec等) - 返回UNKNOWN */
 	return HNSW_FMT_UNKNOWN;
 }
 
