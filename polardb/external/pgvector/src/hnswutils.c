@@ -1063,6 +1063,9 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 
 /*
  * Algorithm 2 from paper
+ *
+ * [优化2.1] 预分配候选节点池
+ * 减少搜索过程中的palloc调用，显著降低内存分配开销
  */
 List *
 HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples)
@@ -1079,6 +1082,30 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	HnswUnvisited *unvisited = palloc(lm * sizeof(HnswUnvisited));
 	int			unvisitedLength;
 	bool		inMemory = index == NULL;
+
+	/* [优化2.1] 候选节点池预分配
+	 * 池大小估算: ef + ef*m/2 (与visited hash大小相同)
+	 * 这避免了每次创建候选时的palloc调用
+	 */
+	int pool_size = ef + (ef * m) / 2;
+	if (pool_size < 128)
+		pool_size = 128;  /* 最小池大小 */
+	HnswSearchCandidate *candidate_pool = palloc(pool_size * sizeof(HnswSearchCandidate));
+	int pool_idx = 0;
+
+	/* 池分配宏：快速获取预分配的候选节点 */
+	#define POOL_ALLOC_CANDIDATE(_pbase, _pelem, _pdist) \
+		({ \
+			HnswSearchCandidate *_sc; \
+			if (likely(pool_idx < pool_size)) { \
+				_sc = &candidate_pool[pool_idx++]; \
+			} else { \
+				_sc = palloc(sizeof(HnswSearchCandidate)); /* fallback */ \
+			} \
+			HnswPtrStore(_pbase, _sc->element, _pelem); \
+			_sc->distance = _pdist; \
+			_sc; \
+		})
 
 	if (v == NULL)
 	{
@@ -1132,6 +1159,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	{
 		HnswSearchCandidate *c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
 		HnswSearchCandidate *f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+		bool f_needs_update = false;  /* [优化1.1] 缓存f指针，减少pairingheap_first调用 */
 		HnswElement cElement;
 
 		if (c->distance > f->distance)
@@ -1163,8 +1191,11 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
              * - 添加邻居数组预取
              * - 双重预取深度提升流水线效率
              * ========================================================== */
-            const int prefetch_step = 2; // M=12优化: 增加步长
-            const int prefetch_depth = 2; // 双重预取深度
+            /* [优化1.2] 增加预取深度以更好隐藏内存延迟
+             * 200维 halfvec = 400字节 = 7个cache lines
+             * 增加步长和深度以提前更多加载 */
+            const int prefetch_step = 1;   // 更激进的步长
+            const int prefetch_depth = 1;  // 三重预取深度
 
             if (i + prefetch_step < unvisitedLength)
             {
@@ -1180,15 +1211,19 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
                         void *next_vec = HnswPtrAccess(base, next_el->value);
                         if (next_vec)
                         {
-                            /* 2. 深度预取向量数据：
-                             * 200维 SQ8格式 = 8字节header + 200字节data = 208字节
-                             * = 3.25 cache lines，完整预取4个cache lines
+                            /* [优化1.2] 深度预取向量数据：
+                             * 200维 SQ8格式 = 8字节header + 200字节data = 208字节 = 4 cache lines
+                             * 200维 halfvec = 4字节header + 400字节data = 404字节 = 7 cache lines
+                             * 预取7个cache lines以覆盖两种格式
                              */
                             char *ptr = (char *)next_vec;
-                            __builtin_prefetch(ptr, 0, 3);       // 字节 0-63
-                            __builtin_prefetch(ptr + 64, 0, 3);  // 字节 64-127
-                            __builtin_prefetch(ptr + 128, 0, 3); // 字节 128-191
-                            __builtin_prefetch(ptr + 192, 0, 3); // 字节 192-255 (完整覆盖208字节)
+                            __builtin_prefetch(ptr, 0, 3);         // 字节 0-63
+                            __builtin_prefetch(ptr + 64, 0, 3);    // 字节 64-127
+                            __builtin_prefetch(ptr + 128, 0, 3);   // 字节 128-191
+                            __builtin_prefetch(ptr + 192, 0, 3);   // 字节 192-255
+                            __builtin_prefetch(ptr + 256, 0, 2);   // 字节 256-319 (halfvec)
+                            __builtin_prefetch(ptr + 320, 0, 2);   // 字节 320-383 (halfvec)
+                            __builtin_prefetch(ptr + 384, 0, 1);   // 字节 384-447 (halfvec尾部)
                         }
 
                         // 3. 预取邻居数组 (M=12时每层最多24个邻居)
@@ -1214,7 +1249,11 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
             }
             /* ========================================================== */
 
-			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+			/* [优化1.1] 仅在W改变后更新f，避免每次迭代都调用pairingheap_first */
+			if (f_needs_update) {
+				f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+				f_needs_update = false;
+			}
 
 			if (inMemory)
 			{
@@ -1239,8 +1278,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			{
 				if (discarded != NULL)
 				{
-					/* Create a new candidate */
-					e = HnswInitSearchCandidate(base, eElement, eDistance);
+					/* [优化2.1] 使用预分配池创建候选节点 */
+					e = POOL_ALLOC_CANDIDATE(base, eElement, eDistance);
 					pairingheap_add(*discarded, &e->w_node);
 				}
 
@@ -1251,10 +1290,11 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			if (eElement->level < lc)
 				continue;
 
-			/* Create a new candidate */
-			e = HnswInitSearchCandidate(base, eElement, eDistance);
+			/* [优化2.1] 使用预分配池创建候选节点 */
+			e = POOL_ALLOC_CANDIDATE(base, eElement, eDistance);
 			pairingheap_add(C, &e->c_node);
 			pairingheap_add(W, &e->w_node);
+			f_needs_update = true;  /* [优化1.1] W改变，标记需要更新f */
 
 			/*
 			 * Do not count elements being deleted towards ef when vacuuming.
@@ -1269,6 +1309,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 				if (wlen > ef)
 				{
 					HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+					f_needs_update = true;  /* [优化1.1] W改变，标记需要更新f */
 
 					if (discarded != NULL)
 						pairingheap_add(*discarded, &d->w_node);
@@ -1285,6 +1326,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		w = lappend(w, sc);
 	}
 
+	#undef POOL_ALLOC_CANDIDATE
 	return w;
 }
 
