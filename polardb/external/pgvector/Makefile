@@ -19,6 +19,7 @@ REGRESS_OPTS = --inputdir=test --load-extension=$(EXTENSION)
 # -march=native: 针对评测机 CPU 架构优化
 # -flto: 开启链接时全局优化 (关键!)
 # -mavx512...: 强制开启向量指令集
+# -march=native -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
 BASE_FLAGS = -march=native -O3 -flto -funroll-loops \
              -mavx512f -mavx512vl -mavx512bw -mavx512dq \
              -mfma -ftree-vectorize -fassociative-math \

@@ -33,105 +33,6 @@ extern Datum halfvec_l2_squared_distance(PG_FUNCTION_ARGS);
 
 /* 函数声明 */
 static inline double HnswGetDistance(Datum a, Datum b, HnswSupport * support);
-static float HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support);
-
-/* 已删除未使用的QuantizeVectorToPayload函数
- * 现在使用统一的QuantizeAndSerialize和HnswQuantizeHalfVector函数
- */
-#include <stdio.h> // 必须加在文件头
-/* 比赛专用：通用距离计算函数，支持量化和非量化数据 */
-__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
-static float
-HnswGetDistanceOptimized(Datum v1, Datum v2, HnswSupport *support)
-{
-    Vector *index_vec = DatumGetVector(v2);
-
-    /* 检查是否为量化数据 */
-    Size actual_payload_size = VARSIZE_ANY_EXHDR(index_vec);
-    Size expected_sq8_size = sizeof(float)*2 + index_vec->dim;
-
-    /* 如果不是量化数据，回退到原始距离计算 */
-    if (actual_payload_size != expected_sq8_size) {
-        return (float) HnswGetDistance(v1, v2, support);
-    }
-
-    /* 处理量化数据 */
-    Vector *query = DatumGetVector(v1);
-    int dim = query->dim;
-
-    /* 检查查询向量是否也是量化的 */
-    Size query_payload_size = VARSIZE_ANY_EXHDR(query);
-    bool query_is_quantized = (query_payload_size == sizeof(float)*2 + dim);
-
-    float query_f[2048];
-
-    if (query_is_quantized) {
-        /* 反序列化查询向量 */
-        char *query_buffer = (char *)query->x;
-        float query_scale, query_bias;
-        uint8_t *query_data;
-
-        memcpy(&query_scale, query_buffer, sizeof(float));
-        memcpy(&query_bias, query_buffer + sizeof(float), sizeof(float));
-        query_data = (uint8_t *)(query_buffer + sizeof(float) * 2);
-
-        /* 反量化查询向量到float数组 */
-        for (int i = 0; i < dim; i++) {
-            query_f[i] = query_data[i] * query_scale + query_bias;
-        }
-    } else {
-        /* 查询向量是原始格式，需要转换 */
-        half *h_query = (half *)query->x;
-        for(int i = 0; i < dim; i++) {
-            query_f[i] = HalfToFloat4(h_query[i]);
-        }
-    }
-
-    /* 反序列化索引向量 */
-    char *buffer = (char *)index_vec->x;
-    float scale, bias;
-    uint8_t *data;
-
-    memcpy(&scale, buffer, sizeof(float));
-    memcpy(&bias, buffer + sizeof(float), sizeof(float));
-    data = (uint8_t *)(buffer + sizeof(float) * 2);
-
-    /* 添加安全检查 */
-    if (scale == 0.0f && bias == 0.0f) {
-        float sum = 0.0f;
-        for (int i = 0; i < dim; i++) {
-            sum += query_f[i] * query_f[i];
-        }
-        return sum; /* 返回查询向量到零向量的距离 */
-    }
-
-    __m512 v_scale = _mm512_set1_ps(scale);
-    __m512 v_bias  = _mm512_set1_ps(bias);
-    __m512 v_sum   = _mm512_setzero_ps();
-
-    int i;
-    for (i = 0; i <= dim - 16; i += 16) {
-        __m128i v_u8 = _mm_loadu_si128((const __m128i *)&data[i]);
-        __m512i v_i32 = _mm512_cvtepu8_epi32(v_u8);
-        __m512 v_f_idx = _mm512_cvtepi32_ps(v_i32);
-        __m512 v_rec = _mm512_fmadd_ps(v_f_idx, v_scale, v_bias);
-        __m512 v_q = _mm512_loadu_ps(&query_f[i]);
-        __m512 v_diff = _mm512_sub_ps(v_q, v_rec);
-        v_sum = _mm512_fmadd_ps(v_diff, v_diff, v_sum);
-    }
-
-    if (i < dim) {
-        __mmask16 mask = (1U << (dim - i)) - 1;
-        __m128i v_u8 = _mm_mask_loadu_epi8(_mm_setzero_si128(), mask, &data[i]);
-        __m512i v_i32 = _mm512_cvtepu8_epi32(v_u8);
-        __m512 v_rec = _mm512_fmadd_ps(_mm512_cvtepi32_ps(v_i32), v_scale, v_bias);
-        __m512 v_q = _mm512_mask_loadu_ps(_mm512_setzero_ps(), mask, &query_f[i]);
-        __m512 v_diff = _mm512_sub_ps(v_q, v_rec);
-        v_sum = _mm512_mask3_fmadd_ps(v_diff, v_diff, v_sum, mask);
-    }
-
-    return _mm512_reduce_add_ps(v_sum);
-}
 
 /* ======================================================= */
 
@@ -766,9 +667,6 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
             *distance = 0;
         else
         {
-            /* 【修正】避免 varlena 偏移错误 */
-            Vector     *query_vec = DatumGetVector(q->value);
-
             /* 从 HnswElementTuple 的 data 字段构造正确的 Datum */
             /* 注意：etup->data 是一个 Vector 结构体，不是指针 */
             Datum       index_datum = PointerGetDatum(&etup->data);
@@ -1237,79 +1135,6 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	}
 
 	return w;
-}
-
-/*
- * Compare candidate distances with pointer tie-breaker
- */
-static int
-CompareCandidateDistances(const ListCell *a, const ListCell *b)
-{
-	HnswCandidate *hca = lfirst(a);
-	HnswCandidate *hcb = lfirst(b);
-
-	if (hca->distance < hcb->distance)
-		return 1;
-
-	if (hca->distance > hcb->distance)
-		return -1;
-
-	if (HnswPtrPointer(hca->element) < HnswPtrPointer(hcb->element))
-		return 1;
-
-	if (HnswPtrPointer(hca->element) > HnswPtrPointer(hcb->element))
-		return -1;
-
-	return 0;
-}
-
-/*
- * Compare candidate distances with offset tie-breaker
- */
-static int
-CompareCandidateDistancesOffset(const ListCell *a, const ListCell *b)
-{
-	HnswCandidate *hca = lfirst(a);
-	HnswCandidate *hcb = lfirst(b);
-
-	if (hca->distance < hcb->distance)
-		return 1;
-
-	if (hca->distance > hcb->distance)
-		return -1;
-
-	if (HnswPtrOffset(hca->element) < HnswPtrOffset(hcb->element))
-		return 1;
-
-	if (HnswPtrOffset(hca->element) > HnswPtrOffset(hcb->element))
-		return -1;
-
-	return 0;
-}
-
-/*
- * Check if an element is closer to q than any element from R
- */
-static bool
-CheckElementCloser(char *base, HnswCandidate * e, List *r, HnswSupport * support)
-{
-	HnswElement eElement = HnswPtrAccess(base, e->element);
-	Datum		eValue = HnswGetValue(base, eElement);
-	ListCell   *lc2;
-
-	foreach(lc2, r)
-	{
-		HnswCandidate *ri = lfirst(lc2);
-		HnswElement riElement = HnswPtrAccess(base, ri->element);
-		Datum		riValue = HnswGetValue(base, riElement);
-		/* === 比赛专用 Hack：使用优化的距离计算 === */
-		float		distance = (float)HnswGetDistance(eValue, riValue, support);
-
-		if (distance <= e->distance)
-			return false;
-	}
-
-	return true;
 }
 
 /*
