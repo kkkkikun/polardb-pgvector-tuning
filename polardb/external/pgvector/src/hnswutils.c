@@ -1056,13 +1056,27 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		if (tuples != NULL)
 			(*tuples) += unvisitedLength;
 
+		/* 【优化】磁盘查询: 预取初始批次的元素页面 */
+		if (!inMemory && unvisitedLength > 0)
+		{
+			int prefetch_count = Min(unvisitedLength, 4);  /* 预取前4个页面 */
+			for (int p = 0; p < prefetch_count; p++)
+			{
+				ItemPointer tid = &unvisited[p].indextid;
+				PrefetchBuffer(index, MAIN_FORKNUM, ItemPointerGetBlockNumber(tid));
+			}
+		}
+
+		/* 【优化】缓存最远距离，避免每次迭代都访问堆 */
+		double cached_f_distance = HnswGetSearchCandidate(w_node, pairingheap_first(W))->distance;
+
 		for (int i = 0; i < unvisitedLength; i++)
 		{
 			HnswElement eElement;
 			HnswSearchCandidate *e;
 			double		eDistance;
 			bool		alwaysAdd = wlen < ef;
-			
+
 			/* ==========================================================
              * 【针对 200维 & M=10 优化的深度预取】
              * ========================================================== */
@@ -1093,10 +1107,15 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
                         }
                     }
                 }
+                else
+                {
+                    /* 【优化】磁盘查询时预取元素页面 */
+                    ItemPointer next_tid = &unvisited[i + prefetch_step].indextid;
+                    BlockNumber next_blkno = ItemPointerGetBlockNumber(next_tid);
+                    PrefetchBuffer(index, MAIN_FORKNUM, next_blkno);
+                }
             }
             /* ========================================================== */
-
-			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 
 			if (inMemory)
 			{
@@ -1111,13 +1130,14 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 				/* Avoid any allocations if not adding */
 				eElement = NULL;
-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
+				/* 【优化】使用缓存的距离阈值 */
+				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &cached_f_distance, &eElement);
 
 				if (eElement == NULL)
 					continue;
 			}
 
-			if (eElement == NULL || !(eDistance < f->distance || alwaysAdd))
+			if (eElement == NULL || !(eDistance < cached_f_distance || alwaysAdd))
 			{
 				if (discarded != NULL)
 				{
@@ -1154,7 +1174,16 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 					if (discarded != NULL)
 						pairingheap_add(*discarded, &d->w_node);
+
+					/* 【优化】堆变化后更新缓存 */
+					cached_f_distance = HnswGetSearchCandidate(w_node, pairingheap_first(W))->distance;
 				}
+			}
+			else
+			{
+				/* 【优化】添加新候选后，如果比当前最远更远则更新缓存 */
+				if (eDistance > cached_f_distance)
+					cached_f_distance = eDistance;
 			}
 		}
 	}
