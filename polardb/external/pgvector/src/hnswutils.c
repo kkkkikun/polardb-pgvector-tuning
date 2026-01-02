@@ -1534,42 +1534,58 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 		efConstruction++;
 
 	/* 2nd phase */
-	for (int lc = level; lc >= 0; lc--)
+	/*
+	 * 【优化】跨层共享 visited set
+	 * 同一个元素在不同层被访问时，距离是相同的，无需重复计算
+	 * 首层初始化 visited，后续层复用
+	 */
 	{
-		int			lm = HnswGetLayerM(m, lc);
-		List	   *neighbors;
-		List	   *lw = NIL;
-		ListCell   *lc2;
+		visited_hash sharedVisited;
+		bool		firstLayer = true;
 
-		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
-
-		/* Convert search candidates to candidates */
-		foreach(lc2, w)
+		for (int lc = level; lc >= 0; lc--)
 		{
-			HnswSearchCandidate *sc = lfirst(lc2);
-			HnswCandidate *hc = palloc(sizeof(HnswCandidate));
+			int			lm = HnswGetLayerM(m, lc);
+			List	   *neighbors;
+			List	   *lw = NIL;
+			ListCell   *lc2;
 
-			hc->element = sc->element;
-			hc->distance = sc->distance;
+			/*
+			 * 首层: 初始化 visited set (initVisited=true)
+			 * 后续层: 复用 visited set (initVisited=false)
+			 */
+			w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement,
+								inMemory ? &sharedVisited : NULL, NULL, firstLayer, NULL);
+			firstLayer = false;
 
-			lw = lappend(lw, hc);
+			/* Convert search candidates to candidates */
+			foreach(lc2, w)
+			{
+				HnswSearchCandidate *sc = lfirst(lc2);
+				HnswCandidate *hc = palloc(sizeof(HnswCandidate));
+
+				hc->element = sc->element;
+				hc->distance = sc->distance;
+
+				lw = lappend(lw, hc);
+			}
+
+			/* Elements being deleted or skipped can help with search */
+			/* but should be removed before selecting neighbors */
+			if (!inMemory)
+				lw = RemoveElements(base, lw, skipElement);
+
+			/*
+			 * Candidates are sorted, but not deterministically. Could set
+			 * sortCandidates to true for in-memory builds to enable closer
+			 * caching, but there does not seem to be a difference in performance.
+			 */
+			neighbors = SelectNeighbors(base, lw, lm, support, &HnswGetNeighbors(base, element, lc)->closerSet, NULL, NULL, false);
+
+			AddConnections(base, element, neighbors, lc);
+
+			ep = w;
 		}
-
-		/* Elements being deleted or skipped can help with search */
-		/* but should be removed before selecting neighbors */
-		if (!inMemory)
-			lw = RemoveElements(base, lw, skipElement);
-
-		/*
-		 * Candidates are sorted, but not deterministically. Could set
-		 * sortCandidates to true for in-memory builds to enable closer
-		 * caching, but there does not seem to be a difference in performance.
-		 */
-		neighbors = SelectNeighbors(base, lw, lm, support, &HnswGetNeighbors(base, element, lc)->closerSet, NULL, NULL, false);
-
-		AddConnections(base, element, neighbors, lc);
-
-		ep = w;
 	}
 }
 
