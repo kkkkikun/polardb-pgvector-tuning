@@ -382,6 +382,21 @@ InitBuildState(IvfflatBuildState * buildstate, Relation heap, Relation index, In
 #endif
 
 	buildstate->ivfleader = NULL;
+
+	/* Initialize RaBitQ encoder if dimensions support it */
+	buildstate->useRaBitQ = false;
+	buildstate->rabitqEncoder = NULL;
+
+#ifdef IVFFLAT_RABITQ_ENABLED
+	if (buildstate->dimensions <= RABITQ_MAX_DIM && buildstate->dimensions >= 64)
+	{
+		buildstate->rabitqEncoder = (RaBitQEncoder *) palloc(sizeof(RaBitQEncoder));
+		RaBitQEncoderInit(buildstate->rabitqEncoder, buildstate->dimensions,
+						  (uint64) RandomInt() << 32 | RandomInt());
+		buildstate->useRaBitQ = true;
+		elog(INFO, "RaBitQ encoding enabled for %d dimensions", buildstate->dimensions);
+	}
+#endif
 }
 
 /*
@@ -397,6 +412,14 @@ FreeBuildState(IvfflatBuildState * buildstate)
 	pfree(buildstate->listSums);
 	pfree(buildstate->listCounts);
 #endif
+
+	/* Free RaBitQ encoder if allocated */
+	if (buildstate->rabitqEncoder != NULL)
+	{
+		RaBitQEncoderFree(buildstate->rabitqEncoder);
+		pfree(buildstate->rabitqEncoder);
+		buildstate->rabitqEncoder = NULL;
+	}
 
 	MemoryContextDelete(buildstate->tmpCtx);
 }
@@ -438,7 +461,27 @@ ComputeCenters(IvfflatBuildState * buildstate)
 	}
 
 	/* Calculate centers */
-	IvfflatBench("k-means", IvfflatKmeans(buildstate->index, buildstate->samples, buildstate->centers, buildstate->typeInfo));
+#ifdef IVFFLAT_HIERARCHICAL_KMEANS
+	/* Use hierarchical K-means for large number of lists (VectorChord style) */
+	if (buildstate->lists > 1000)
+	{
+		int			L1 = (int) sqrt((double) buildstate->lists);
+
+		/* Ensure L1 divides L2 evenly */
+		while (buildstate->lists % L1 != 0 && L1 > 1)
+			L1--;
+
+		elog(INFO, "Using hierarchical K-means: L1=%d, L2=%d", L1, buildstate->lists);
+		IvfflatBench("hierarchical k-means",
+					 IvfflatHierarchicalKmeans(buildstate->index, buildstate->samples,
+											   buildstate->centers, buildstate->typeInfo,
+											   L1, buildstate->lists));
+	}
+	else
+#endif
+	{
+		IvfflatBench("k-means", IvfflatKmeans(buildstate->index, buildstate->samples, buildstate->centers, buildstate->typeInfo));
+	}
 
 	/* Free samples before we allocate more memory */
 	VectorArrayFree(buildstate->samples);
@@ -464,6 +507,11 @@ CreateMetaPage(Relation index, int dimensions, int lists, ForkNumber forkNum)
 	metap->version = IVFFLAT_VERSION;
 	metap->dimensions = dimensions;
 	metap->lists = lists;
+	/* RaBitQ extension fields */
+	metap->encoderBlkno = InvalidBlockNumber;
+	metap->useRaBitQ = 0;
+	metap->hierarchicalLevels = 0;
+	metap->reserved = 0;
 	((PageHeader) page)->pd_lower =
 		((char *) metap + sizeof(IvfflatMetaPageData)) - (char *) page;
 

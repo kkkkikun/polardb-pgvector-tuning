@@ -12,6 +12,7 @@
 #include "utils/sampling.h"
 #include "utils/tuplesort.h"
 #include "vector.h"
+#include "rabitq.h"				/* RaBitQ quantization support */
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
@@ -34,9 +35,14 @@
 #define IVFFLAT_KMEANS_NORM_PROC 4
 #define IVFFLAT_TYPE_INFO_PROC 5
 
-#define IVFFLAT_VERSION	1
+#define IVFFLAT_VERSION	2			/* Version 2 with RaBitQ support */
 #define IVFFLAT_MAGIC_NUMBER 0x14FF1A7
 #define IVFFLAT_PAGE_ID	0xFF84
+
+/* RaBitQ settings */
+#define IVFFLAT_RABITQ_ENABLED		1
+#define IVFFLAT_HIERARCHICAL_KMEANS	1
+#define IVFFLAT_RERANK_TOP_K		100
 
 /* Preserved page numbers */
 #define IVFFLAT_METAPAGE_BLKNO	0
@@ -221,6 +227,10 @@ typedef struct IvfflatBuildState
 
 	/* Parallel builds */
 	IvfflatLeader *ivfleader;
+
+	/* RaBitQ support */
+	RaBitQEncoder *rabitqEncoder;
+	bool		useRaBitQ;
 }			IvfflatBuildState;
 
 typedef struct IvfflatMetaPageData
@@ -229,9 +239,26 @@ typedef struct IvfflatMetaPageData
 	uint32		version;
 	uint16		dimensions;
 	uint16		lists;
+	/* RaBitQ extension (version 2+) */
+	BlockNumber encoderBlkno;		/* Starting block of serialized encoder */
+	uint8		useRaBitQ;			/* Whether RaBitQ is enabled */
+	uint8		hierarchicalLevels;	/* Number of K-means hierarchy levels */
+	uint16		reserved;			/* Padding for alignment */
 }			IvfflatMetaPageData;
 
 typedef IvfflatMetaPageData * IvfflatMetaPage;
+
+/*
+ * RaBitQ compressed entry for IVF posting lists
+ *
+ * Instead of storing full vectors (256+ bytes for 128-dim halfvec),
+ * we store only the quantized code (20 bytes for 128-dim).
+ */
+typedef struct IvfRaBitQEntry
+{
+	ItemPointerData heaptid;		/* 6 bytes: heap tuple id */
+	RaBitQCode128	code;			/* 20 bytes: quantized vector */
+}			IvfRaBitQEntry;			/* Total: 26 bytes */
 
 typedef struct IvfflatPageOpaqueData
 {
@@ -286,6 +313,11 @@ typedef struct IvfflatScanOpaqueData
 	BlockNumber *listPages;
 	int			listIndex;
 	IvfflatScanList *lists;
+
+	/* RaBitQ support */
+	RaBitQEncoder *rabitqEncoder;
+	RaBitQQueryState queryState;
+	bool		useRaBitQ;
 }			IvfflatScanOpaqueData;
 
 typedef IvfflatScanOpaqueData * IvfflatScanOpaque;
@@ -310,6 +342,7 @@ VectorArraySet(VectorArray arr, int offset, Pointer val)
 VectorArray VectorArrayInit(int maxlen, int dimensions, Size itemsize);
 void		VectorArrayFree(VectorArray arr);
 void		IvfflatKmeans(Relation index, VectorArray samples, VectorArray centers, const IvfflatTypeInfo * typeInfo);
+void		IvfflatHierarchicalKmeans(Relation index, VectorArray samples, VectorArray centers, const IvfflatTypeInfo * typeInfo, int L1, int L2);
 FmgrInfo   *IvfflatOptionalProcInfo(Relation index, uint16 procnum);
 Datum		IvfflatNormValue(const IvfflatTypeInfo * typeInfo, Oid collation, Datum value);
 bool		IvfflatCheckNorm(FmgrInfo *procinfo, Oid collation, Datum value);

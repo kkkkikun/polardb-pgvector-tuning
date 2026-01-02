@@ -581,3 +581,169 @@ IvfflatKmeans(Relation index, VectorArray samples, VectorArray centers, const Iv
 	MemoryContextSwitchTo(oldCtx);
 	MemoryContextDelete(kmeansCtx);
 }
+
+/*
+ * Hierarchical K-means for large numbers of lists
+ *
+ * VectorChord-style two-level clustering:
+ * - Level 1: L1 coarse clusters (e.g., 400)
+ * - Level 2: Each L1 cluster subdivided into L2/L1 sub-clusters
+ *
+ * Total clusters: L1 * (L2/L1) = L2
+ * Speedup: O(n*sqrt(L2)) instead of O(n*L2)
+ *
+ * Example: L2=160000
+ * - Direct: 160000 distance computations per sample per iteration
+ * - Hierarchical (L1=400): 400 + 400 = 800 computations per sample
+ * - Speedup: ~200x
+ */
+void
+IvfflatHierarchicalKmeans(Relation index, VectorArray samples, VectorArray centers,
+						  const IvfflatTypeInfo * typeInfo, int L1, int L2)
+{
+	MemoryContext kmeansCtx;
+	MemoryContext oldCtx;
+	FmgrInfo   *procinfo;
+	Oid			collation;
+	int			dimensions;
+	int			numSamples;
+	int			subListsPerCluster;
+	VectorArray L1Centers;
+	int		   *assignments;
+	int		   *clusterSizes;
+
+	if (samples->length == 0)
+	{
+		/* Fall back to random centers */
+		IvfflatKmeans(index, samples, centers, typeInfo);
+		return;
+	}
+
+	/* Validate parameters */
+	if (L1 <= 0 || L2 <= 0 || L2 < L1)
+	{
+		elog(WARNING, "Invalid hierarchical K-means parameters (L1=%d, L2=%d), falling back to standard", L1, L2);
+		IvfflatKmeans(index, samples, centers, typeInfo);
+		return;
+	}
+
+	kmeansCtx = AllocSetContextCreate(CurrentMemoryContext,
+									  "Ivfflat hierarchical kmeans context",
+									  ALLOCSET_DEFAULT_SIZES);
+	oldCtx = MemoryContextSwitchTo(kmeansCtx);
+
+	procinfo = index_getprocinfo(index, 1, IVFFLAT_KMEANS_DISTANCE_PROC);
+	collation = index->rd_indcollation[0];
+	dimensions = samples->dim;
+	numSamples = samples->length;
+	subListsPerCluster = L2 / L1;
+
+	elog(INFO, "Hierarchical K-means: L1=%d, L2=%d, sublists/cluster=%d",
+		 L1, L2, subListsPerCluster);
+
+	/* Step 1: First-level K-means with L1 clusters */
+	L1Centers = VectorArrayInit(L1, dimensions, centers->itemsize);
+
+	elog(INFO, "Phase 1: Computing %d coarse clusters", L1);
+	ElkanKmeans(index, samples, L1Centers, typeInfo);
+
+	/* Step 2: Assign each sample to its closest L1 center */
+	assignments = (int *) palloc(numSamples * sizeof(int));
+	clusterSizes = (int *) palloc0(L1 * sizeof(int));
+
+	for (int j = 0; j < numSamples; j++)
+	{
+		Datum		vec = PointerGetDatum(VectorArrayGet(samples, j));
+		float		minDistance = FLT_MAX;
+		int			closestCenter = 0;
+
+		for (int k = 0; k < L1; k++)
+		{
+			float		distance = DatumGetFloat8(FunctionCall2Coll(procinfo, collation, vec,
+																	 PointerGetDatum(VectorArrayGet(L1Centers, k))));
+
+			if (distance < minDistance)
+			{
+				minDistance = distance;
+				closestCenter = k;
+			}
+		}
+
+		assignments[j] = closestCenter;
+		clusterSizes[closestCenter]++;
+	}
+
+	/* Step 3: For each L1 cluster, run K-means to get sublists */
+	elog(INFO, "Phase 2: Computing %d sub-clusters for each coarse cluster", subListsPerCluster);
+
+	for (int i = 0; i < L1; i++)
+	{
+		VectorArray clusterSamples;
+		VectorArray subCenters;
+		int			clusterSize = clusterSizes[i];
+		int			sampleIdx = 0;
+
+		CHECK_FOR_INTERRUPTS();
+
+		if (clusterSize == 0)
+		{
+			/* Empty cluster: use random centers */
+			for (int j = 0; j < subListsPerCluster; j++)
+			{
+				int			centerIdx = i * subListsPerCluster + j;
+				float	   *x = (float *) palloc(sizeof(float) * dimensions);
+
+				for (int k = 0; k < dimensions; k++)
+					x[k] = (float) RandomDouble();
+
+				typeInfo->updateCenter(VectorArrayGet(centers, centerIdx), dimensions, x);
+				centers->length++;
+				pfree(x);
+			}
+			continue;
+		}
+
+		/* Collect samples belonging to this cluster */
+		clusterSamples = VectorArrayInit(clusterSize, dimensions, samples->itemsize);
+		for (int j = 0; j < numSamples; j++)
+		{
+			if (assignments[j] == i)
+			{
+				VectorArraySet(clusterSamples, sampleIdx, VectorArrayGet(samples, j));
+				clusterSamples->length++;
+				sampleIdx++;
+			}
+		}
+
+		/* Run K-means on this subset */
+		subCenters = VectorArrayInit(subListsPerCluster, dimensions, centers->itemsize);
+		ElkanKmeans(index, clusterSamples, subCenters, typeInfo);
+
+		/* Copy sub-centers to final centers array */
+		for (int j = 0; j < subListsPerCluster; j++)
+		{
+			int			centerIdx = i * subListsPerCluster + j;
+
+			VectorArraySet(centers, centerIdx, VectorArrayGet(subCenters, j));
+			if (centers->length <= centerIdx)
+				centers->length = centerIdx + 1;
+		}
+
+		VectorArrayFree(clusterSamples);
+		VectorArrayFree(subCenters);
+	}
+
+	/* Ensure all centers are set */
+	centers->length = L2;
+
+	CheckCenters(index, centers, typeInfo);
+
+	pfree(assignments);
+	pfree(clusterSizes);
+	VectorArrayFree(L1Centers);
+
+	MemoryContextSwitchTo(oldCtx);
+	MemoryContextDelete(kmeansCtx);
+
+	elog(INFO, "Hierarchical K-means completed: %d centers", centers->length);
+}
