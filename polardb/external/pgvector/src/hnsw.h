@@ -197,7 +197,14 @@ typedef struct HnswGraph
 	/* Graph state - sharded for parallel builds (locks kept for safety) */
 	slock_t		locks[HNSW_NUM_LIST_SHARDS];
 	HnswElementPtr heads[HNSW_NUM_LIST_SHARDS];
+
+	/*
+	 * Atomic counter on its own cache line to avoid false sharing.
+	 * Cache line is typically 64 bytes; padding ensures isolation.
+	 */
+	char		_pad1[64];
 	pg_atomic_uint64 indtuples;	/* Atomic counter replacing spinlock */
+	char		_pad2[64 - sizeof(pg_atomic_uint64)];
 
 	/* Entry state */
 	LWLock		entryLock;
@@ -224,9 +231,13 @@ typedef struct HnswShared
 	/* Worker progress */
 	ConditionVariable workersdonecv;
 
-	/* Lock-free atomic state for worker coordination */
+	/*
+	 * Atomic counters on their own cache line to avoid false sharing.
+	 */
+	char		_pad1[64];
 	pg_atomic_uint32 nparticipantsdone;	/* Atomic counter */
 	pg_atomic_uint64 reltuples;			/* Atomic tuple counter */
+	char		_pad2[64 - sizeof(pg_atomic_uint32) - sizeof(pg_atomic_uint64)];
 
 	HnswGraph	graphData;
 }			HnswShared;

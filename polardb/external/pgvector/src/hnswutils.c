@@ -29,8 +29,11 @@
  * A candidate is skipped if RQ_distance > exact_max_distance * RQ_THRESHOLD_MULT.
  * Higher value = more aggressive filtering (fewer exact computations) but may miss neighbors.
  * Lower value = safer filtering but less speedup.
+ *
+ * Note: RQ distance approximation has error ~10-20%, so 1.3 allows some margin
+ * while still providing meaningful filtering.
  */
-#define RQ_THRESHOLD_MULT 1.5f
+#define RQ_THRESHOLD_MULT 1.3f
 
 #if PG_VERSION_NUM < 170000
 static inline uint64

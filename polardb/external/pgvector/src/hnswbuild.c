@@ -887,6 +887,9 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	return true;
 }
 
+/* Progress update interval to reduce overhead */
+#define PROGRESS_UPDATE_INTERVAL 100
+
 /*
  * Callback for table_index_build_scan
  */
@@ -908,9 +911,15 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
 	/* Insert tuple */
 	if (InsertTuple(index, values, isnull, tid, buildstate))
 	{
-		/* Update progress (lock-free atomic increment) */
+		/* Update counter (lock-free atomic increment) */
 		uint64 newCount = pg_atomic_add_fetch_u64(&graph->indtuples, 1);
-		pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE, newCount);
+
+		/*
+		 * Update progress only every PROGRESS_UPDATE_INTERVAL tuples
+		 * to reduce pgstat overhead. The final count will be accurate.
+		 */
+		if (newCount % PROGRESS_UPDATE_INTERVAL == 0)
+			pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE, newCount);
 	}
 
 	/* Reset memory context */

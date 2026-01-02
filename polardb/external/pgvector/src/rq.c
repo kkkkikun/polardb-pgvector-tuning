@@ -270,7 +270,8 @@ ComputeL2Squared(float *a, float *b, int dim)
 }
 
 /*
- * Find nearest centroid in a codebook stage
+ * Find nearest centroid in a codebook stage (SIMD optimized)
+ * Uses batch distance computation and parallel minimum finding
  */
 static int
 FindNearestCentroid(float *vector, float *centroids, int numCentroids, int dim)
@@ -278,6 +279,169 @@ FindNearestCentroid(float *vector, float *centroids, int numCentroids, int dim)
 	int			nearest = 0;
 	float		minDist = FLT_MAX;
 
+#ifdef __AVX512F__
+	/*
+	 * AVX-512 optimized: compute distances for 4 centroids at a time,
+	 * interleaving distance calculations to hide latency
+	 */
+	float		distances[4];
+	int			i = 0;
+
+	for (; i + 4 <= numCentroids; i += 4)
+	{
+		__m512		vsum0 = _mm512_setzero_ps();
+		__m512		vsum1 = _mm512_setzero_ps();
+		__m512		vsum2 = _mm512_setzero_ps();
+		__m512		vsum3 = _mm512_setzero_ps();
+		float	   *c0 = &centroids[(i + 0) * dim];
+		float	   *c1 = &centroids[(i + 1) * dim];
+		float	   *c2 = &centroids[(i + 2) * dim];
+		float	   *c3 = &centroids[(i + 3) * dim];
+		int			d = 0;
+
+		/* Process 16 dimensions at a time for all 4 centroids */
+		for (; d + 16 <= dim; d += 16)
+		{
+			__m512		vv = _mm512_loadu_ps(&vector[d]);
+			__m512		vc0 = _mm512_loadu_ps(&c0[d]);
+			__m512		vc1 = _mm512_loadu_ps(&c1[d]);
+			__m512		vc2 = _mm512_loadu_ps(&c2[d]);
+			__m512		vc3 = _mm512_loadu_ps(&c3[d]);
+			__m512		diff0 = _mm512_sub_ps(vv, vc0);
+			__m512		diff1 = _mm512_sub_ps(vv, vc1);
+			__m512		diff2 = _mm512_sub_ps(vv, vc2);
+			__m512		diff3 = _mm512_sub_ps(vv, vc3);
+
+			vsum0 = _mm512_fmadd_ps(diff0, diff0, vsum0);
+			vsum1 = _mm512_fmadd_ps(diff1, diff1, vsum1);
+			vsum2 = _mm512_fmadd_ps(diff2, diff2, vsum2);
+			vsum3 = _mm512_fmadd_ps(diff3, diff3, vsum3);
+		}
+
+		distances[0] = _mm512_reduce_add_ps(vsum0);
+		distances[1] = _mm512_reduce_add_ps(vsum1);
+		distances[2] = _mm512_reduce_add_ps(vsum2);
+		distances[3] = _mm512_reduce_add_ps(vsum3);
+
+		/* Handle remaining dimensions */
+		for (; d < dim; d++)
+		{
+			float		v = vector[d];
+			float		diff0 = v - c0[d];
+			float		diff1 = v - c1[d];
+			float		diff2 = v - c2[d];
+			float		diff3 = v - c3[d];
+
+			distances[0] += diff0 * diff0;
+			distances[1] += diff1 * diff1;
+			distances[2] += diff2 * diff2;
+			distances[3] += diff3 * diff3;
+		}
+
+		/* Find minimum among 4 distances */
+		for (int j = 0; j < 4; j++)
+		{
+			if (distances[j] < minDist)
+			{
+				minDist = distances[j];
+				nearest = i + j;
+			}
+		}
+	}
+
+	/* Handle remaining centroids */
+	for (; i < numCentroids; i++)
+	{
+		float	   *centroid = &centroids[i * dim];
+		float		dist = ComputeL2Squared(vector, centroid, dim);
+
+		if (dist < minDist)
+		{
+			minDist = dist;
+			nearest = i;
+		}
+	}
+
+#elif defined(__AVX2__)
+	/*
+	 * AVX2 optimized: compute distances for 2 centroids at a time
+	 */
+	float		distances[2];
+	int			i = 0;
+
+	for (; i + 2 <= numCentroids; i += 2)
+	{
+		__m256		vsum0 = _mm256_setzero_ps();
+		__m256		vsum1 = _mm256_setzero_ps();
+		float	   *c0 = &centroids[(i + 0) * dim];
+		float	   *c1 = &centroids[(i + 1) * dim];
+		int			d = 0;
+
+		for (; d + 8 <= dim; d += 8)
+		{
+			__m256		vv = _mm256_loadu_ps(&vector[d]);
+			__m256		vc0 = _mm256_loadu_ps(&c0[d]);
+			__m256		vc1 = _mm256_loadu_ps(&c1[d]);
+			__m256		diff0 = _mm256_sub_ps(vv, vc0);
+			__m256		diff1 = _mm256_sub_ps(vv, vc1);
+
+			vsum0 = _mm256_fmadd_ps(diff0, diff0, vsum0);
+			vsum1 = _mm256_fmadd_ps(diff1, diff1, vsum1);
+		}
+
+		/* Horizontal sum for vsum0 */
+		__m128		sum128 = _mm_add_ps(_mm256_castps256_ps128(vsum0),
+									   _mm256_extractf128_ps(vsum0, 1));
+		sum128 = _mm_hadd_ps(sum128, sum128);
+		sum128 = _mm_hadd_ps(sum128, sum128);
+		distances[0] = _mm_cvtss_f32(sum128);
+
+		/* Horizontal sum for vsum1 */
+		sum128 = _mm_add_ps(_mm256_castps256_ps128(vsum1),
+						   _mm256_extractf128_ps(vsum1, 1));
+		sum128 = _mm_hadd_ps(sum128, sum128);
+		sum128 = _mm_hadd_ps(sum128, sum128);
+		distances[1] = _mm_cvtss_f32(sum128);
+
+		/* Handle remaining dimensions */
+		for (; d < dim; d++)
+		{
+			float		v = vector[d];
+			float		diff0 = v - c0[d];
+			float		diff1 = v - c1[d];
+
+			distances[0] += diff0 * diff0;
+			distances[1] += diff1 * diff1;
+		}
+
+		/* Find minimum */
+		if (distances[0] < minDist)
+		{
+			minDist = distances[0];
+			nearest = i;
+		}
+		if (distances[1] < minDist)
+		{
+			minDist = distances[1];
+			nearest = i + 1;
+		}
+	}
+
+	/* Handle remaining centroids */
+	for (; i < numCentroids; i++)
+	{
+		float	   *centroid = &centroids[i * dim];
+		float		dist = ComputeL2Squared(vector, centroid, dim);
+
+		if (dist < minDist)
+		{
+			minDist = dist;
+			nearest = i;
+		}
+	}
+
+#else
+	/* Scalar fallback */
 	for (int i = 0; i < numCentroids; i++)
 	{
 		float	   *centroid = &centroids[i * dim];
@@ -289,6 +453,7 @@ FindNearestCentroid(float *vector, float *centroids, int numCentroids, int dim)
 			nearest = i;
 		}
 	}
+#endif
 
 	return nearest;
 }
@@ -587,7 +752,7 @@ RQDecodeToHalfvec(RQCodebook *cb, RQCode *code, HalfVector *output)
 }
 
 /*
- * Create distance lookup table for a query vector
+ * Create distance lookup table for a query vector (SIMD optimized)
  *
  * For asymmetric distance computation (ADC), we precompute the
  * squared distance from the query to each centroid at each stage.
@@ -607,18 +772,94 @@ RQCreateDistTable(RQCodebook *cb, float *query)
 	dt->tables = palloc((Size) numStages * numCentroids * sizeof(float));
 
 	/*
-	 * For each stage and centroid, compute the contribution to the distance.
-	 * For L2 squared distance: ||q - (c1 + c2 + ... + cM)||^2
-	 * We use: sum_i ||q_partial - ci||^2 + cross terms
-	 *
-	 * Simplified approach: store ||q - c_i||^2 for each centroid
-	 * Then reconstruct and compute exact distance (slower but more accurate)
-	 *
-	 * Or use an approximation based on cumulative residuals.
+	 * For each stage and centroid, compute: -2 * <q, c> + ||c||^2
+	 * This allows fast distance approximation by summing table entries.
 	 */
 
-	/* For simplicity, precompute dot products: <query, centroid_i> */
-	/* And ||centroid_i||^2 */
+#ifdef __AVX512F__
+	/* AVX-512 optimized: process multiple centroids in parallel */
+	for (int stage = 0; stage < numStages; stage++)
+	{
+		float	   *stageTable = &dt->tables[stage * numCentroids];
+
+		for (int c = 0; c < numCentroids; c++)
+		{
+			float	   *centroid = RQGetCentroid(cb, stage, c);
+			__m512		vdot = _mm512_setzero_ps();
+			__m512		vnorm = _mm512_setzero_ps();
+			int			d = 0;
+
+			/* Process 16 floats at a time */
+			for (; d + 16 <= dim; d += 16)
+			{
+				__m512		vq = _mm512_loadu_ps(&query[d]);
+				__m512		vc = _mm512_loadu_ps(&centroid[d]);
+
+				vdot = _mm512_fmadd_ps(vq, vc, vdot);
+				vnorm = _mm512_fmadd_ps(vc, vc, vnorm);
+			}
+
+			float		dotProduct = _mm512_reduce_add_ps(vdot);
+			float		normSq = _mm512_reduce_add_ps(vnorm);
+
+			/* Handle remaining elements */
+			for (; d < dim; d++)
+			{
+				dotProduct += query[d] * centroid[d];
+				normSq += centroid[d] * centroid[d];
+			}
+
+			stageTable[c] = -2.0f * dotProduct + normSq;
+		}
+	}
+#elif defined(__AVX2__)
+	/* AVX2 optimized */
+	for (int stage = 0; stage < numStages; stage++)
+	{
+		float	   *stageTable = &dt->tables[stage * numCentroids];
+
+		for (int c = 0; c < numCentroids; c++)
+		{
+			float	   *centroid = RQGetCentroid(cb, stage, c);
+			__m256		vdot = _mm256_setzero_ps();
+			__m256		vnorm = _mm256_setzero_ps();
+			int			d = 0;
+
+			/* Process 8 floats at a time */
+			for (; d + 8 <= dim; d += 8)
+			{
+				__m256		vq = _mm256_loadu_ps(&query[d]);
+				__m256		vc = _mm256_loadu_ps(&centroid[d]);
+
+				vdot = _mm256_fmadd_ps(vq, vc, vdot);
+				vnorm = _mm256_fmadd_ps(vc, vc, vnorm);
+			}
+
+			/* Horizontal sum */
+			__m128		sum128 = _mm_add_ps(_mm256_castps256_ps128(vdot),
+										   _mm256_extractf128_ps(vdot, 1));
+			sum128 = _mm_hadd_ps(sum128, sum128);
+			sum128 = _mm_hadd_ps(sum128, sum128);
+			float		dotProduct = _mm_cvtss_f32(sum128);
+
+			sum128 = _mm_add_ps(_mm256_castps256_ps128(vnorm),
+							   _mm256_extractf128_ps(vnorm, 1));
+			sum128 = _mm_hadd_ps(sum128, sum128);
+			sum128 = _mm_hadd_ps(sum128, sum128);
+			float		normSq = _mm_cvtss_f32(sum128);
+
+			/* Handle remaining elements */
+			for (; d < dim; d++)
+			{
+				dotProduct += query[d] * centroid[d];
+				normSq += centroid[d] * centroid[d];
+			}
+
+			stageTable[c] = -2.0f * dotProduct + normSq;
+		}
+	}
+#else
+	/* Scalar fallback */
 	for (int stage = 0; stage < numStages; stage++)
 	{
 		for (int c = 0; c < numCentroids; c++)
@@ -633,10 +874,10 @@ RQCreateDistTable(RQCodebook *cb, float *query)
 				normSq += centroid[d] * centroid[d];
 			}
 
-			/* Store: -2 * <q, c> + ||c||^2 for easy summation */
 			dt->tables[stage * numCentroids + c] = -2.0f * dotProduct + normSq;
 		}
 	}
+#endif
 
 	return dt;
 }
@@ -656,26 +897,40 @@ RQFreeDistTable(RQDistTable *dt)
 }
 
 /*
- * Compute approximate L2 squared distance using lookup table
+ * Compute approximate L2 squared distance using lookup table (optimized)
  *
  * This is an approximation. For exact distance, use RQComputeDistanceL2.
  * The approximation ignores cross terms between centroids from different stages.
+ * Loop is fully unrolled for RQ_NUM_STAGES=8 for maximum performance.
  */
 float
 RQComputeDistance(RQDistTable *dt, RQCode *code)
 {
-	float		distance = 0.0f;
-	int			numStages = dt->numStages;
+	float	   *tables = dt->tables;
 	int			numCentroids = dt->numCentroids;
 
-	for (int stage = 0; stage < numStages; stage++)
-	{
-		int			c = code->codes[stage];
+	/*
+	 * Fully unroll for 8 stages (RQ_NUM_STAGES).
+	 * This eliminates loop overhead and allows better instruction scheduling.
+	 */
+#if RQ_NUM_STAGES == 8
+	return tables[0 * numCentroids + code->codes[0]] +
+		   tables[1 * numCentroids + code->codes[1]] +
+		   tables[2 * numCentroids + code->codes[2]] +
+		   tables[3 * numCentroids + code->codes[3]] +
+		   tables[4 * numCentroids + code->codes[4]] +
+		   tables[5 * numCentroids + code->codes[5]] +
+		   tables[6 * numCentroids + code->codes[6]] +
+		   tables[7 * numCentroids + code->codes[7]];
+#else
+	float		distance = 0.0f;
+	int			numStages = dt->numStages;
 
-		distance += dt->tables[stage * numCentroids + c];
-	}
+	for (int stage = 0; stage < numStages; stage++)
+		distance += tables[stage * numCentroids + code->codes[stage]];
 
 	return distance;
+#endif
 }
 
 /*
