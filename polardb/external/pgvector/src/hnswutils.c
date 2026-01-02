@@ -1313,45 +1313,131 @@ CheckElementCloser(char *base, HnswCandidate * e, List *r, HnswSupport * support
 }
 
 /*
+ * 【优化】数组版本的CheckElementCloser - 避免List遍历开销
+ */
+static bool
+CheckElementCloserArray(char *base, HnswCandidate *e, HnswCandidate **r, int rlen, HnswSupport *support)
+{
+	HnswElement eElement = HnswPtrAccess(base, e->element);
+	Datum		eValue = HnswGetValue(base, eElement);
+
+	for (int i = 0; i < rlen; i++)
+	{
+		HnswCandidate *ri = r[i];
+		HnswElement riElement = HnswPtrAccess(base, ri->element);
+		Datum		riValue = HnswGetValue(base, riElement);
+		float		distance = (float)HnswGetDistance(eValue, riValue, support);
+
+		if (distance <= e->distance)
+			return false;
+	}
+
+	return true;
+}
+
+/*
+ * 【优化】qsort比较函数 - 降序排列（距离大的在前）
+ */
+static int
+CompareCandidateDistancesQsort(const void *a, const void *b)
+{
+	HnswCandidate *hca = *(HnswCandidate **)a;
+	HnswCandidate *hcb = *(HnswCandidate **)b;
+
+	if (hca->distance < hcb->distance)
+		return 1;
+	if (hca->distance > hcb->distance)
+		return -1;
+
+	/* Pointer tie-breaker for deterministic order */
+	if (HnswPtrPointer(hca->element) < HnswPtrPointer(hcb->element))
+		return 1;
+	if (HnswPtrPointer(hca->element) > HnswPtrPointer(hcb->element))
+		return -1;
+
+	return 0;
+}
+
+static int
+CompareCandidateDistancesOffsetQsort(const void *a, const void *b)
+{
+	HnswCandidate *hca = *(HnswCandidate **)a;
+	HnswCandidate *hcb = *(HnswCandidate **)b;
+
+	if (hca->distance < hcb->distance)
+		return 1;
+	if (hca->distance > hcb->distance)
+		return -1;
+
+	/* Offset tie-breaker for deterministic order */
+	if (HnswPtrOffset(hca->element) < HnswPtrOffset(hcb->element))
+		return 1;
+	if (HnswPtrOffset(hca->element) > HnswPtrOffset(hcb->element))
+		return -1;
+
+	return 0;
+}
+
+/*
  * Algorithm 4 from paper
+ * 【优化】使用数组代替List，避免list_copy/list_sort/list_delete_last/lappend开销
  */
 static List *
 SelectNeighbors(char *base, List *c, int lm, HnswSupport * support, bool *closerSet, HnswCandidate * newCandidate, HnswCandidate * *pruned, bool sortCandidates)
 {
-	List	   *r = NIL;
-	List	   *w = list_copy(c);
-	HnswCandidate **wd;
+	int			clen = list_length(c);
+	ListCell   *lc;
+	int			i;
+
+	/* 快速路径：候选数不超过lm，直接复制返回 */
+	if (clen <= lm)
+		return list_copy(c);
+
+	/* 【优化】使用栈分配小数组，避免palloc开销 */
+	/* 最大支持256个候选，超出则使用堆分配 */
+	HnswCandidate *w_stack[256];
+	HnswCandidate *r_stack[256];
+	HnswCandidate *wd_stack[256];
+	HnswCandidate *added_stack[256];
+
+	HnswCandidate **w = (clen <= 256) ? w_stack : palloc(sizeof(HnswCandidate *) * clen);
+	HnswCandidate **r_arr = (lm <= 256) ? r_stack : palloc(sizeof(HnswCandidate *) * lm);
+	HnswCandidate **wd = (clen <= 256) ? wd_stack : palloc(sizeof(HnswCandidate *) * clen);
+	HnswCandidate **added_arr = (lm <= 256) ? added_stack : palloc(sizeof(HnswCandidate *) * lm);
+
+	int			wlen = 0;
+	int			rlen = 0;
 	int			wdlen = 0;
 	int			wdoff = 0;
+	int			addedlen = 0;
 	bool		mustCalculate = !(*closerSet);
-	List	   *added = NIL;
 	bool		removedAny = false;
 
-	if (list_length(w) <= lm)
-		return w;
+	/* 复制候选到数组 */
+	foreach(lc, c)
+	{
+		w[wlen++] = (HnswCandidate *) lfirst(lc);
+	}
 
-	wd = palloc(sizeof(HnswCandidate *) * list_length(w));
-
-	/* Ensure order of candidates is deterministic for closer caching */
+	/* 【优化】使用qsort代替list_sort - 降序排列（距离大的在前） */
 	if (sortCandidates)
 	{
 		if (base == NULL)
-			list_sort(w, CompareCandidateDistances);
+			qsort(w, wlen, sizeof(HnswCandidate *), CompareCandidateDistancesQsort);
 		else
-			list_sort(w, CompareCandidateDistancesOffset);
+			qsort(w, wlen, sizeof(HnswCandidate *), CompareCandidateDistancesOffsetQsort);
 	}
 
-	while (list_length(w) > 0 && list_length(r) < lm)
+	/* 从后往前处理（距离最小的在后面） */
+	while (wlen > 0 && rlen < lm)
 	{
-		/* Assumes w is already ordered desc */
-		HnswCandidate *e = llast(w);
-
-		w = list_delete_last(w);
+		/* 取最后一个元素（距离最小） */
+		HnswCandidate *e = w[--wlen];
 
 		/* Use previous state of r and wd to skip work when possible */
 		if (mustCalculate)
-			e->closer = CheckElementCloser(base, e, r, support);
-		else if (list_length(added) > 0)
+			e->closer = CheckElementCloserArray(base, e, r_arr, rlen, support);
+		else if (addedlen > 0)
 		{
 			/* Keep Valgrind happy for in-memory, parallel builds */
 			if (base != NULL)
@@ -1363,7 +1449,7 @@ SelectNeighbors(char *base, List *c, int lm, HnswSupport * support, bool *closer
 			 */
 			if (e->closer)
 			{
-				e->closer = CheckElementCloser(base, e, added, support);
+				e->closer = CheckElementCloserArray(base, e, added_arr, addedlen, support);
 
 				if (!e->closer)
 					removedAny = true;
@@ -1376,17 +1462,17 @@ SelectNeighbors(char *base, List *c, int lm, HnswSupport * support, bool *closer
 				 */
 				if (removedAny)
 				{
-					e->closer = CheckElementCloser(base, e, r, support);
+					e->closer = CheckElementCloserArray(base, e, r_arr, rlen, support);
 					if (e->closer)
-						added = lappend(added, e);
+						added_arr[addedlen++] = e;
 				}
 			}
 		}
 		else if (e == newCandidate)
 		{
-			e->closer = CheckElementCloser(base, e, r, support);
+			e->closer = CheckElementCloserArray(base, e, r_arr, rlen, support);
 			if (e->closer)
-				added = lappend(added, e);
+				added_arr[addedlen++] = e;
 		}
 
 		/* Keep Valgrind happy for in-memory, parallel builds */
@@ -1394,7 +1480,7 @@ SelectNeighbors(char *base, List *c, int lm, HnswSupport * support, bool *closer
 			VALGRIND_MAKE_MEM_DEFINED(&e->closer, 1);
 
 		if (e->closer)
-			r = lappend(r, e);
+			r_arr[rlen++] = e;
 		else
 			wd[wdlen++] = e;
 	}
@@ -1403,19 +1489,38 @@ SelectNeighbors(char *base, List *c, int lm, HnswSupport * support, bool *closer
 	*closerSet = sortCandidates;
 
 	/* Keep pruned connections */
-	while (wdoff < wdlen && list_length(r) < lm)
-		r = lappend(r, wd[wdoff++]);
+	while (wdoff < wdlen && rlen < lm)
+		r_arr[rlen++] = wd[wdoff++];
 
 	/* Return pruned for update connections */
 	if (pruned != NULL)
 	{
 		if (wdoff < wdlen)
 			*pruned = wd[wdoff];
+		else if (wlen > 0)
+			*pruned = w[0];  /* 相当于原来的 linitial(w) */
 		else
-			*pruned = linitial(w);
+			*pruned = NULL;
 	}
 
-	return r;
+	/* 【最后】将结果数组转换回List返回 */
+	List *result = NIL;
+	for (i = 0; i < rlen; i++)
+		result = lappend(result, r_arr[i]);
+
+	/* 释放堆分配的内存（栈分配的不需要释放） */
+	if (clen > 256)
+	{
+		pfree(w);
+		pfree(wd);
+	}
+	if (lm > 256)
+	{
+		pfree(r_arr);
+		pfree(added_arr);
+	}
+
+	return result;
 }
 
 /*
