@@ -289,6 +289,8 @@ HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel,
 	element->deleted = 0;
 	/* Start at one to make it easier to find issues */
 	element->version = 1;
+	/* 初始化邻居版本号用于无锁读取 */
+	pg_atomic_init_u32(&element->neighborVersion, 0);
 
 	HnswInitNeighbors(base, element, m, allocator);
 
@@ -847,17 +849,48 @@ CountElement(HnswElement skipElement, HnswElement e)
 
 /*
  * Load unvisited neighbors from memory
+ *
+ * 【优化】使用无锁读取 + 版本号验证（乐观锁）
+ * 参考 VectorChord 的减少锁争用策略
  */
 static void
 HnswLoadUnvisitedFromMemory(char *base, HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, int lc, HnswNeighborArray * localNeighborhood, Size neighborhoodSize)
 {
 	/* Get the neighborhood at layer lc */
 	HnswNeighborArray *neighborhood = HnswGetNeighbors(base, element, lc);
+	uint32		version_before;
+	uint32		version_after;
+	int			retry_count = 0;
+	const int	max_retries = 3;
 
-	/* Copy neighborhood to local memory */
-	LWLockAcquire(&element->lock, LW_SHARED);
+retry:
+	/* 读取版本号（读前） */
+	version_before = pg_atomic_read_u32(&element->neighborVersion);
+
+	/* 内存屏障：确保版本号读取在数据读取之前完成 */
+	pg_memory_barrier();
+
+	/* 无锁复制邻居数据 */
 	memcpy(localNeighborhood, neighborhood, neighborhoodSize);
-	LWLockRelease(&element->lock);
+
+	/* 内存屏障：确保数据读取在版本号读取之前完成 */
+	pg_memory_barrier();
+
+	/* 读取版本号（读后） */
+	version_after = pg_atomic_read_u32(&element->neighborVersion);
+
+	/* 版本号不匹配说明有并发修改，需要重试或降级到加锁 */
+	if (version_before != version_after)
+	{
+		retry_count++;
+		if (retry_count < max_retries)
+			goto retry;
+
+		/* 超过重试次数，降级到传统加锁方式 */
+		LWLockAcquire(&element->lock, LW_SHARED);
+		memcpy(localNeighborhood, neighborhood, neighborhoodSize);
+		LWLockRelease(&element->lock);
+	}
 
 	*unvisitedLength = 0;
 

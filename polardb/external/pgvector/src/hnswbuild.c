@@ -393,6 +393,8 @@ UpdateNeighborsInMemory(char *base, HnswSupport * support, HnswElement e, int m)
 
 			LWLockAcquire(&neighborElement->lock, LW_EXCLUSIVE);
 			HnswUpdateConnection(base, HnswGetNeighbors(base, neighborElement, lc), e, hc->distance, lm, NULL, NULL, support);
+			/* 【优化】增加版本号，通知无锁读取者数据已更新 */
+			pg_atomic_fetch_add_u32(&neighborElement->neighborVersion, 1);
 			LWLockRelease(&neighborElement->lock);
 		}
 	}
