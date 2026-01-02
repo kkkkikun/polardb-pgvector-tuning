@@ -12,6 +12,7 @@
 #include "utils/sampling.h"
 #include "vector.h"
 #include "rq.h"					/* Residual Quantization support */
+#include "port/atomics.h"		/* Atomic operations for lock-free CAS */
 
 #define HNSW_MAX_DIM 2000
 #define HNSW_MAX_NNZ 1000
@@ -193,11 +194,10 @@ typedef struct HnswOptions
 
 typedef struct HnswGraph
 {
-	/* Graph state - sharded for parallel builds */
+	/* Graph state - sharded for parallel builds (locks kept for safety) */
 	slock_t		locks[HNSW_NUM_LIST_SHARDS];
 	HnswElementPtr heads[HNSW_NUM_LIST_SHARDS];
-	slock_t		countLock;		/* For indtuples updates */
-	double		indtuples;
+	pg_atomic_uint64 indtuples;	/* Atomic counter replacing spinlock */
 
 	/* Entry state */
 	LWLock		entryLock;
@@ -224,12 +224,10 @@ typedef struct HnswShared
 	/* Worker progress */
 	ConditionVariable workersdonecv;
 
-	/* Mutex for mutable state */
-	slock_t		mutex;
+	/* Lock-free atomic state for worker coordination */
+	pg_atomic_uint32 nparticipantsdone;	/* Atomic counter */
+	pg_atomic_uint64 reltuples;			/* Atomic tuple counter */
 
-	/* Mutable state */
-	int			nparticipantsdone;
-	double		reltuples;
 	HnswGraph	graphData;
 }			HnswShared;
 

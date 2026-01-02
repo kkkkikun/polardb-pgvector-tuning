@@ -843,8 +843,9 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 
 		if (!graph->flushed)
 		{
+			uint64 tupleCount = pg_atomic_read_u64(&graph->indtuples);
 			ereport(NOTICE,
-					(errmsg("hnsw graph no longer fits into maintenance_work_mem after " INT64_FORMAT " tuples", (int64) graph->indtuples),
+					(errmsg("hnsw graph no longer fits into maintenance_work_mem after " INT64_FORMAT " tuples", (int64) tupleCount),
 					 errdetail("Building will take significantly more time."),
 					 errhint("Increase maintenance_work_mem to speed up builds.")));
 
@@ -907,10 +908,9 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
 	/* Insert tuple */
 	if (InsertTuple(index, values, isnull, tid, buildstate))
 	{
-		/* Update progress */
-		SpinLockAcquire(&graph->countLock);
-		pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE, ++graph->indtuples);
-		SpinLockRelease(&graph->countLock);
+		/* Update progress (lock-free atomic increment) */
+		uint64 newCount = pg_atomic_add_fetch_u64(&graph->indtuples, 1);
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE, newCount);
 	}
 
 	/* Reset memory context */
@@ -938,8 +938,9 @@ InitGraph(HnswGraph * graph, char *base, Size memoryTotal)
 	graph->memoryUsed = 0;
 	graph->memoryTotal = memoryTotal;
 	graph->flushed = false;
-	graph->indtuples = 0;
-	SpinLockInit(&graph->countLock);
+
+	/* Initialize atomic counter (replaces spinlock) */
+	pg_atomic_init_u64(&graph->indtuples, 0);
 	LWLockInitialize(&graph->entryLock, hnsw_lock_tranche_id);
 	LWLockInitialize(&graph->entryWaitLock, hnsw_lock_tranche_id);
 	LWLockInitialize(&graph->allocatorLock, hnsw_lock_tranche_id);
@@ -1085,16 +1086,16 @@ ParallelHeapScan(HnswBuildState * buildstate)
 	nparticipanttuplesorts = buildstate->hnswleader->nparticipanttuplesorts;
 	for (;;)
 	{
-		SpinLockAcquire(&hnswshared->mutex);
-		if (hnswshared->nparticipantsdone == nparticipanttuplesorts)
+		/* Check without acquiring lock (lock-free read) */
+		uint32 participants = pg_atomic_read_u32(&hnswshared->nparticipantsdone);
+
+		if (participants == nparticipanttuplesorts)
 		{
 			buildstate->graph = &hnswshared->graphData;
 			buildstate->hnswarea = buildstate->hnswleader->hnswarea;
-			reltuples = hnswshared->reltuples;
-			SpinLockRelease(&hnswshared->mutex);
+			reltuples = (double) pg_atomic_read_u64(&hnswshared->reltuples);
 			break;
 		}
-		SpinLockRelease(&hnswshared->mutex);
 
 		ConditionVariableSleep(&hnswshared->workersdonecv,
 							   WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN);
@@ -1129,11 +1130,9 @@ HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnsw
 									   true, progress, BuildCallback,
 									   (void *) &buildstate, scan);
 
-	/* Record statistics */
-	SpinLockAcquire(&hnswshared->mutex);
-	hnswshared->nparticipantsdone++;
-	hnswshared->reltuples += reltuples;
-	SpinLockRelease(&hnswshared->mutex);
+	/* Record statistics (lock-free atomic operations) */
+	pg_atomic_add_fetch_u32(&hnswshared->nparticipantsdone, 1);
+	pg_atomic_add_fetch_u64(&hnswshared->reltuples, (uint64) reltuples);
 
 	/* Log statistics */
 	if (progress)
@@ -1311,10 +1310,9 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
 	hnswshared->indexrelid = RelationGetRelid(buildstate->index);
 	hnswshared->isconcurrent = isconcurrent;
 	ConditionVariableInit(&hnswshared->workersdonecv);
-	SpinLockInit(&hnswshared->mutex);
-	/* Initialize mutable state */
-	hnswshared->nparticipantsdone = 0;
-	hnswshared->reltuples = 0;
+	/* Initialize lock-free atomic counters */
+	pg_atomic_init_u32(&hnswshared->nparticipantsdone, 0);
+	pg_atomic_init_u64(&hnswshared->reltuples, 0);
 	table_parallelscan_initialize(buildstate->heap,
 								  ParallelTableScanFromHnswShared(hnswshared),
 								  snapshot);
@@ -1423,7 +1421,8 @@ BuildGraph(HnswBuildState * buildstate)
 			buildstate->reltuples = table_index_build_scan(buildstate->heap, buildstate->index, buildstate->indexInfo,
 														   true, true, BuildCallback, (void *) buildstate, NULL);
 
-		buildstate->indtuples = buildstate->graph->indtuples;
+		/* Read atomic counter for indtuples */
+		buildstate->indtuples = (double) pg_atomic_read_u64(&buildstate->graph->indtuples);
 	}
 
 	/* Flush pages */
