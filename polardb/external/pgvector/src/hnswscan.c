@@ -7,6 +7,129 @@
 #include "storage/lmgr.h"
 #include "utils/float.h"
 #include "utils/memutils.h"
+#include "halfvec.h"
+#include "vector.h"
+
+/* SIMD headers */
+#ifdef __x86_64__
+#include <immintrin.h>
+#endif
+
+/* Simple half to float conversion for query conversion */
+static inline float
+HalfToFloatSimple(half h)
+{
+#ifdef F16C_SUPPORT
+	return _cvtsh_ss(h);
+#else
+	uint32		sign = (h >> 15) & 0x1;
+	uint32		exp = (h >> 10) & 0x1F;
+	uint32		mant = h & 0x3FF;
+	uint32		f;
+
+	if (exp == 0)
+	{
+		if (mant == 0)
+			f = sign << 31;
+		else
+		{
+			exp = 1;
+			while ((mant & 0x400) == 0)
+			{
+				mant <<= 1;
+				exp--;
+			}
+			mant &= 0x3FF;
+			f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+		}
+	}
+	else if (exp == 31)
+		f = (sign << 31) | 0x7F800000 | (mant << 13);
+	else
+		f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+
+	return *((float *) &f);
+#endif
+}
+
+/*
+ * Convert query datum to float array for RQ distance computation.
+ * Uses VARSIZE to determine if it's halfvec or vector.
+ */
+static float *
+QueryDatumToFloat(Datum value, int dimensions)
+{
+	Pointer		ptr = DatumGetPointer(value);
+	float	   *result;
+	int			i;
+
+	if (ptr == NULL)
+		return NULL;
+
+	result = palloc(dimensions * sizeof(float));
+
+	/* Check if it's a halfvec or vector based on size */
+	if (VARSIZE_ANY(ptr) <= HALFVEC_SIZE(dimensions) + 8)
+	{
+		/* Likely halfvec */
+		HalfVector *hv = (HalfVector *) ptr;
+
+		for (i = 0; i < hv->dim && i < dimensions; i++)
+			result[i] = HalfToFloatSimple(hv->x[i]);
+	}
+	else
+	{
+		/* Likely full vector */
+		Vector	   *v = (Vector *) ptr;
+
+		for (i = 0; i < v->dim && i < dimensions; i++)
+			result[i] = v->x[i];
+	}
+
+	return result;
+}
+
+/*
+ * Initialize RQ support for query
+ *
+ * Note: RQ distance table is created but NOT yet used in search path.
+ * This is infrastructure for future optimization.
+ */
+static void
+InitRQForQuery(HnswScanOpaque so, Relation index, Datum value)
+{
+	float	   *queryFloat;
+
+	/* Already initialized */
+	if (so->rqDistTable != NULL)
+		return;
+
+	/* Load codebook if not loaded */
+	if (so->rqCodebook == NULL)
+	{
+		so->rqCodebook = HnswLoadRQCodebook(index);
+
+		if (so->rqCodebook == NULL)
+			return;				/* No RQ support for this index */
+	}
+
+	/* Convert query to float using known dimension from codebook */
+	queryFloat = QueryDatumToFloat(value, so->rqCodebook->dim);
+
+	if (queryFloat == NULL)
+	{
+		ereport(DEBUG1, (errmsg("RQ: could not convert query to float")));
+		return;
+	}
+
+	/* Create distance table (allocated in current memory context) */
+	so->rqDistTable = RQCreateDistTable(so->rqCodebook, queryFloat);
+
+	/* Free query float - allocated in same context */
+	pfree(queryFloat);
+
+	ereport(DEBUG1, (errmsg("RQ: initialized distance table for query")));
+}
 
 /*
  * Algorithm 5 from paper
@@ -30,6 +153,9 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	q->value = value;
 	so->m = m;
 
+	/* Initialize RQ distance table for this query */
+	InitRQForQuery(so, index, value);
+
 	if (entryPoint == NULL)
 		return NIL;
 
@@ -37,11 +163,13 @@ GetScanItems(IndexScanDesc scan, Datum value)
 
 	for (int lc = entryPoint->level; lc >= 1; lc--)
 	{
-		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL);
+		/* Upper layers: no RQ filtering, just find entry to ground layer */
+		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL, NULL);
 		ep = w;
 	}
 
-	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples);
+	/* Ground layer: use RQ distance table for early filtering if available */
+	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, so->rqDistTable);
 }
 
 /*
@@ -72,7 +200,8 @@ ResumeScanItems(IndexScanDesc scan)
 		ep = lappend(ep, sc);
 	}
 
-	return HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples);
+	/* Use RQ distance table for early filtering if available */
+	return HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples, so->rqDistTable);
 }
 
 /*
@@ -131,6 +260,10 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 	/* Set support functions */
 	HnswInitSupport(&so->support, index);
 
+	/* Initialize RQ support (will be loaded on first query) */
+	so->rqCodebook = NULL;
+	so->rqDistTable = NULL;
+
 	/*
 	 * Use a lower max allocation size than default to allow scanning more
 	 * tuples for iterative search before exceeding work_mem
@@ -163,6 +296,15 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->discarded = NULL;
 	so->tuples = 0;
 	so->previousDistance = -get_float8_infinity();
+
+	/*
+	 * RQ structures are allocated in tmpCtx, so they will be freed
+	 * by MemoryContextReset. Just set pointers to NULL.
+	 * The codebook will be reloaded from index on next query.
+	 */
+	so->rqDistTable = NULL;
+	so->rqCodebook = NULL;
+
 	MemoryContextReset(so->tmpCtx);
 
 	if (keys && scan->numberOfKeys > 0)
@@ -327,6 +469,10 @@ hnswendscan(IndexScanDesc scan)
 {
 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
 
+	/*
+	 * RQ structures are allocated in tmpCtx, so they will be freed
+	 * by MemoryContextDelete. Just delete the context.
+	 */
 	MemoryContextDelete(so->tmpCtx);
 
 	pfree(so);

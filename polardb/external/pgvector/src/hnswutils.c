@@ -24,6 +24,14 @@
 #include "varatt.h"
 #endif
 
+/*
+ * RQ distance threshold multiplier for early filtering.
+ * A candidate is skipped if RQ_distance > exact_max_distance * RQ_THRESHOLD_MULT.
+ * Higher value = more aggressive filtering (fewer exact computations) but may miss neighbors.
+ * Lower value = safer filtering but less speedup.
+ */
+#define RQ_THRESHOLD_MULT 1.5f
+
 #if PG_VERSION_NUM < 170000
 static inline uint64
 murmurhash64(uint64 data)
@@ -449,6 +457,8 @@ HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
 		else
 			ItemPointerSetInvalid(&etup->heaptids[i]);
 	}
+	/* Copy RQ code */
+	etup->rqCode = element->rqCode;
 	memcpy(&etup->data, valuePtr, VARSIZE_ANY(valuePtr));
 }
 
@@ -500,6 +510,9 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 	element->neighborOffno = ItemPointerGetOffsetNumber(&etup->neighbortid);
 	element->heaptidsLength = 0;
 
+	/* Load RQ code */
+	element->rqCode = etup->rqCode;
+
 	if (loadHeaptids)
 	{
 		for (int i = 0; i < HNSW_HEAPTIDS; i++)
@@ -532,9 +545,10 @@ HnswGetDistance(Datum a, Datum b, HnswSupport * support)
 
 /*
  * Load an element and optionally get its distance from q
+ * With optional RQ-based early filtering
  */
 static void
-HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element)
+HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element, RQDistTable *rqDistTable)
 {
 	Buffer		buf;
 	Page		page;
@@ -549,7 +563,33 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 
 	Assert(HnswIsElementTuple(etup));
 
-	/* Calculate distance */
+	/*
+	 * RQ-based early filtering: If we have an RQ distance table and the element
+	 * has a valid RQ code, compute approximate distance first. If it's clearly
+	 * larger than the current max, skip exact distance computation.
+	 */
+	if (rqDistTable != NULL && maxDistance != NULL && *maxDistance > 0)
+	{
+		float		rqDist = RQComputeDistance(rqDistTable, &etup->rqCode);
+
+		/*
+		 * RQ distance is an approximation that doesn't include ||q||^2.
+		 * Since ||q||^2 is constant and RQ distance correlates with true distance,
+		 * if RQ distance is much larger than current max, skip this candidate.
+		 * Use a threshold to account for approximation error.
+		 */
+		if (rqDist > (*maxDistance) * RQ_THRESHOLD_MULT)
+		{
+			/* Skip this candidate - RQ suggests it's too far */
+			*element = NULL;
+			if (distance != NULL)
+				*distance = rqDist; /* Use approximate distance for discarded candidates */
+			UnlockReleaseBuffer(buf);
+			return;
+		}
+	}
+
+	/* Calculate exact distance */
 	if (distance != NULL)
 	{
 		if (DatumGetPointer(q->value) == NULL)
@@ -576,7 +616,7 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 void
 HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance)
 {
-	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element);
+	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element, NULL);
 }
 
 /*
@@ -848,7 +888,7 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
  * Algorithm 2 from paper
  */
 List *
-HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples)
+HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, RQDistTable *rqDistTable)
 {
 	List	   *w = NIL;
 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
@@ -916,8 +956,9 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		HnswSearchCandidate *c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
 		HnswSearchCandidate *f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 		HnswElement cElement;
+		double		f_distance = f->distance;	/* Cache for inner loop */
 
-		if (c->distance > f->distance)
+		if (c->distance > f_distance)
 			break;
 
 		cElement = HnswPtrAccess(base, c->element);
@@ -938,8 +979,6 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			double		eDistance;
 			bool		alwaysAdd = wlen < ef;
 
-			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
-
 			if (inMemory)
 			{
 				eElement = unvisited[i].element;
@@ -953,13 +992,13 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 				/* Avoid any allocations if not adding */
 				eElement = NULL;
-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
+				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f_distance, &eElement, rqDistTable);
 
 				if (eElement == NULL)
 					continue;
 			}
 
-			if (eElement == NULL || !(eDistance < f->distance || alwaysAdd))
+			if (eElement == NULL || !(eDistance < f_distance || alwaysAdd))
 			{
 				if (discarded != NULL)
 				{
@@ -996,6 +1035,10 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 					if (discarded != NULL)
 						pairingheap_add(*discarded, &d->w_node);
+
+					/* Update cached f_distance after W modification */
+					f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+					f_distance = f->distance;
 				}
 			}
 		}
@@ -1331,7 +1374,8 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 	/* 1st phase: greedy search to insert level */
 	for (int lc = entryLevel; lc >= level + 1; lc--)
 	{
-		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
+		/* No RQ filtering during index build */
+		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL);
 		ep = w;
 	}
 
@@ -1350,7 +1394,8 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 		List	   *lw = NIL;
 		ListCell   *lc2;
 
-		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
+		/* No RQ filtering during index build */
+		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL);
 
 		/* Convert search candidates to candidates */
 		foreach(lc2, w)
@@ -1456,4 +1501,85 @@ hnsw_sparsevec_support(PG_FUNCTION_ARGS)
 	};
 
 	PG_RETURN_POINTER(&typeInfo);
+}
+
+/*
+ * Load RQ codebook from index pages
+ */
+RQCodebook *
+HnswLoadRQCodebook(Relation index)
+{
+	Buffer		buf;
+	Page		page;
+	HnswMetaPage metap;
+	BlockNumber codebookBlkno;
+	int			dim;
+	int			numStages;
+	int			numCentroids;
+	Size		totalSize;
+	char	   *data;
+	char	   *ptr;
+	RQCodebook *codebook;
+
+	/* Read metapage to get RQ info */
+	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	metap = HnswPageGetMeta(page);
+
+	codebookBlkno = metap->rqCodebookBlkno;
+	dim = metap->dimensions;
+	numStages = metap->rqNumStages;
+	numCentroids = metap->rqNumCentroids;
+
+	UnlockReleaseBuffer(buf);
+
+	/* No RQ codebook */
+	if (!BlockNumberIsValid(codebookBlkno) || numStages == 0)
+		return NULL;
+
+	/* Calculate total size */
+	totalSize = sizeof(int) * 3 + (Size) numStages * numCentroids * dim * sizeof(float);
+
+	/* Allocate buffer for serialized data */
+	data = palloc(totalSize);
+	ptr = data;
+
+	/* Read codebook pages */
+	while (codebookBlkno != InvalidBlockNumber && ptr < data + totalSize)
+	{
+		char	   *pageData;
+		Size		chunkSize;
+		HnswPageOpaque opaque;
+
+		buf = ReadBuffer(index, codebookBlkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+
+		/* Get chunk size and data */
+		pageData = (char *) page + MAXALIGN(SizeOfPageHeaderData);
+		chunkSize = *((Size *) pageData);
+		pageData += sizeof(Size);
+
+		/* Copy data */
+		if (ptr + chunkSize <= data + totalSize)
+			memcpy(ptr, pageData, chunkSize);
+
+		ptr += chunkSize;
+
+		/* Get next block */
+		opaque = HnswPageGetOpaque(page);
+		codebookBlkno = opaque->nextblkno;
+
+		UnlockReleaseBuffer(buf);
+	}
+
+	/* Deserialize codebook */
+	codebook = RQDeserializeCodebook(data);
+	pfree(data);
+
+	ereport(DEBUG1, (errmsg("RQ: loaded codebook (dim=%d, stages=%d, centroids=%d)",
+							codebook->dim, codebook->numStages, codebook->numCentroids)));
+
+	return codebook;
 }

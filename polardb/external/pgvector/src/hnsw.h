@@ -11,9 +11,13 @@
 #include "utils/relptr.h"
 #include "utils/sampling.h"
 #include "vector.h"
+#include "rq.h"					/* Residual Quantization support */
 
 #define HNSW_MAX_DIM 2000
 #define HNSW_MAX_NNZ 1000
+
+/* Number of shards for element list to reduce SpinLock contention */
+#define HNSW_NUM_LIST_SHARDS 32
 
 /* Support functions */
 #define HNSW_DISTANCE_PROC 1
@@ -151,6 +155,8 @@ struct HnswElementData
 	BlockNumber neighborPage;
 	DatumPtr	value;
 	LWLock		lock;
+	/* RQ code for fast approximate distance */
+	RQCode		rqCode;			/* Precomputed RQ code (8 bytes) */
 };
 
 typedef HnswElementData * HnswElement;
@@ -187,9 +193,10 @@ typedef struct HnswOptions
 
 typedef struct HnswGraph
 {
-	/* Graph state */
-	slock_t		lock;
-	HnswElementPtr head;
+	/* Graph state - sharded for parallel builds */
+	slock_t		locks[HNSW_NUM_LIST_SHARDS];
+	HnswElementPtr heads[HNSW_NUM_LIST_SHARDS];
+	slock_t		countLock;		/* For indtuples updates */
 	double		indtuples;
 
 	/* Entry state */
@@ -299,6 +306,12 @@ typedef struct HnswBuildState
 	HnswLeader *hnswleader;
 	HnswShared *hnswshared;
 	char	   *hnswarea;
+
+	/* Residual Quantization (RQ) support */
+	RQCodebook *rqCodebook;		/* Trained RQ codebook (NULL if RQ disabled) */
+	float	   *rqTrainVectors;	/* Vectors for RQ training */
+	int			rqTrainCount;	/* Number of training vectors */
+	int			rqTrainMax;		/* Max training vectors to collect */
 }			HnswBuildState;
 
 typedef struct HnswMetaPageData
@@ -312,6 +325,10 @@ typedef struct HnswMetaPageData
 	OffsetNumber entryOffno;
 	int16		entryLevel;
 	BlockNumber insertPage;
+	/* RQ codebook storage info */
+	BlockNumber rqCodebookBlkno; /* First block of RQ codebook (0 if no RQ) */
+	uint16		rqNumStages;	/* Number of RQ stages (0 if no RQ) */
+	uint16		rqNumCentroids;	/* Centroids per stage */
 }			HnswMetaPageData;
 
 typedef HnswMetaPageData * HnswMetaPage;
@@ -334,6 +351,7 @@ typedef struct HnswElementTupleData
 	ItemPointerData heaptids[HNSW_HEAPTIDS];
 	ItemPointerData neighbortid;
 	uint16		unused;
+	RQCode		rqCode;			/* RQ code for fast distance (8 bytes) */
 	Vector		data;
 }			HnswElementTupleData;
 
@@ -378,6 +396,10 @@ typedef struct HnswScanOpaqueData
 
 	/* Support functions */
 	HnswSupport support;
+
+	/* RQ support for fast distance computation */
+	RQCodebook *rqCodebook;		/* Loaded RQ codebook (NULL if no RQ) */
+	RQDistTable *rqDistTable;	/* Precomputed distance lookup table */
 }			HnswScanOpaqueData;
 
 typedef HnswScanOpaqueData * HnswScanOpaque;
@@ -417,7 +439,7 @@ bool		HnswCheckNorm(HnswSupport * support, Datum value);
 Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
 void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
-List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
+List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, RQDistTable *rqDistTable);
 HnswElement HnswGetEntryPoint(Relation index);
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
@@ -441,6 +463,9 @@ bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Rela
 void		HnswInitLockTranche(void);
 const		HnswTypeInfo *HnswGetTypeInfo(Relation index);
 PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
+
+/* RQ codebook functions */
+RQCodebook *HnswLoadRQCodebook(Relation index);
 
 /* Index access methods */
 IndexBuildResult *hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo);

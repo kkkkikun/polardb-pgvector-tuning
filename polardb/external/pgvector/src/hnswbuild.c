@@ -74,7 +74,274 @@
 #define PARALLEL_KEY_QUERY_TEXT			UINT64CONST(0xA000000000000003)
 
 /*
+ * Helper function for halfvec to float conversion
+ * (inline version for speed)
+ */
+static inline float
+HnswHalfToFloat(half h)
+{
+	uint32		sign = (h >> 15) & 0x1;
+	uint32		exp = (h >> 10) & 0x1F;
+	uint32		mant = h & 0x3FF;
+	uint32		f;
+
+	if (exp == 0)
+	{
+		if (mant == 0)
+			f = sign << 31;
+		else
+		{
+			exp = 1;
+			while ((mant & 0x400) == 0)
+			{
+				mant <<= 1;
+				exp--;
+			}
+			mant &= 0x3FF;
+			f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+		}
+	}
+	else if (exp == 31)
+		f = (sign << 31) | 0x7F800000 | (mant << 13);
+	else
+		f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+
+	return *((float *) &f);
+}
+
+/*
+ * Convert vector datum to float array for RQ processing
+ */
+static void
+VectorToFloatArray(Datum value, int dimensions, float *output)
+{
+	Pointer		ptr = DatumGetPointer(value);
+
+	/* Check if it's a halfvec or vector based on size */
+	if (VARSIZE_ANY(ptr) <= HALFVEC_SIZE(dimensions) + 8)
+	{
+		/* Likely halfvec */
+		HalfVector *hv = (HalfVector *) ptr;
+		int			i;
+
+		for (i = 0; i < hv->dim; i++)
+			output[i] = HnswHalfToFloat(hv->x[i]);
+	}
+	else
+	{
+		/* Likely full vector */
+		Vector	   *v = (Vector *) ptr;
+		int			i;
+
+		for (i = 0; i < v->dim; i++)
+			output[i] = v->x[i];
+	}
+}
+
+/*
+ * Collect training vector for RQ
+ * Returns true if we should train now (buffer full)
+ */
+static bool
+CollectRQTrainingVector(HnswBuildState *buildstate, Datum value)
+{
+	int			dim = buildstate->dimensions;
+	float	   *dest;
+
+	/* Skip if RQ not enabled or already trained */
+	if (buildstate->rqTrainVectors == NULL || buildstate->rqCodebook != NULL)
+		return false;
+
+	/* Check if buffer is full */
+	if (buildstate->rqTrainCount >= buildstate->rqTrainMax)
+		return true;
+
+	/* Add vector to training buffer */
+	dest = &buildstate->rqTrainVectors[buildstate->rqTrainCount * dim];
+	VectorToFloatArray(value, dim, dest);
+	buildstate->rqTrainCount++;
+
+	return (buildstate->rqTrainCount >= buildstate->rqTrainMax);
+}
+
+/*
+ * Train the RQ codebook using collected vectors
+ */
+static void
+TrainRQCodebook(HnswBuildState *buildstate)
+{
+	int			dim = buildstate->dimensions;
+	MemoryContext oldCtx;
+
+	if (buildstate->rqCodebook != NULL)
+		return;					/* Already trained */
+
+	if (buildstate->rqTrainCount < 256)
+	{
+		ereport(DEBUG1, (errmsg("RQ: not enough training vectors (%d), skipping RQ",
+								buildstate->rqTrainCount)));
+		return;
+	}
+
+	ereport(DEBUG1, (errmsg("RQ: training codebook with %d vectors, %d dimensions",
+							buildstate->rqTrainCount, dim)));
+
+	/*
+	 * IMPORTANT: Switch to graphCtx for codebook allocation.
+	 * The codebook must persist beyond the current tuple context (tmpCtx),
+	 * which gets reset after each tuple is processed in BuildCallback.
+	 */
+	oldCtx = MemoryContextSwitchTo(buildstate->graphCtx);
+
+	/* Create and train codebook in the persistent context */
+	buildstate->rqCodebook = RQCreateCodebook(dim, RQ_NUM_STAGES, RQ_NUM_CENTROIDS);
+	RQTrainCodebook(buildstate->rqCodebook, buildstate->rqTrainVectors,
+					buildstate->rqTrainCount);
+
+	MemoryContextSwitchTo(oldCtx);
+
+	ereport(DEBUG1, (errmsg("RQ: codebook training complete")));
+
+	/* Free training vectors */
+	pfree(buildstate->rqTrainVectors);
+	buildstate->rqTrainVectors = NULL;
+}
+
+/*
+ * Compute RQ code for a vector
+ */
+static void
+ComputeRQCode(HnswBuildState *buildstate, Datum value, RQCode *code)
+{
+	float	   *floatVec;
+	int			dim = buildstate->dimensions;
+	Size		allocSize;
+
+	if (buildstate->rqCodebook == NULL)
+	{
+		/* No RQ, zero out the code */
+		memset(code, 0, sizeof(RQCode));
+		return;
+	}
+
+	/* Validate dimensions before allocation */
+	if (dim <= 0 || dim > RQ_MAX_DIM)
+	{
+		ereport(WARNING, (errmsg("RQ: invalid dimension %d, skipping encoding", dim)));
+		memset(code, 0, sizeof(RQCode));
+		return;
+	}
+
+	/* Also validate codebook dimension */
+	if (buildstate->rqCodebook->dim != dim)
+	{
+		ereport(WARNING, (errmsg("RQ: codebook dim %d != buildstate dim %d",
+								buildstate->rqCodebook->dim, dim)));
+		memset(code, 0, sizeof(RQCode));
+		return;
+	}
+
+	allocSize = (Size)dim * sizeof(float);
+	floatVec = palloc(allocSize);
+	VectorToFloatArray(value, dim, floatVec);
+	RQEncode(buildstate->rqCodebook, floatVec, code);
+	pfree(floatVec);
+}
+
+/*
+ * Store RQ codebook to index pages
+ * Returns the first block number of the codebook chain
+ */
+static BlockNumber
+StoreRQCodebook(Relation index, ForkNumber forkNum, RQCodebook *codebook)
+{
+	Size		totalSize;
+	Size		pageDataSize;
+	char	   *data;
+	char	   *ptr;
+	BlockNumber firstBlkno = InvalidBlockNumber;
+	Buffer		buf;
+	Buffer		prevBuf = InvalidBuffer;
+	Page		page;
+	Size		remaining;
+
+	if (codebook == NULL)
+		return InvalidBlockNumber;
+
+	/* Serialize codebook */
+	totalSize = RQCodebookSize(codebook);
+	data = palloc(totalSize);
+	RQSerializeCodebook(codebook, data);
+
+	/* Calculate usable space per page (leave room for page header and opaque) */
+	pageDataSize = BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(HnswPageOpaqueData)) - sizeof(Size);
+
+	/* Write codebook data across multiple pages */
+	ptr = data;
+	remaining = totalSize;
+
+	while (remaining > 0)
+	{
+		Size		writeSize = Min(remaining, pageDataSize);
+		char	   *pageData;
+		BlockNumber currentBlkno;
+
+		buf = HnswNewBuffer(index, forkNum);
+		page = BufferGetPage(buf);
+		HnswInitPage(buf, page);
+		currentBlkno = BufferGetBlockNumber(buf);
+
+		if (firstBlkno == InvalidBlockNumber)
+			firstBlkno = currentBlkno;
+
+		/* Link previous page to this one */
+		if (BufferIsValid(prevBuf))
+		{
+			Page		prevPage = BufferGetPage(prevBuf);
+			HnswPageOpaque prevOpaque = HnswPageGetOpaque(prevPage);
+
+			prevOpaque->nextblkno = currentBlkno;
+			MarkBufferDirty(prevBuf);
+			UnlockReleaseBuffer(prevBuf);
+		}
+
+		/* Store size at the beginning of data area */
+		pageData = (char *) page + MAXALIGN(SizeOfPageHeaderData);
+		*((Size *) pageData) = writeSize;
+		pageData += sizeof(Size);
+
+		/* Copy codebook data */
+		memcpy(pageData, ptr, writeSize);
+
+		((PageHeader) page)->pd_lower = pageData + writeSize - (char *) page;
+
+		MarkBufferDirty(buf);
+
+		/* Keep this buffer for linking to next page */
+		prevBuf = buf;
+
+		ptr += writeSize;
+		remaining -= writeSize;
+	}
+
+	/* Release the last buffer */
+	if (BufferIsValid(prevBuf))
+		UnlockReleaseBuffer(prevBuf);
+
+	pfree(data);
+
+	ereport(DEBUG1, (errmsg("RQ: stored codebook (%zu bytes) starting at block %u",
+							totalSize, firstBlkno)));
+
+	return firstBlkno;
+}
+
+/*
  * Create the metapage
+ *
+ * IMPORTANT: Metapage MUST be at block 0 (HNSW_METAPAGE_BLKNO).
+ * We first create the metapage, then store the RQ codebook at subsequent blocks,
+ * then update the metapage with the codebook location.
  */
 static void
 CreateMetaPage(HnswBuildState * buildstate)
@@ -84,12 +351,17 @@ CreateMetaPage(HnswBuildState * buildstate)
 	Buffer		buf;
 	Page		page;
 	HnswMetaPage metap;
+	BlockNumber rqCodebookBlkno = InvalidBlockNumber;
 
+	/* First create the metapage at block 0 */
 	buf = HnswNewBuffer(index, forkNum);
 	page = BufferGetPage(buf);
 	HnswInitPage(buf, page);
 
-	/* Set metapage data */
+	/* Verify this is block 0 */
+	Assert(BufferGetBlockNumber(buf) == HNSW_METAPAGE_BLKNO);
+
+	/* Set metapage data (initially without RQ info) */
 	metap = HnswPageGetMeta(page);
 	metap->magicNumber = HNSW_MAGIC_NUMBER;
 	metap->version = HNSW_VERSION;
@@ -100,11 +372,34 @@ CreateMetaPage(HnswBuildState * buildstate)
 	metap->entryOffno = InvalidOffsetNumber;
 	metap->entryLevel = -1;
 	metap->insertPage = InvalidBlockNumber;
+	metap->rqNumStages = 0;
+	metap->rqNumCentroids = 0;
+	metap->rqCodebookBlkno = InvalidBlockNumber;
+
 	((PageHeader) page)->pd_lower =
 		((char *) metap + sizeof(HnswMetaPageData)) - (char *) page;
 
 	MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
+
+	/* Now store RQ codebook at subsequent blocks (after metapage) */
+	if (buildstate->rqCodebook != NULL)
+	{
+		rqCodebookBlkno = StoreRQCodebook(index, forkNum, buildstate->rqCodebook);
+
+		/* Update metapage with RQ codebook info */
+		buf = ReadBufferExtended(index, forkNum, HNSW_METAPAGE_BLKNO, RBM_NORMAL, NULL);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+		metap = HnswPageGetMeta(page);
+
+		metap->rqNumStages = buildstate->rqCodebook->numStages;
+		metap->rqNumCentroids = buildstate->rqCodebook->numCentroids;
+		metap->rqCodebookBlkno = rqCodebookBlkno;
+
+		MarkBufferDirty(buf);
+		UnlockReleaseBuffer(buf);
+	}
 }
 
 /*
@@ -150,8 +445,8 @@ CreateGraphPages(HnswBuildState * buildstate)
 	HnswElement entryPoint;
 	Buffer		buf;
 	Page		page;
-	HnswElementPtr iter = buildstate->graph->head;
 	char	   *base = buildstate->hnswarea;
+	int			shard;
 
 	/* Calculate sizes */
 	maxSize = HNSW_MAX_SIZE;
@@ -165,64 +460,70 @@ CreateGraphPages(HnswBuildState * buildstate)
 	page = BufferGetPage(buf);
 	HnswInitPage(buf, page);
 
-	while (!HnswPtrIsNull(base, iter))
+	/* Iterate through all shards */
+	for (shard = 0; shard < HNSW_NUM_LIST_SHARDS; shard++)
 	{
-		HnswElement element = HnswPtrAccess(base, iter);
-		Size		etupSize;
-		Size		ntupSize;
-		Size		combinedSize;
-		Pointer		valuePtr = HnswPtrAccess(base, element->value);
+		HnswElementPtr iter = buildstate->graph->heads[shard];
 
-		/* Update iterator */
-		iter = element->next;
-
-		/* Zero memory for each element */
-		MemSet(etup, 0, HNSW_TUPLE_ALLOC_SIZE);
-
-		/* Calculate sizes */
-		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
-		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
-		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
-
-		/* Initial size check */
-		if (etupSize > HNSW_TUPLE_ALLOC_SIZE)
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("index tuple too large")));
-
-		HnswSetElementTuple(base, etup, element);
-
-		/* Keep element and neighbors on the same page if possible */
-		if (PageGetFreeSpace(page) < etupSize || (combinedSize <= maxSize && PageGetFreeSpace(page) < combinedSize))
-			HnswBuildAppendPage(index, &buf, &page, forkNum);
-
-		/* Calculate offsets */
-		element->blkno = BufferGetBlockNumber(buf);
-		element->offno = OffsetNumberNext(PageGetMaxOffsetNumber(page));
-		if (combinedSize <= maxSize)
+		while (!HnswPtrIsNull(base, iter))
 		{
-			element->neighborPage = element->blkno;
-			element->neighborOffno = OffsetNumberNext(element->offno);
+			HnswElement element = HnswPtrAccess(base, iter);
+			Size		etupSize;
+			Size		ntupSize;
+			Size		combinedSize;
+			Pointer		valuePtr = HnswPtrAccess(base, element->value);
+
+			/* Update iterator */
+			iter = element->next;
+
+			/* Zero memory for each element */
+			MemSet(etup, 0, HNSW_TUPLE_ALLOC_SIZE);
+
+			/* Calculate sizes */
+			etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
+			ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
+			combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
+
+			/* Initial size check */
+			if (etupSize > HNSW_TUPLE_ALLOC_SIZE)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("index tuple too large")));
+
+			HnswSetElementTuple(base, etup, element);
+
+			/* Keep element and neighbors on the same page if possible */
+			if (PageGetFreeSpace(page) < etupSize || (combinedSize <= maxSize && PageGetFreeSpace(page) < combinedSize))
+				HnswBuildAppendPage(index, &buf, &page, forkNum);
+
+			/* Calculate offsets */
+			element->blkno = BufferGetBlockNumber(buf);
+			element->offno = OffsetNumberNext(PageGetMaxOffsetNumber(page));
+			if (combinedSize <= maxSize)
+			{
+				element->neighborPage = element->blkno;
+				element->neighborOffno = OffsetNumberNext(element->offno);
+			}
+			else
+			{
+				element->neighborPage = element->blkno + 1;
+				element->neighborOffno = FirstOffsetNumber;
+			}
+
+			ItemPointerSet(&etup->neighbortid, element->neighborPage, element->neighborOffno);
+
+			/* Add element */
+			if (PageAddItem(page, (Item) etup, etupSize, InvalidOffsetNumber, false, false) != element->offno)
+				elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+
+			/* Add new page if needed */
+			if (PageGetFreeSpace(page) < ntupSize)
+				HnswBuildAppendPage(index, &buf, &page, forkNum);
+
+			/* Add placeholder for neighbors */
+			if (PageAddItem(page, (Item) ntup, ntupSize, InvalidOffsetNumber, false, false) != element->neighborOffno)
+				elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
 		}
-		else
-		{
-			element->neighborPage = element->blkno + 1;
-			element->neighborOffno = FirstOffsetNumber;
-		}
-
-		ItemPointerSet(&etup->neighbortid, element->neighborPage, element->neighborOffno);
-
-		/* Add element */
-		if (PageAddItem(page, (Item) etup, etupSize, InvalidOffsetNumber, false, false) != element->offno)
-			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
-
-		/* Add new page if needed */
-		if (PageGetFreeSpace(page) < ntupSize)
-			HnswBuildAppendPage(index, &buf, &page, forkNum);
-
-		/* Add placeholder for neighbors */
-		if (PageAddItem(page, (Item) ntup, ntupSize, InvalidOffsetNumber, false, false) != element->neighborOffno)
-			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
 	}
 
 	insertPage = BufferGetBlockNumber(buf);
@@ -247,42 +548,48 @@ WriteNeighborTuples(HnswBuildState * buildstate)
 	Relation	index = buildstate->index;
 	ForkNumber	forkNum = buildstate->forkNum;
 	int			m = buildstate->m;
-	HnswElementPtr iter = buildstate->graph->head;
 	char	   *base = buildstate->hnswarea;
 	HnswNeighborTuple ntup;
+	int			shard;
 
 	/* Allocate once */
 	ntup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
 
-	while (!HnswPtrIsNull(base, iter))
+	/* Iterate through all shards */
+	for (shard = 0; shard < HNSW_NUM_LIST_SHARDS; shard++)
 	{
-		HnswElement element = HnswPtrAccess(base, iter);
-		Buffer		buf;
-		Page		page;
-		Size		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, m);
+		HnswElementPtr iter = buildstate->graph->heads[shard];
 
-		/* Update iterator */
-		iter = element->next;
+		while (!HnswPtrIsNull(base, iter))
+		{
+			HnswElement element = HnswPtrAccess(base, iter);
+			Buffer		buf;
+			Page		page;
+			Size		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, m);
 
-		/* Zero memory for each element */
-		MemSet(ntup, 0, HNSW_TUPLE_ALLOC_SIZE);
+			/* Update iterator */
+			iter = element->next;
 
-		/* Can take a while, so ensure we can interrupt */
-		/* Needs to be called when no buffer locks are held */
-		CHECK_FOR_INTERRUPTS();
+			/* Zero memory for each element */
+			MemSet(ntup, 0, HNSW_TUPLE_ALLOC_SIZE);
 
-		buf = ReadBufferExtended(index, forkNum, element->neighborPage, RBM_NORMAL, NULL);
-		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-		page = BufferGetPage(buf);
+			/* Can take a while, so ensure we can interrupt */
+			/* Needs to be called when no buffer locks are held */
+			CHECK_FOR_INTERRUPTS();
 
-		HnswSetNeighborTuple(base, ntup, element, m);
+			buf = ReadBufferExtended(index, forkNum, element->neighborPage, RBM_NORMAL, NULL);
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			page = BufferGetPage(buf);
 
-		if (!PageIndexTupleOverwrite(page, element->neighborOffno, (Item) ntup, ntupSize))
-			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+			HnswSetNeighborTuple(base, ntup, element, m);
 
-		/* Commit */
-		MarkBufferDirty(buf);
-		UnlockReleaseBuffer(buf);
+			if (!PageIndexTupleOverwrite(page, element->neighborOffno, (Item) ntup, ntupSize))
+				elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+
+			/* Commit */
+			MarkBufferDirty(buf);
+			UnlockReleaseBuffer(buf);
+		}
 	}
 
 	pfree(ntup);
@@ -297,6 +604,10 @@ FlushPages(HnswBuildState * buildstate)
 #ifdef HNSW_MEMORY
 	elog(INFO, "memory: %zu MB", buildstate->graph->memoryUsed / (1024 * 1024));
 #endif
+
+	/* Train RQ codebook if we have enough samples but haven't trained yet */
+	if (buildstate->rqCodebook == NULL && buildstate->rqTrainCount > 0)
+		TrainRQCodebook(buildstate);
 
 	CreateMetaPage(buildstate);
 	CreateGraphPages(buildstate);
@@ -355,15 +666,18 @@ FindDuplicateInMemory(char *base, HnswElement element)
 }
 
 /*
- * Add to element list
+ * Add to element list (sharded)
  */
 static void
 AddElementInMemory(char *base, HnswGraph * graph, HnswElement element)
 {
-	SpinLockAcquire(&graph->lock);
-	element->next = graph->head;
-	HnswPtrStore(base, graph->head, element);
-	SpinLockRelease(&graph->lock);
+	/* Use element hash to select shard for even distribution */
+	int			shard = element->hash % HNSW_NUM_LIST_SHARDS;
+
+	SpinLockAcquire(&graph->locks[shard]);
+	element->next = graph->heads[shard];
+	HnswPtrStore(base, graph->heads[shard], element);
+	SpinLockRelease(&graph->locks[shard]);
 }
 
 /*
@@ -490,6 +804,12 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	if (!HnswFormIndexValue(&value, values, isnull, buildstate->typeInfo, support))
 		return false;
 
+	/* Collect training vector for RQ if still collecting */
+	if (CollectRQTrainingVector(buildstate, value))
+	{
+		TrainRQCodebook(buildstate);
+	}
+
 	/* Get datum size */
 	valueSize = VARSIZE_ANY(DatumGetPointer(value));
 
@@ -551,6 +871,9 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	memcpy(valuePtr, DatumGetPointer(value), valueSize);
 	HnswPtrStore(base, element->value, valuePtr);
 
+	/* Compute RQ code for this element */
+	ComputeRQCode(buildstate, value, &element->rqCode);
+
 	/* Create a lock for the element */
 	LWLockInitialize(&element->lock, hnsw_lock_tranche_id);
 
@@ -585,9 +908,9 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
 	if (InsertTuple(index, values, isnull, tid, buildstate))
 	{
 		/* Update progress */
-		SpinLockAcquire(&graph->lock);
+		SpinLockAcquire(&graph->countLock);
 		pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE, ++graph->indtuples);
-		SpinLockRelease(&graph->lock);
+		SpinLockRelease(&graph->countLock);
 	}
 
 	/* Reset memory context */
@@ -604,13 +927,19 @@ InitGraph(HnswGraph * graph, char *base, Size memoryTotal)
 	/* Initialize the lock tranche if needed */
 	HnswInitLockTranche();
 
-	HnswPtrStore(base, graph->head, (HnswElement) NULL);
+	/* Initialize sharded element lists */
+	for (int i = 0; i < HNSW_NUM_LIST_SHARDS; i++)
+	{
+		HnswPtrStore(base, graph->heads[i], (HnswElement) NULL);
+		SpinLockInit(&graph->locks[i]);
+	}
+
 	HnswPtrStore(base, graph->entryPoint, (HnswElement) NULL);
 	graph->memoryUsed = 0;
 	graph->memoryTotal = memoryTotal;
 	graph->flushed = false;
 	graph->indtuples = 0;
-	SpinLockInit(&graph->lock);
+	SpinLockInit(&graph->countLock);
 	LWLockInitialize(&graph->entryLock, hnsw_lock_tranche_id);
 	LWLockInitialize(&graph->entryWaitLock, hnsw_lock_tranche_id);
 	LWLockInitialize(&graph->allocatorLock, hnsw_lock_tranche_id);
@@ -718,6 +1047,19 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	buildstate->hnswleader = NULL;
 	buildstate->hnswshared = NULL;
 	buildstate->hnswarea = NULL;
+
+	/* Initialize RQ training state */
+	buildstate->rqCodebook = NULL;
+	buildstate->rqTrainMax = RQ_SAMPLE_SIZE;
+	buildstate->rqTrainCount = 0;
+	buildstate->rqTrainVectors = NULL;
+
+	/* Allocate training buffer if dimensions are known */
+	if (buildstate->dimensions > 0 && buildstate->dimensions <= RQ_MAX_DIM)
+	{
+		buildstate->rqTrainVectors = palloc((Size) buildstate->rqTrainMax *
+											buildstate->dimensions * sizeof(float));
+	}
 }
 
 /*
