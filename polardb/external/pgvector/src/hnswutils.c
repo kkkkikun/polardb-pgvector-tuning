@@ -790,27 +790,19 @@ CompareFurthestCandidates(const pairingheap_node *a, const pairingheap_node *b, 
 /*
  * Init visited
  *
- * Use larger initial size to reduce hash table resizing.
- * For index building (inMemory=true): use fixed 32768 to avoid resizing
- *   during large-scale builds. Threshold ~29491 nodes per search.
- * For queries (inMemory=false): use 4x multiplier which is sufficient.
- *   ef=40, m=16 -> 2560 -> 4096 (threshold ~3686)
+ * Use slightly larger initial size to reduce hash table resizing,
+ * but not too large to avoid initialization overhead.
+ * Hash table resize is triggered at 90% fill factor.
  */
 static inline void
 InitVisited(char *base, visited_hash * v, bool inMemory, int ef, int m)
 {
-	uint32 initial_size;
-
-	if (inMemory)
-	{
-		/* Fixed large size for building to minimize/eliminate resizing */
-		initial_size = 32768;  /* Can hold ~29491 nodes before resize */
-	}
-	else
-	{
-		/* Dynamic size for queries based on ef_search */
-		initial_size = ef * m * 4;
-	}
+	/*
+	 * Use ef * m * 2 as baseline (original pgvector default).
+	 * This balances initialization cost vs resize cost.
+	 * For ef=60, m=12: 1440 initial, threshold ~1296 before resize.
+	 */
+	uint32 initial_size = ef * m * 8;
 
 	if (!inMemory)
 		v->tids = tidhash_create(CurrentMemoryContext, initial_size, NULL);
