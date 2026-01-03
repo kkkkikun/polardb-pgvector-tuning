@@ -1227,7 +1227,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 				 * 阈值 = dim * BQ_THRESHOLD_RATIO（可调参数）
 				 */
 #define BQ_THRESHOLD_RATIO 0.30  /* 经验值，可根据测试结果调整 */
-#define BQ_COARSE_FILTER_ENABLED 1  /* 0=禁用BQ粗筛, 1=启用 */
+#define BQ_COARSE_FILTER_ENABLED 0  /* 0=禁用BQ粗筛, 1=启用 */
 
 				if (BQ_COARSE_FILTER_ENABLED && !alwaysAdd && elemVec->unused == HYBRID_TAG) {
 					Vector *queryVec = (Vector *) PG_DETOAST_DATUM_PACKED(q->value);
@@ -1775,7 +1775,7 @@ HnswGetTypeInfo(Relation index)
 
 	if (procinfo == NULL)
 	{
-		/* 默认 vector 类型：使用混合量化 */
+		/* 默认 vector 类型：使用 SQ8 量化 */
 		static const HnswTypeInfo typeInfo = {
 			.maxDimensions = HNSW_MAX_DIM,
 			.normalize = l2_normalize,
@@ -1793,7 +1793,7 @@ FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_halfvec_support);
 Datum
 hnsw_halfvec_support(PG_FUNCTION_ARGS)
 {
-	/* halfvec_l2_ops 默认使用混合量化 (BQ+SQ8) */
+	/* halfvec_l2_ops 使用 HYBRID 量化 (BQ+SQ8) */
 	static const HnswTypeInfo typeInfo = {
 		.maxDimensions = HNSW_MAX_DIM * 2,
 		.normalize = halfvec_l2_normalize,
