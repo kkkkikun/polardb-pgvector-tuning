@@ -102,43 +102,43 @@ GetScanValue(IndexScanDesc scan)
 		if (!so->support.allowQuantization)
 			return value;
 
-		/* === 比赛专用 Hack：查询量化 === */
+		/* === 比赛专用 Hack：混合量化查询 (BQ + SQ8) === */
 		/* 只对L2距离的vector和halfvec类型进行量化 */
 
 		/* 【关键修复】先检测格式，再解包，避免halfvec误入vector分支 */
 		HnswValueFormat fmt = HnswDetectFormat(value);
 
 		if (fmt == HNSW_FMT_RAW_HALFVEC) {
-			/* 处理halfvec类型的量化 - 使用熔断优化 */
+			/* 处理halfvec类型的混合量化 */
 			HalfVector *halfvec = DatumGetHalfVector(value);
 			int			dim = halfvec->dim;
+			int			bq_bytes = (dim + 7) / 8;
 
-			/* 直接分配结果 Vector (SQ8 大小) */
-			Size payload_size = sizeof(float)*2 + dim;
+			/* 混合格式大小: bq_bytes(2) + bq_data + scale(4) + bias(4) + sq8_codes(dim) */
+			Size payload_size = sizeof(uint16_t) + bq_bytes + sizeof(float)*2 + dim;
 			Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
 
-			/* 使用熔断优化函数：直接 Half -> SQ8 */
-			HnswQuantizeHalfVector(halfvec, quantized_query);
+			/* 使用混合量化函数 */
+			HnswQuantizeHybrid(halfvec, quantized_query);
 
 			value = PointerGetDatum(quantized_query);
 
 		} else if (fmt == HNSW_FMT_RAW_FLOAT_VEC) {
-			/* 处理vector类型的量化 */
+			/* 处理vector类型的混合量化 */
 			Vector	   *query_vec = DatumGetVector(value);
 			int			dim = query_vec->dim;
+			int			bq_bytes = (dim + 7) / 8;
 
-			Size		payload_size = sizeof(float)*2 + dim; /* scale + bias + data */
-
-			/* 创建新的Vector用于存储量化后的查询向量 */
+			Size		payload_size = sizeof(uint16_t) + bq_bytes + sizeof(float)*2 + dim;
 			Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
 
-			/* 使用相同的量化函数进行序列化 */
-			QuantizeAndSerialize(query_vec, quantized_query);
+			/* 执行混合量化 */
+			HnswQuantizeHybridFromFloat(query_vec, quantized_query);
 			value = PointerGetDatum(quantized_query);
 
-		} else if (fmt == HNSW_FMT_SQ8) {
-			/* 已经是SQ8格式，无需重复量化 */
-			elog(DEBUG1, "Query vector is already SQ8 quantized, skipping quantization");
+		} else if (fmt == HNSW_FMT_SQ8 || fmt == HNSW_FMT_HYBRID) {
+			/* 已经是量化格式，无需重复量化 */
+			elog(DEBUG1, "Query vector is already quantized, skipping quantization");
 
 		} else {
 			/* 未知格式(bit, sparsevec等)：不量化，直接使用原值 */

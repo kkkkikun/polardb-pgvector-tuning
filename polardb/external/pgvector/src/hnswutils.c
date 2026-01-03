@@ -461,41 +461,43 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 		return true;
 	}
 
-	/* === 比赛专用 Hack：量化存储 === */
+	/* === 比赛专用 Hack：混合量化存储 (BQ + SQ8) === */
 	/* 只对L2距离的vector和halfvec类型进行量化 */
 
 	/* 【关键修复】先检测格式，再解包，避免halfvec误入vector分支 */
 	HnswValueFormat fmt = HnswDetectFormat(value);
 
 	if (fmt == HNSW_FMT_RAW_HALFVEC) {
-		/* 处理halfvec类型的量化 - 使用熔断优化 */
+		/* 处理halfvec类型的混合量化 */
 		HalfVector *halfvec = DatumGetHalfVector(value);
 		int			dim = halfvec->dim;
+		int			bq_bytes = (dim + 7) / 8;
 
-		/* 直接分配结果 Vector (SQ8 大小) */
-		Size payload_size = sizeof(float)*2 + dim;
+		/* 混合格式大小: bq_bytes(2) + bq_data + scale(4) + bias(4) + sq8_codes(dim) */
+		Size payload_size = sizeof(uint16_t) + bq_bytes + sizeof(float)*2 + dim;
 		Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
 
-		/* 使用熔断优化函数：直接 Half -> SQ8 */
-		HnswQuantizeHalfVector(halfvec, quantized_vec);
+		/* 使用混合量化函数：同时生成 BQ 和 SQ8 */
+		HnswQuantizeHybrid(halfvec, quantized_vec);
 
 		*out = PointerGetDatum(quantized_vec);
 
 	} else if (fmt == HNSW_FMT_RAW_FLOAT_VEC) {
-		/* 处理vector类型的量化 */
+		/* 处理vector类型的混合量化 */
 		Vector	   *vec = DatumGetVector(value);
 		int			dim = vec->dim;
+		int			bq_bytes = (dim + 7) / 8;
 
-		Size		payload_size = sizeof(float)*2 + dim; /* scale + bias + data */
+		Size		payload_size = sizeof(uint16_t) + bq_bytes + sizeof(float)*2 + dim;
 		Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
 
-		/* 执行量化序列化，严格按照数据流写入 */
-		QuantizeAndSerialize(vec, quantized_vec);
+		/* 执行混合量化 */
+		HnswQuantizeHybridFromFloat(vec, quantized_vec);
 		*out = PointerGetDatum(quantized_vec);
 
-	} else if (fmt == HNSW_FMT_SQ8) {
-		/* 已经是SQ8格式，直接返回（理论上不应该在heap value中出现） */
-		elog(DEBUG1, "Heap value is already SQ8 quantized, using directly");
+	} else if (fmt == HNSW_FMT_SQ8 || fmt == HNSW_FMT_HYBRID) {
+		/* 已经是量化格式，直接返回 */
+		elog(DEBUG1, "Heap value is already quantized, using directly");
 		*out = value;
 
 	} else {
@@ -610,37 +612,75 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 static inline double
 HnswGetDistance(Datum a, Datum b, HnswSupport * support)
 {
-	/* 【优化】使用更快速的SQ8检测 - 直接检查unused字段避免复杂计算 */
+	/* 【优化】使用更快速的格式检测 - 直接检查unused字段 */
 	Vector *va = (Vector *) PG_DETOAST_DATUM_PACKED(a);
 	Vector *vb = (Vector *) PG_DETOAST_DATUM_PACKED(b);
 
-	bool a_sq8 = (va->unused == SQ8_TAG);
-	bool b_sq8 = (vb->unused == SQ8_TAG);
+	uint16 tag_a = va->unused;
+	uint16 tag_b = vb->unused;
 
-	/* 【优化】最常见情况优先：SQ8 vs SQ8（索引内部比较） */
-	if (likely(a_sq8 && b_sq8)) {
-		/* case 1: SQ8 vs SQ8 - 使用零分配优化版本 */
+	/* 【最常见】混合格式 vs 混合格式（索引内部比较） */
+	if (likely(tag_a == HYBRID_TAG && tag_b == HYBRID_TAG)) {
+		/* 使用 SQ8 精确距离（用于候选集排序） */
+		return HnswHybridSQ8Distance(a, b);
+	}
+
+	/* 【次常见】SQ8 vs SQ8（兼容旧索引） */
+	if (tag_a == SQ8_TAG && tag_b == SQ8_TAG) {
 		return HnswSQ8Distance(a, b);
 	}
 
-	/* 【优化】次常见情况：原始 vs 原始（纯原始数据比较） */
-	if (likely(!a_sq8 && !b_sq8)) {
-		/* case 2: 原始 vs 原始 - 使用标准距离函数 */
+	/* 【较少】原始 vs 原始（纯原始数据比较） */
+	if (tag_a != SQ8_TAG && tag_a != HYBRID_TAG &&
+	    tag_b != SQ8_TAG && tag_b != HYBRID_TAG) {
 		return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
 	}
 
-	/* 【较少情况】混合类型：SQ8 vs halfvec（查询时发生） */
-	if (a_sq8) {
-		/* a=SQ8, b=halfvec - 使用零分配混合距离 */
-		Vector *sq8_vec = (Vector *) PG_DETOAST_DATUM_PACKED(a);
+	/* 【较少情况】混合类型 */
+	if (tag_a == SQ8_TAG || tag_a == HYBRID_TAG) {
+		/* a=量化, b=halfvec */
 		HalfVector *half_vec = (HalfVector *) PG_DETOAST_DATUM_PACKED(b);
-		return (double)HnswSQ8HalfvecDistance2(sq8_vec, half_vec);
+		if (tag_a == SQ8_TAG) {
+			return (double)HnswSQ8HalfvecDistance2(va, half_vec);
+		} else {
+			/* HYBRID: 提取SQ8部分计算距离 - 简化处理 */
+			/* TODO: 实现 HnswHybridHalfvecDistance */
+			return (double)HnswSQ8HalfvecDistance2(va, half_vec);
+		}
 	} else {
-		/* b=SQ8, a=halfvec - 使用零分配混合距离 */
-		Vector *sq8_vec = (Vector *) PG_DETOAST_DATUM_PACKED(b);
+		/* b=量化, a=halfvec */
 		HalfVector *half_vec = (HalfVector *) PG_DETOAST_DATUM_PACKED(a);
-		return (double)HnswSQ8HalfvecDistance2(sq8_vec, half_vec);
+		if (tag_b == SQ8_TAG) {
+			return (double)HnswSQ8HalfvecDistance2(vb, half_vec);
+		} else {
+			return (double)HnswSQ8HalfvecDistance2(vb, half_vec);
+		}
 	}
+}
+
+/*
+ * 获取距离（支持粗筛模式）
+ * coarse=true: 使用 BQ Hamming 距离（快速粗筛）
+ * coarse=false: 使用 SQ8 L2 距离（精确排序）
+ */
+static inline double
+HnswGetDistanceCoarse(Datum a, Datum b, HnswSupport * support, bool coarse)
+{
+	if (!coarse) {
+		return HnswGetDistance(a, b, support);
+	}
+
+	/* 粗筛模式：检查是否为混合格式 */
+	Vector *va = (Vector *) PG_DETOAST_DATUM_PACKED(a);
+	Vector *vb = (Vector *) PG_DETOAST_DATUM_PACKED(b);
+
+	if (va->unused == HYBRID_TAG && vb->unused == HYBRID_TAG) {
+		/* 使用 BQ Hamming 距离快速粗筛 */
+		return HnswHybridBQDistance(a, b);
+	}
+
+	/* 非混合格式：回退到精确计算 */
+	return HnswGetDistance(a, b, support);
 }
 
 /*
@@ -1120,7 +1160,35 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			if (inMemory)
 			{
 				eElement = unvisited[i].element;
-				eDistance = GetElementDistance(base, eElement, q, support);
+
+				/* 【BQ+SQ8 混合量化优化】两阶段距离计算 */
+				Datum elemValue = HnswGetValue(base, eElement);
+				Vector *elemVec = (Vector *) PG_DETOAST_DATUM_PACKED(elemValue);
+
+				/* 检查是否为混合格式且不需要强制添加 */
+				if (!alwaysAdd && elemVec->unused == HYBRID_TAG) {
+					Vector *queryVec = (Vector *) PG_DETOAST_DATUM_PACKED(q->value);
+					if (queryVec->unused == HYBRID_TAG) {
+						/* 第一阶段：BQ 粗筛 */
+						double bq_dist = HnswHybridBQDistance(q->value, elemValue);
+
+						/* 阈值策略：固定倍数 K=2 */
+						/* BQ Hamming 距离与 L2 距离非线性相关，使用经验阈值 */
+						if (bq_dist > cached_f_distance * 2.0) {
+							/* 快速拒绝：BQ 距离过大，跳过 */
+							if (discarded != NULL) {
+								/* 仍需计算精确距离用于 discarded 堆 */
+								eDistance = HnswHybridSQ8Distance(q->value, elemValue);
+								e = HnswInitSearchCandidate(base, eElement, eDistance);
+								pairingheap_add(*discarded, &e->w_node);
+							}
+							continue;
+						}
+					}
+				}
+
+				/* 第二阶段：SQ8 精确距离 */
+				eDistance = HnswGetDistance(q->value, elemValue, support);
 			}
 			else
 			{

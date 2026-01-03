@@ -527,12 +527,16 @@ typedef struct HnswSQ8Payload {
 /* SQ8 量化数据的魔数标记，用于可靠识别 */
 #define SQ8_TAG 0x5158  /* 'QX' - 量化标记 */
 
+/* 混合量化标记：BQ + SQ8 */
+#define HYBRID_TAG 0x4859  /* 'HY' - Hybrid BQ+SQ8 */
+
 /* HNSW值格式枚举 */
 typedef enum
 {
 	HNSW_FMT_RAW_FLOAT_VEC,    /* 原始vector：4字节float/元素 */
 	HNSW_FMT_RAW_HALFVEC,      /* 原始halfvec：2字节half/元素 */
 	HNSW_FMT_SQ8,              /* SQ8量化：scale(4) + bias(4) + codes(dim) */
+	HNSW_FMT_HYBRID,           /* 混合量化：bq_bytes(2) + bq_data + scale(4) + bias(4) + sq8_codes */
 	HNSW_FMT_UNKNOWN           /* 未知格式：bit, sparsevec等其他类型 */
 } HnswValueFormat;
 
@@ -582,6 +586,19 @@ HnswDetectFormat(Datum d)
 		} else {
 			elog(WARNING, "SQ8-like payload without proper tag, treating as SQ8 anyway");
 			return HNSW_FMT_SQ8;
+		}
+	}
+
+	/* 混合量化：payload == 2 + bq_bytes + 8 + dim */
+	/* bq_bytes = (dim + 7) / 8 */
+	{
+		int bq_bytes = (dim + 7) / 8;
+		int hybrid_payload = sizeof(uint16_t) + bq_bytes + sizeof(float) * 2 + dim;
+		if (payload == hybrid_payload) {
+			Vector *v = (Vector *)p;
+			if (v->unused == HYBRID_TAG) {
+				return HNSW_FMT_HYBRID;
+			}
 		}
 	}
 
@@ -722,6 +739,129 @@ QuantizeAndSerialize(Vector *src, Vector *dest)
     dest->unused = SQ8_TAG;  /* 添加SQ8识别标记 */
     /* 设置总长度：Scale(4) + Bias(4) + Data(dim) */
     SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) + sizeof(float)*2 + dim);
+}
+
+/*
+ * 混合量化函数：同时生成 BQ 和 SQ8
+ * 内存布局: [bq_bytes:2][bq_data:bq_bytes][scale:4][bias:4][sq8_codes:dim]
+ * 用于两阶段距离计算：BQ粗筛 + SQ8精排
+ */
+static inline void
+HnswQuantizeHybrid(HalfVector *src, Vector *dest)
+{
+    int dim = src->dim;
+    int bq_bytes = (dim + 7) / 8;  /* BQ 字节数，向上取整 */
+    half *hdata = src->x;
+
+    char *buffer = (char *)dest->x;
+
+    /* 写入 BQ 字节数 */
+    uint16_t bq_len = (uint16_t)bq_bytes;
+    memcpy(buffer, &bq_len, sizeof(uint16_t));
+    buffer += sizeof(uint16_t);
+
+    /* BQ 数据区 */
+    uint8_t *bq_ptr = (uint8_t *)buffer;
+    memset(bq_ptr, 0, bq_bytes);
+
+    /* 第一遍：计算 BQ（符号位量化）+ 统计 min/max */
+    float min_v = 1e30f, max_v = -1e30f;
+    for (int i = 0; i < dim; i++) {
+        float val = HalfToFloat4(hdata[i]);
+        /* BQ: val > 0 -> 1, val <= 0 -> 0 */
+        if (val > 0) {
+            bq_ptr[i / 8] |= (1 << (7 - (i % 8)));
+        }
+        if (val < min_v) min_v = val;
+        if (val > max_v) max_v = val;
+    }
+    buffer += bq_bytes;
+
+    /* SQ8 量化参数 */
+    float scale = (max_v == min_v) ? 0.0f : (max_v - min_v) / 255.0f;
+    float bias = min_v;
+
+    memcpy(buffer, &scale, sizeof(float));
+    memcpy(buffer + sizeof(float), &bias, sizeof(float));
+
+    /* SQ8 量化数据 */
+    uint8_t *sq8_ptr = (uint8_t *)(buffer + sizeof(float) * 2);
+
+    if (scale == 0.0f) {
+        memset(sq8_ptr, 0, dim);
+    } else {
+        float inv_scale = 1.0f / scale;
+        for (int i = 0; i < dim; i++) {
+            float val = HalfToFloat4(hdata[i]);
+            int32_t q = (int32_t)((val - bias) * inv_scale + 0.5f);
+            if (q < 0) q = 0; else if (q > 255) q = 255;
+            sq8_ptr[i] = (uint8_t)q;
+        }
+    }
+
+    dest->dim = dim;
+    dest->unused = HYBRID_TAG;
+    /* 总长度: bq_bytes(2) + bq_data + scale(4) + bias(4) + sq8_codes(dim) */
+    SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) +
+                sizeof(uint16_t) + bq_bytes + sizeof(float)*2 + dim);
+}
+
+/* 从 Float Vector 生成混合量化 */
+static inline void
+HnswQuantizeHybridFromFloat(Vector *src, Vector *dest)
+{
+    int dim = src->dim;
+    int bq_bytes = (dim + 7) / 8;
+    float *fdata = src->x;
+
+    char *buffer = (char *)dest->x;
+
+    /* 写入 BQ 字节数 */
+    uint16_t bq_len = (uint16_t)bq_bytes;
+    memcpy(buffer, &bq_len, sizeof(uint16_t));
+    buffer += sizeof(uint16_t);
+
+    /* BQ 数据区 */
+    uint8_t *bq_ptr = (uint8_t *)buffer;
+    memset(bq_ptr, 0, bq_bytes);
+
+    /* 第一遍：计算 BQ + 统计 min/max */
+    float min_v = 1e30f, max_v = -1e30f;
+    for (int i = 0; i < dim; i++) {
+        float val = fdata[i];
+        if (val > 0) {
+            bq_ptr[i / 8] |= (1 << (7 - (i % 8)));
+        }
+        if (val < min_v) min_v = val;
+        if (val > max_v) max_v = val;
+    }
+    buffer += bq_bytes;
+
+    /* SQ8 量化 */
+    float scale = (max_v == min_v) ? 0.0f : (max_v - min_v) / 255.0f;
+    float bias = min_v;
+
+    memcpy(buffer, &scale, sizeof(float));
+    memcpy(buffer + sizeof(float), &bias, sizeof(float));
+
+    uint8_t *sq8_ptr = (uint8_t *)(buffer + sizeof(float) * 2);
+
+    if (scale == 0.0f) {
+        memset(sq8_ptr, 0, dim);
+    } else {
+        float inv_scale = 1.0f / scale;
+        for (int i = 0; i < dim; i++) {
+            float val = fdata[i];
+            int32_t q = (int32_t)((val - bias) * inv_scale + 0.5f);
+            if (q < 0) q = 0; else if (q > 255) q = 255;
+            sq8_ptr[i] = (uint8_t)q;
+        }
+    }
+
+    dest->dim = dim;
+    dest->unused = HYBRID_TAG;
+    SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) +
+                sizeof(uint16_t) + bq_bytes + sizeof(float)*2 + dim);
 }
 
 /*
@@ -1263,6 +1403,162 @@ HnswSQ8Distance(Datum a, Datum b)
 
     /* 直接调用零分配优化版本 */
     return (double)HnswSQ8Distance2_Vector(vec_a, vec_b);
+}
+
+/* ========== 混合量化 (BQ+SQ8) 距离计算函数 ========== */
+
+/*
+ * 【AVX-512优化】BQ Hamming 距离计算
+ * 使用 AVX-512 VPOPCNT 指令实现快速 popcount
+ */
+__attribute__((target("avx512f,avx512vpopcntdq")))
+static inline uint64_t
+HnswBQHammingDistance_AVX512(const uint8_t *a, const uint8_t *b, int bq_bytes)
+{
+    __m512i dist = _mm512_setzero_si512();
+    int i = 0;
+
+    /* 64 字节（512 位）并行处理 */
+    for (; i + 64 <= bq_bytes; i += 64) {
+        __m512i va = _mm512_loadu_si512((const __m512i *)(a + i));
+        __m512i vb = _mm512_loadu_si512((const __m512i *)(b + i));
+        __m512i vxor = _mm512_xor_si512(va, vb);
+        dist = _mm512_add_epi64(dist, _mm512_popcnt_epi64(vxor));
+    }
+
+    uint64_t distance = _mm512_reduce_add_epi64(dist);
+
+    /* 处理尾部（标量） */
+    for (; i < bq_bytes; i++) {
+        distance += __builtin_popcount(a[i] ^ b[i]);
+    }
+
+    return distance;
+}
+
+/* 标量版本 BQ Hamming 距离（fallback） */
+static inline uint64_t
+HnswBQHammingDistance_Scalar(const uint8_t *a, const uint8_t *b, int bq_bytes)
+{
+    uint64_t distance = 0;
+    int i = 0;
+
+    /* 8 字节并行处理 */
+    for (; i + 8 <= bq_bytes; i += 8) {
+        uint64_t va, vb;
+        memcpy(&va, a + i, 8);
+        memcpy(&vb, b + i, 8);
+        distance += __builtin_popcountll(va ^ vb);
+    }
+
+    /* 处理尾部 */
+    for (; i < bq_bytes; i++) {
+        distance += __builtin_popcount(a[i] ^ b[i]);
+    }
+
+    return distance;
+}
+
+/* BQ Hamming 距离主入口 */
+static inline uint64_t
+HnswBQHammingDistance(const uint8_t *a, const uint8_t *b, int bq_bytes)
+{
+#if HNSW_SQ8_FORCE_AVX512
+    return HnswBQHammingDistance_AVX512(a, b, bq_bytes);
+#else
+    if (__builtin_expect(HnswAvx512EnabledCached(), 1))
+        return HnswBQHammingDistance_AVX512(a, b, bq_bytes);
+    else
+        return HnswBQHammingDistance_Scalar(a, b, bq_bytes);
+#endif
+}
+
+/*
+ * 从混合量化数据提取 BQ 部分并计算 Hamming 距离
+ * 用于粗筛阶段
+ */
+static inline double
+HnswHybridBQDistance(Datum a, Datum b)
+{
+    Vector *va = (Vector *)PG_DETOAST_DATUM_PACKED(a);
+    Vector *vb = (Vector *)PG_DETOAST_DATUM_PACKED(b);
+
+    Assert(va->unused == HYBRID_TAG && vb->unused == HYBRID_TAG);
+    Assert(va->dim == vb->dim);
+
+    char *bufa = (char *)va->x;
+    char *bufb = (char *)vb->x;
+
+    uint16_t bq_bytes_a, bq_bytes_b;
+    memcpy(&bq_bytes_a, bufa, sizeof(uint16_t));
+    memcpy(&bq_bytes_b, bufb, sizeof(uint16_t));
+
+    Assert(bq_bytes_a == bq_bytes_b);
+
+    const uint8_t *bq_a = (const uint8_t *)(bufa + sizeof(uint16_t));
+    const uint8_t *bq_b = (const uint8_t *)(bufb + sizeof(uint16_t));
+
+    return (double)HnswBQHammingDistance(bq_a, bq_b, bq_bytes_a);
+}
+
+/*
+ * 从混合量化数据提取 SQ8 部分并计算 L2 距离
+ * 用于精排阶段
+ */
+static inline double
+HnswHybridSQ8Distance(Datum a, Datum b)
+{
+    Vector *va = (Vector *)PG_DETOAST_DATUM_PACKED(a);
+    Vector *vb = (Vector *)PG_DETOAST_DATUM_PACKED(b);
+
+    Assert(va->unused == HYBRID_TAG && vb->unused == HYBRID_TAG);
+    Assert(va->dim == vb->dim);
+
+    int dim = va->dim;
+    int bq_bytes = (dim + 7) / 8;
+
+    char *bufa = (char *)va->x;
+    char *bufb = (char *)vb->x;
+
+    /* 跳过 bq_bytes(2) 和 bq_data，定位到 SQ8 数据 */
+    char *sq8_a = bufa + sizeof(uint16_t) + bq_bytes;
+    char *sq8_b = bufb + sizeof(uint16_t) + bq_bytes;
+
+    /* 提取 SQ8 参数 */
+    float sa, ba, sb, bb;
+    memcpy(&sa, sq8_a, sizeof(float));
+    memcpy(&ba, sq8_a + sizeof(float), sizeof(float));
+    memcpy(&sb, sq8_b, sizeof(float));
+    memcpy(&bb, sq8_b + sizeof(float), sizeof(float));
+
+    const uint8_t *qa = (const uint8_t *)(sq8_a + sizeof(float) * 2);
+    const uint8_t *qb = (const uint8_t *)(sq8_b + sizeof(float) * 2);
+
+    /* 计算 L2 距离 */
+    double sum = 0.0;
+    for (int i = 0; i < dim; i++) {
+        float val_a = (float)qa[i] * sa + ba;
+        float val_b = (float)qb[i] * sb + bb;
+        float diff = val_a - val_b;
+        sum += (double)diff * (double)diff;
+    }
+
+    return sum;
+}
+
+/*
+ * 混合距离计算主入口
+ * coarse=true: 返回 BQ Hamming 距离（用于粗筛）
+ * coarse=false: 返回 SQ8 L2 距离（用于精排）
+ */
+static inline double
+HnswHybridDistance(Datum a, Datum b, bool coarse)
+{
+    if (coarse) {
+        return HnswHybridBQDistance(a, b);
+    } else {
+        return HnswHybridSQ8Distance(a, b);
+    }
 }
 
 #endif
