@@ -95,40 +95,42 @@ QueryDatumToFloat(Datum value, int dimensions)
  * Note: RQ distance table is created but NOT yet used in search path.
  * This is infrastructure for future optimization.
  */
+
+/*
+ * Initialize RaBitQ query state for early filtering
+ */
 static void
-InitRQForQuery(HnswScanOpaque so, Relation index, Datum value)
+InitRaBitQForQuery(HnswScanOpaque so, Relation index, Datum value)
 {
-	float	   *queryFloat;
+	Vector	   *vec;
+	MemoryContext oldCtx;
 
 	/* Already initialized */
-	if (so->rqDistTable != NULL)
+	if (so->rabitqQueryState != NULL)
 		return;
 
-	/* Load codebook if not loaded */
-	if (so->rqCodebook == NULL)
+	/* Load encoder if not loaded */
+	if (so->rabitqEncoder == NULL)
 	{
-		so->rqCodebook = HnswLoadRQCodebook(index);
-
-		if (so->rqCodebook == NULL)
-			return;				/* No RQ support for this index */
+		so->rabitqEncoder = HnswLoadRaBitQEncoder(index);
+		if (so->rabitqEncoder == NULL)
+		{
+			so->useRaBitQ = false;
+			return;
+		}
+		so->useRaBitQ = true;
 	}
 
-	/* Convert query to float using known dimension from codebook */
-	queryFloat = QueryDatumToFloat(value, so->rqCodebook->dim);
+	/* Prepare SQ4 query state */
+	oldCtx = MemoryContextSwitchTo(so->tmpCtx);
 
-	if (queryFloat == NULL)
-	{
-		ereport(DEBUG1, (errmsg("RQ: could not convert query to float")));
-		return;
-	}
+	vec = DatumGetVector(value);
+	so->rabitqQueryState = palloc(sizeof(RaBitQQueryStateSQ4));
+	RaBitQPrepareSQ4Query(so->rabitqEncoder, vec->x, so->rabitqQueryState);
 
-	/* Create distance table (allocated in current memory context) */
-	so->rqDistTable = RQCreateDistTable(so->rqCodebook, queryFloat);
+	MemoryContextSwitchTo(oldCtx);
 
-	/* Free query float - allocated in same context */
-	pfree(queryFloat);
-
-	ereport(DEBUG1, (errmsg("RQ: initialized distance table for query")));
+	elog(DEBUG1, "RaBitQ: prepared SQ4 query state");
 }
 
 /*
@@ -153,8 +155,8 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	q->value = value;
 	so->m = m;
 
-	/* Initialize RQ distance table for this query */
-	InitRQForQuery(so, index, value);
+	/* Initialize RaBitQ query state for this query */
+	InitRaBitQForQuery(so, index, value);
 
 	if (entryPoint == NULL)
 		return NIL;
@@ -164,12 +166,12 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	for (int lc = entryPoint->level; lc >= 1; lc--)
 	{
 		/* Upper layers: no RQ filtering, just find entry to ground layer */
-		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL, NULL);
+		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL, NULL, NULL);
 		ep = w;
 	}
 
-	/* Ground layer: use RQ distance table for early filtering if available */
-	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, so->rqDistTable);
+	/* Ground layer: use RaBitQ for early filtering if available */
+	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, NULL, so->rabitqQueryState);
 }
 
 /*
@@ -200,8 +202,8 @@ ResumeScanItems(IndexScanDesc scan)
 		ep = lappend(ep, sc);
 	}
 
-	/* Use RQ distance table for early filtering if available */
-	return HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples, so->rqDistTable);
+	/* Use RaBitQ for early filtering if available */
+	return HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples, NULL, so->rabitqQueryState);
 }
 
 /*
@@ -260,9 +262,10 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 	/* Set support functions */
 	HnswInitSupport(&so->support, index);
 
-	/* Initialize RQ support (will be loaded on first query) */
-	so->rqCodebook = NULL;
-	so->rqDistTable = NULL;
+	/* Initialize RaBitQ support (will be loaded on first query) */
+	so->rabitqEncoder = NULL;
+	so->rabitqQueryState = NULL;
+	so->useRaBitQ = false;
 
 	/*
 	 * Use a lower max allocation size than default to allow scanning more
@@ -298,12 +301,12 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->previousDistance = -get_float8_infinity();
 
 	/*
-	 * RQ structures are allocated in tmpCtx, so they will be freed
+	 * RaBitQ structures are allocated in tmpCtx, so they will be freed
 	 * by MemoryContextReset. Just set pointers to NULL.
-	 * The codebook will be reloaded from index on next query.
+	 * The encoder will be reloaded from index on next query.
 	 */
-	so->rqDistTable = NULL;
-	so->rqCodebook = NULL;
+	so->rabitqQueryState = NULL;
+	/* rabitqEncoder is allocated in persistent context, not reset here */
 
 	MemoryContextReset(so->tmpCtx);
 
@@ -470,9 +473,16 @@ hnswendscan(IndexScanDesc scan)
 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
 
 	/*
-	 * RQ structures are allocated in tmpCtx, so they will be freed
+	 * RQ/RaBitQ structures are allocated in tmpCtx, so they will be freed
 	 * by MemoryContextDelete. Just delete the context.
+	 * RaBitQ encoder is allocated in query context, free it explicitly.
 	 */
+	if (so->rabitqEncoder != NULL)
+	{
+		RaBitQEncoderFree(so->rabitqEncoder);
+		pfree(so->rabitqEncoder);
+	}
+
 	MemoryContextDelete(so->tmpCtx);
 
 	pfree(so);

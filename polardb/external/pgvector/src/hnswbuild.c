@@ -51,6 +51,7 @@
 #include "optimizer/optimizer.h"
 #include "storage/bufmgr.h"
 #include "tcop/tcopprot.h"
+#include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/memutils.h"
 
@@ -142,110 +143,175 @@ VectorToFloatArray(Datum value, int dimensions, float *output)
  * Collect training vector for RQ
  * Returns true if we should train now (buffer full)
  */
-static bool
-CollectRQTrainingVector(HnswBuildState *buildstate, Datum value)
-{
-	int			dim = buildstate->dimensions;
-	float	   *dest;
-
-	/* Skip if RQ not enabled or already trained */
-	if (buildstate->rqTrainVectors == NULL || buildstate->rqCodebook != NULL)
-		return false;
-
-	/* Check if buffer is full */
-	if (buildstate->rqTrainCount >= buildstate->rqTrainMax)
-		return true;
-
-	/* Add vector to training buffer */
-	dest = &buildstate->rqTrainVectors[buildstate->rqTrainCount * dim];
-	VectorToFloatArray(value, dim, dest);
-	buildstate->rqTrainCount++;
-
-	return (buildstate->rqTrainCount >= buildstate->rqTrainMax);
-}
+/* RaBitQ initialization replaces RQ training (no training needed) */
 
 /*
- * Train the RQ codebook using collected vectors
+ * Initialize RaBitQ encoder for index construction
  */
 static void
-TrainRQCodebook(HnswBuildState *buildstate)
+InitRaBitQEncoder(HnswBuildState *buildstate, Relation index)
 {
+#if 1  /* Enable RaBitQ */
 	int			dim = buildstate->dimensions;
 	MemoryContext oldCtx;
+	uint64		seed;
+	Oid			columnType;
 
-	if (buildstate->rqCodebook != NULL)
-		return;					/* Already trained */
+	if (buildstate->rabitqEncoder != NULL)
+		return;					/* Already initialized */
 
-	if (buildstate->rqTrainCount < 256)
+	/* Get the column type OID */
+	columnType = TupleDescAttr(index->rd_att, 0)->atttypid;
+
+	/* Only enable RaBitQ for float32 vector type, not for bit/halfvec/sparsevec */
+	/* Get type name and check if it's "vector" */
 	{
-		ereport(DEBUG1, (errmsg("RQ: not enough training vectors (%d), skipping RQ",
-								buildstate->rqTrainCount)));
+		char	   *typeName = format_type_be(columnType);
+
+		if (strcmp(typeName, "vector") != 0)
+		{
+			buildstate->useRaBitQ = false;
+			return;
+		}
+	}
+
+	/* Only support dimensions 128-256 for RaBitQ */
+	/* RaBitQCode256 structure can handle up to 256 dimensions */
+	/* Require at least 128 dimensions for meaningful quantization */
+	if (dim < 128 || dim > 256)
+	{
+		buildstate->useRaBitQ = false;
 		return;
 	}
 
-	ereport(DEBUG1, (errmsg("RQ: training codebook with %d vectors, %d dimensions",
-							buildstate->rqTrainCount, dim)));
+	/* Generate seed from index OID for reproducibility */
+	seed = (uint64)RelationGetRelid(index) ^ 0x123456789ABCDEF0ULL;
 
-	/*
-	 * IMPORTANT: Switch to graphCtx for codebook allocation.
-	 * The codebook must persist beyond the current tuple context (tmpCtx),
-	 * which gets reset after each tuple is processed in BuildCallback.
-	 */
+	ereport(DEBUG1, (errmsg("RaBitQ: initializing encoder for %d dimensions with seed %lu",
+							dim, seed)));
+
+	/* Switch to persistent context for encoder allocation */
 	oldCtx = MemoryContextSwitchTo(buildstate->graphCtx);
 
-	/* Create and train codebook in the persistent context */
-	buildstate->rqCodebook = RQCreateCodebook(dim, RQ_NUM_STAGES, RQ_NUM_CENTROIDS);
-	RQTrainCodebook(buildstate->rqCodebook, buildstate->rqTrainVectors,
-					buildstate->rqTrainCount);
+	/* Initialize RaBitQ encoder - no training needed! */
+	buildstate->rabitqEncoder = palloc(sizeof(RaBitQEncoder));
+	RaBitQEncoderInit(buildstate->rabitqEncoder, dim, seed);
+	buildstate->useRaBitQ = true;
 
 	MemoryContextSwitchTo(oldCtx);
 
-	ereport(DEBUG1, (errmsg("RQ: codebook training complete")));
-
-	/* Free training vectors */
-	pfree(buildstate->rqTrainVectors);
-	buildstate->rqTrainVectors = NULL;
+	ereport(DEBUG1, (errmsg("RaBitQ: encoder initialization complete")));
+#endif
 }
 
 /*
- * Compute RQ code for a vector
+ * Compute RaBitQ code for a vector
  */
 static void
-ComputeRQCode(HnswBuildState *buildstate, Datum value, RQCode *code)
+ComputeRaBitQCode(HnswBuildState *buildstate, Datum value, RaBitQCode256 *code)
 {
-	float	   *floatVec;
-	int			dim = buildstate->dimensions;
-	Size		allocSize;
+	RaBitQCode	fullCode;
+	Vector	   *vec;
 
-	if (buildstate->rqCodebook == NULL)
+	if (!buildstate->useRaBitQ || buildstate->rabitqEncoder == NULL)
 	{
-		/* No RQ, zero out the code */
-		memset(code, 0, sizeof(RQCode));
+		/* No RaBitQ, zero out the code */
+		memset(code, 0, sizeof(RaBitQCode256));
 		return;
 	}
 
-	/* Validate dimensions before allocation */
-	if (dim <= 0 || dim > RQ_MAX_DIM)
+	/* Get vector data */
+	vec = DatumGetVector(value);
+
+	/* Encode to RaBitQCode */
+	RaBitQEncode(buildstate->rabitqEncoder, vec->x, &fullCode);
+
+	/* Copy to 256-bit compact structure (supports up to 256 dims) */
+	code->bits[0] = fullCode.bits[0];
+	code->bits[1] = fullCode.bits[1];
+	code->bits[2] = fullCode.bits[2];
+	code->bits[3] = fullCode.bits[3];
+	code->norm = fullCode.norm;
+}
+
+/*
+ * Store RaBitQ encoder to index pages
+ * Returns the first block number of the encoder chain
+ */
+static BlockNumber
+StoreRaBitQEncoder(Relation index, ForkNumber forkNum, HnswBuildState *buildstate)
+{
+	RaBitQEncoder *enc = buildstate->rabitqEncoder;
+	Size		totalSize;
+	Size		pageDataSize;
+	char	   *data;
+	char	   *ptr;
+	BlockNumber firstBlkno = InvalidBlockNumber;
+	Buffer		buf;
+	Buffer		prevBuf = InvalidBuffer;
+	Page		page;
+	Size		remaining;
+
+	if (enc == NULL)
+		return InvalidBlockNumber;
+
+	/* Serialize encoder */
+	totalSize = RaBitQEncoderSerializedSize(enc->dim);
+	data = palloc(totalSize);
+	RaBitQEncoderSerialize(enc, data);
+
+	/* Calculate usable space per page */
+	pageDataSize = BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(HnswPageOpaqueData)) - sizeof(Size);
+
+	/* Write encoder data across multiple pages */
+	ptr = data;
+	remaining = totalSize;
+
+	while (remaining > 0)
 	{
-		ereport(WARNING, (errmsg("RQ: invalid dimension %d, skipping encoding", dim)));
-		memset(code, 0, sizeof(RQCode));
-		return;
+		Size		writeSize = Min(remaining, pageDataSize);
+		char	   *pageData;
+		BlockNumber currentBlkno;
+
+		buf = HnswNewBuffer(index, forkNum);
+		page = BufferGetPage(buf);
+		HnswInitPage(buf, page);
+		currentBlkno = BufferGetBlockNumber(buf);
+
+		if (firstBlkno == InvalidBlockNumber)
+			firstBlkno = currentBlkno;
+
+		/* Link previous page to this one */
+		if (BufferIsValid(prevBuf))
+		{
+			Page		prevPage = BufferGetPage(prevBuf);
+			HnswPageOpaque prevOpaque = HnswPageGetOpaque(prevPage);
+
+			prevOpaque->nextblkno = currentBlkno;
+			MarkBufferDirty(prevBuf);
+			UnlockReleaseBuffer(prevBuf);
+		}
+
+		/* Write chunk size and data */
+		pageData = PageGetContents(page);
+		memcpy(pageData, &writeSize, sizeof(Size));
+		memcpy(pageData + sizeof(Size), ptr, writeSize);
+
+		ptr += writeSize;
+		remaining -= writeSize;
+
+		prevBuf = buf;
 	}
 
-	/* Also validate codebook dimension */
-	if (buildstate->rqCodebook->dim != dim)
+	/* Mark final page dirty and release */
+	if (BufferIsValid(prevBuf))
 	{
-		ereport(WARNING, (errmsg("RQ: codebook dim %d != buildstate dim %d",
-								buildstate->rqCodebook->dim, dim)));
-		memset(code, 0, sizeof(RQCode));
-		return;
+		MarkBufferDirty(prevBuf);
+		UnlockReleaseBuffer(prevBuf);
 	}
 
-	allocSize = (Size)dim * sizeof(float);
-	floatVec = palloc(allocSize);
-	VectorToFloatArray(value, dim, floatVec);
-	RQEncode(buildstate->rqCodebook, floatVec, code);
-	pfree(floatVec);
+	pfree(data);
+	return firstBlkno;
 }
 
 /*
@@ -351,7 +417,6 @@ CreateMetaPage(HnswBuildState * buildstate)
 	Buffer		buf;
 	Page		page;
 	HnswMetaPage metap;
-	BlockNumber rqCodebookBlkno = InvalidBlockNumber;
 
 	/* First create the metapage at block 0 */
 	buf = HnswNewBuffer(index, forkNum);
@@ -372,9 +437,10 @@ CreateMetaPage(HnswBuildState * buildstate)
 	metap->entryOffno = InvalidOffsetNumber;
 	metap->entryLevel = -1;
 	metap->insertPage = InvalidBlockNumber;
-	metap->rqNumStages = 0;
-	metap->rqNumCentroids = 0;
-	metap->rqCodebookBlkno = InvalidBlockNumber;
+	metap->rabitqEncoderBlkno = InvalidBlockNumber;
+	metap->rabitqDim = 0;
+	metap->rabitqSeed = 0;
+	metap->useRaBitQ = 0;
 
 	((PageHeader) page)->pd_lower =
 		((char *) metap + sizeof(HnswMetaPageData)) - (char *) page;
@@ -382,20 +448,21 @@ CreateMetaPage(HnswBuildState * buildstate)
 	MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
 
-	/* Now store RQ codebook at subsequent blocks (after metapage) */
-	if (buildstate->rqCodebook != NULL)
+	/* Now store RaBitQ encoder at subsequent blocks (after metapage) */
+	if (buildstate->useRaBitQ && buildstate->rabitqEncoder != NULL)
 	{
-		rqCodebookBlkno = StoreRQCodebook(index, forkNum, buildstate->rqCodebook);
+		BlockNumber rabitqEncoderBlkno = StoreRaBitQEncoder(index, forkNum, buildstate);
 
-		/* Update metapage with RQ codebook info */
+		/* Update metapage with RaBitQ encoder info */
 		buf = ReadBufferExtended(index, forkNum, HNSW_METAPAGE_BLKNO, RBM_NORMAL, NULL);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		page = BufferGetPage(buf);
 		metap = HnswPageGetMeta(page);
 
-		metap->rqNumStages = buildstate->rqCodebook->numStages;
-		metap->rqNumCentroids = buildstate->rqCodebook->numCentroids;
-		metap->rqCodebookBlkno = rqCodebookBlkno;
+		metap->rabitqEncoderBlkno = rabitqEncoderBlkno;
+		metap->rabitqDim = buildstate->rabitqEncoder->dim;
+		metap->rabitqSeed = buildstate->rabitqEncoder->seed;
+		metap->useRaBitQ = 1;
 
 		MarkBufferDirty(buf);
 		UnlockReleaseBuffer(buf);
@@ -605,9 +672,9 @@ FlushPages(HnswBuildState * buildstate)
 	elog(INFO, "memory: %zu MB", buildstate->graph->memoryUsed / (1024 * 1024));
 #endif
 
-	/* Train RQ codebook if we have enough samples but haven't trained yet */
-	if (buildstate->rqCodebook == NULL && buildstate->rqTrainCount > 0)
-		TrainRQCodebook(buildstate);
+	/* Initialize RaBitQ encoder if not already done */
+	if (!buildstate->useRaBitQ)
+		InitRaBitQEncoder(buildstate, buildstate->index);
 
 	CreateMetaPage(buildstate);
 	CreateGraphPages(buildstate);
@@ -804,11 +871,7 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	if (!HnswFormIndexValue(&value, values, isnull, buildstate->typeInfo, support))
 		return false;
 
-	/* Collect training vector for RQ if still collecting */
-	if (CollectRQTrainingVector(buildstate, value))
-	{
-		TrainRQCodebook(buildstate);
-	}
+	/* RaBitQ doesn't need training - encoder is initialized on first flush */
 
 	/* Get datum size */
 	valueSize = VARSIZE_ANY(DatumGetPointer(value));
@@ -872,8 +935,8 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	memcpy(valuePtr, DatumGetPointer(value), valueSize);
 	HnswPtrStore(base, element->value, valuePtr);
 
-	/* Compute RQ code for this element */
-	ComputeRQCode(buildstate, value, &element->rqCode);
+	/* Compute RaBitQ code for this element */
+	ComputeRaBitQCode(buildstate, value, &element->rabitqCode);
 
 	/* Create a lock for the element */
 	LWLockInitialize(&element->lock, hnsw_lock_tranche_id);
@@ -1058,18 +1121,9 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	buildstate->hnswshared = NULL;
 	buildstate->hnswarea = NULL;
 
-	/* Initialize RQ training state */
-	buildstate->rqCodebook = NULL;
-	buildstate->rqTrainMax = RQ_SAMPLE_SIZE;
-	buildstate->rqTrainCount = 0;
-	buildstate->rqTrainVectors = NULL;
-
-	/* Allocate training buffer if dimensions are known */
-	if (buildstate->dimensions > 0 && buildstate->dimensions <= RQ_MAX_DIM)
-	{
-		buildstate->rqTrainVectors = palloc((Size) buildstate->rqTrainMax *
-											buildstate->dimensions * sizeof(float));
-	}
+	/* Initialize RaBitQ state */
+	buildstate->rabitqEncoder = NULL;
+	buildstate->useRaBitQ = false;
 }
 
 /*

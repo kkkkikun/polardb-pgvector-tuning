@@ -12,6 +12,7 @@
 #include "utils/sampling.h"
 #include "vector.h"
 #include "rq.h"					/* Residual Quantization support */
+#include "rabitq.h"				/* RaBitQ (Binary Quantization) support */
 #include "port/atomics.h"		/* Atomic operations for lock-free CAS */
 
 #define HNSW_MAX_DIM 2000
@@ -156,8 +157,8 @@ struct HnswElementData
 	BlockNumber neighborPage;
 	DatumPtr	value;
 	LWLock		lock;
-	/* RQ code for fast approximate distance */
-	RQCode		rqCode;			/* Precomputed RQ code (8 bytes) */
+	/* RaBitQ code for fast approximate distance and compression */
+	RaBitQCode256 rabitqCode;	/* Precomputed RaBitQ code (up to 256 dims, 36 bytes) */
 };
 
 typedef HnswElementData * HnswElement;
@@ -316,11 +317,9 @@ typedef struct HnswBuildState
 	HnswShared *hnswshared;
 	char	   *hnswarea;
 
-	/* Residual Quantization (RQ) support */
-	RQCodebook *rqCodebook;		/* Trained RQ codebook (NULL if RQ disabled) */
-	float	   *rqTrainVectors;	/* Vectors for RQ training */
-	int			rqTrainCount;	/* Number of training vectors */
-	int			rqTrainMax;		/* Max training vectors to collect */
+	/* RaBitQ (Binary Quantization) support */
+	RaBitQEncoder *rabitqEncoder;	/* RaBitQ encoder (NULL if disabled) */
+	bool		useRaBitQ;			/* Whether RaBitQ is enabled */
 }			HnswBuildState;
 
 typedef struct HnswMetaPageData
@@ -334,10 +333,11 @@ typedef struct HnswMetaPageData
 	OffsetNumber entryOffno;
 	int16		entryLevel;
 	BlockNumber insertPage;
-	/* RQ codebook storage info */
-	BlockNumber rqCodebookBlkno; /* First block of RQ codebook (0 if no RQ) */
-	uint16		rqNumStages;	/* Number of RQ stages (0 if no RQ) */
-	uint16		rqNumCentroids;	/* Centroids per stage */
+	/* RaBitQ encoder storage info */
+	BlockNumber rabitqEncoderBlkno; /* First block of RaBitQ encoder (0 if disabled) */
+	uint16		rabitqDim;			/* Vector dimension for validation */
+	uint64		rabitqSeed;			/* Random seed for encoder reproducibility */
+	uint16		useRaBitQ;			/* Whether RaBitQ is enabled (1 or 0) */
 }			HnswMetaPageData;
 
 typedef HnswMetaPageData * HnswMetaPage;
@@ -360,7 +360,7 @@ typedef struct HnswElementTupleData
 	ItemPointerData heaptids[HNSW_HEAPTIDS];
 	ItemPointerData neighbortid;
 	uint16		unused;
-	RQCode		rqCode;			/* RQ code for fast distance (8 bytes) */
+	RaBitQCode256 rabitqCode;		/* RaBitQ code for compression (up to 256 dims, 36 bytes) */
 	Vector		data;
 }			HnswElementTupleData;
 
@@ -406,9 +406,10 @@ typedef struct HnswScanOpaqueData
 	/* Support functions */
 	HnswSupport support;
 
-	/* RQ support for fast distance computation */
-	RQCodebook *rqCodebook;		/* Loaded RQ codebook (NULL if no RQ) */
-	RQDistTable *rqDistTable;	/* Precomputed distance lookup table */
+	/* RaBitQ support for compression and fast distance computation */
+	RaBitQEncoder *rabitqEncoder;	 /* Loaded RaBitQ encoder (NULL if disabled) */
+	RaBitQQueryStateSQ4 *rabitqQueryState; /* Precomputed SQ4 query state */
+	bool		useRaBitQ;			 /* Whether RaBitQ is enabled */
 }			HnswScanOpaqueData;
 
 typedef HnswScanOpaqueData * HnswScanOpaque;
@@ -448,7 +449,7 @@ bool		HnswCheckNorm(HnswSupport * support, Datum value);
 Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
 void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
-List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, RQDistTable *rqDistTable);
+List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, RQDistTable *rqDistTable, RaBitQQueryStateSQ4 *rabitqQueryState);
 HnswElement HnswGetEntryPoint(Relation index);
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
@@ -475,6 +476,9 @@ PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
 
 /* RQ codebook functions */
 RQCodebook *HnswLoadRQCodebook(Relation index);
+
+/* RaBitQ encoder functions */
+RaBitQEncoder *HnswLoadRaBitQEncoder(Relation index);
 
 /* Index access methods */
 IndexBuildResult *hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo);

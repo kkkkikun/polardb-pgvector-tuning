@@ -107,6 +107,7 @@ _PG_init(void)
 	HalfvecInit();
 	HnswInit();
 	IvfflatInit();
+	RaBitQInit();		/* Initialize RaBitQ SIMD dispatch */
 }
 
 /*

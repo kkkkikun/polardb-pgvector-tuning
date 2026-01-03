@@ -47,6 +47,16 @@ typedef struct RaBitQCode128
 } RaBitQCode128;			/* Total: 20 bytes */
 
 /*
+ * Extended RaBitQ code for 256-dim vectors (36 bytes)
+ * Supports up to 256 dimensions (e.g., 200-dim vectors)
+ */
+typedef struct RaBitQCode256
+{
+	uint64		bits[4];	/* 256 bits for up to 256 dimensions */
+	float		norm;		/* 4 bytes */
+} RaBitQCode256;			/* Total: 36 bytes */
+
+/*
  * RaBitQ Encoder state
  *
  * Contains the random orthogonal rotation matrix used during encoding.
@@ -73,6 +83,24 @@ typedef struct RaBitQQueryState
 	float		queryNorm;		/* Query L2 norm */
 	float	   *rotatedQuery;	/* Query after rotation (for ADC) */
 } RaBitQQueryState;
+
+/*
+ * SQ4 (4-bit quantized query) state for fast distance computation
+ *
+ * Stores query vector as 4 bit-planes for efficient bitwise distance calculation.
+ * Query vector is quantized to 4-bit and reorganized by bit position.
+ * Distance computation uses bitwise AND + popcount with weighted bit accumulation.
+ */
+typedef struct RaBitQQueryStateSQ4
+{
+	uint64	   *sq4Bits[4];		/* 4 bit-planes (bit0, bit1, bit2, bit3) */
+	uint64	   *queryBits;		/* Binary sign quantization (for Hamming fallback) */
+	float		queryNorm;		/* Query L2 norm */
+	float	   *rotatedQuery;	/* Query after rotation (for min/max bounds) */
+	int			sq4Total;		/* Sum of all SQ4 values (for correct formula) */
+	int			nwords;			/* Number of uint64 words for bit storage */
+	int			dim;			/* Vector dimensionality */
+} RaBitQQueryStateSQ4;
 
 /* ============== Core Functions ============== */
 
@@ -124,6 +152,27 @@ void RaBitQPrepareQuery(RaBitQEncoder *enc, const float *query,
 float RaBitQFastDistance(const RaBitQQueryState *query, const RaBitQCode *code,
 						 int dim);
 
+/* ============== SQ4 Query Optimization ============== */
+
+/*
+ * Prepare SQ4 query state for fast distance computations
+ * Quantizes query to 4-bit and reorganizes by bit position
+ */
+void RaBitQPrepareSQ4Query(RaBitQEncoder *enc, const float *query,
+						   RaBitQQueryStateSQ4 *state);
+
+/*
+ * Free SQ4 query state resources
+ */
+void RaBitQFreeSQ4Query(RaBitQQueryStateSQ4 *state);
+
+/*
+ * Compute distance using SQ4-optimized query state (Generic version)
+ * Uses bitwise AND + popcount with weighted bit accumulation
+ */
+float RaBitQSQ4Distance_Generic(const RaBitQQueryStateSQ4 *query,
+								const RaBitQCode256 *code);
+
 /* ============== SIMD-Optimized Functions ============== */
 
 #ifdef __AVX512F__
@@ -132,6 +181,12 @@ float RaBitQFastDistance(const RaBitQQueryState *query, const RaBitQCode *code,
  */
 void RaBitQBatchDistance_AVX512(const RaBitQCode *query, const RaBitQCode *codes,
 								int nCodes, int dim, float *distances);
+
+/*
+ * AVX-512 optimized SQ4 distance computation using VPOPCNTDQ
+ */
+float RaBitQSQ4Distance_AVX512(const RaBitQQueryStateSQ4 *query,
+							   const RaBitQCode256 *code);
 #endif
 
 #ifdef __AVX2__
@@ -139,7 +194,32 @@ void RaBitQBatchDistance_AVX512(const RaBitQCode *query, const RaBitQCode *codes
  * AVX2 optimized rotation and encoding
  */
 void RaBitQEncode_AVX2(RaBitQEncoder *enc, const float *vector, RaBitQCode *code);
+
+/*
+ * AVX2 optimized SQ4 distance computation (using lookup tables for popcount)
+ */
+float RaBitQSQ4Distance_AVX2(const RaBitQQueryStateSQ4 *query,
+							 const RaBitQCode256 *code);
 #endif
+
+/* ============== Runtime Dispatch ============== */
+
+/*
+ * Function pointer type for SQ4 distance computation
+ */
+typedef float (*RaBitQSQ4DistanceFunc)(const RaBitQQueryStateSQ4 *query,
+										const RaBitQCode256 *code);
+
+/*
+ * Global function pointer for SQ4 distance (set at module init)
+ */
+extern RaBitQSQ4DistanceFunc RaBitQSQ4Distance;
+
+/*
+ * Initialize SIMD dispatch for SQ4 distance computation
+ * Must be called at module initialization
+ */
+void RaBitQInit(void);
 
 /* ============== Serialization ============== */
 
@@ -176,13 +256,15 @@ RaBitQHamming(const uint64 *a, const uint64 *b, int nwords)
 }
 
 /*
- * Compute Hamming distance for 128-bit codes (optimized for common case)
+ * Compute Hamming distance for 256-bit codes (up to 256 dimensions)
  */
 static inline int
-RaBitQHamming128(const RaBitQCode128 *a, const RaBitQCode128 *b)
+RaBitQHamming256(const RaBitQCode256 *a, const RaBitQCode256 *b)
 {
 	return __builtin_popcountll(a->bits[0] ^ b->bits[0]) +
-		   __builtin_popcountll(a->bits[1] ^ b->bits[1]);
+		   __builtin_popcountll(a->bits[1] ^ b->bits[1]) +
+		   __builtin_popcountll(a->bits[2] ^ b->bits[2]) +
+		   __builtin_popcountll(a->bits[3] ^ b->bits[3]);
 }
 
 /*

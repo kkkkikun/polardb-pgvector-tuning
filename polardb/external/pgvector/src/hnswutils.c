@@ -460,8 +460,8 @@ HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
 		else
 			ItemPointerSetInvalid(&etup->heaptids[i]);
 	}
-	/* Copy RQ code */
-	etup->rqCode = element->rqCode;
+	/* Copy RaBitQ code */
+	etup->rabitqCode = element->rabitqCode;
 	memcpy(&etup->data, valuePtr, VARSIZE_ANY(valuePtr));
 }
 
@@ -513,8 +513,8 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 	element->neighborOffno = ItemPointerGetOffsetNumber(&etup->neighbortid);
 	element->heaptidsLength = 0;
 
-	/* Load RQ code */
-	element->rqCode = etup->rqCode;
+	/* Load RaBitQ code */
+	element->rabitqCode = etup->rabitqCode;
 
 	if (loadHeaptids)
 	{
@@ -551,7 +551,7 @@ HnswGetDistance(Datum a, Datum b, HnswSupport * support)
  * With optional RQ-based early filtering
  */
 static void
-HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element, RQDistTable *rqDistTable)
+HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element, RQDistTable *rqDistTable, RaBitQQueryStateSQ4 *rabitqQueryState)
 {
 	Buffer		buf;
 	Page		page;
@@ -567,26 +567,23 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 	Assert(HnswIsElementTuple(etup));
 
 	/*
-	 * RQ-based early filtering: If we have an RQ distance table and the element
-	 * has a valid RQ code, compute approximate distance first. If it's clearly
-	 * larger than the current max, skip exact distance computation.
+	 * RaBitQ-based early filtering: use binary Hamming distance to skip
+	 * distant candidates before computing exact distance.
 	 */
-	if (rqDistTable != NULL && maxDistance != NULL && *maxDistance > 0)
+	if (rabitqQueryState != NULL && maxDistance != NULL && *maxDistance > 0)
 	{
-		float		rqDist = RQComputeDistance(rqDistTable, &etup->rqCode);
+		float		rabitqDist = RaBitQSQ4Distance(rabitqQueryState, &etup->rabitqCode);
 
 		/*
-		 * RQ distance is an approximation that doesn't include ||q||^2.
-		 * Since ||q||^2 is constant and RQ distance correlates with true distance,
-		 * if RQ distance is much larger than current max, skip this candidate.
-		 * Use a threshold to account for approximation error.
+		 * RaBitQ distance is an approximation. Use 1.3x threshold to maintain
+		 * high recall while filtering distant candidates.
 		 */
-		if (rqDist > (*maxDistance) * RQ_THRESHOLD_MULT)
+		if (rabitqDist > (*maxDistance) * 1.3)
 		{
-			/* Skip this candidate - RQ suggests it's too far */
+			/* Skip this candidate - RaBitQ suggests it's too far */
 			*element = NULL;
 			if (distance != NULL)
-				*distance = rqDist; /* Use approximate distance for discarded candidates */
+				*distance = rabitqDist;
 			UnlockReleaseBuffer(buf);
 			return;
 		}
@@ -619,7 +616,7 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 void
 HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance)
 {
-	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element, NULL);
+	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element, NULL, NULL);
 }
 
 /*
@@ -891,7 +888,7 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
  * Algorithm 2 from paper
  */
 List *
-HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, RQDistTable *rqDistTable)
+HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, RQDistTable *rqDistTable, RaBitQQueryStateSQ4 *rabitqQueryState)
 {
 	List	   *w = NIL;
 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
@@ -995,7 +992,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 				/* Avoid any allocations if not adding */
 				eElement = NULL;
-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f_distance, &eElement, rqDistTable);
+				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f_distance, &eElement, rqDistTable, rabitqQueryState);
 
 				if (eElement == NULL)
 					continue;
@@ -1377,8 +1374,8 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 	/* 1st phase: greedy search to insert level */
 	for (int lc = entryLevel; lc >= level + 1; lc--)
 	{
-		/* No RQ filtering during index build */
-		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL);
+		/* No RQ/RaBitQ filtering during index build */
+		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL, NULL);
 		ep = w;
 	}
 
@@ -1397,8 +1394,8 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 		List	   *lw = NIL;
 		ListCell   *lc2;
 
-		/* No RQ filtering during index build */
-		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL);
+		/* No RQ/RaBitQ filtering during index build */
+		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL, NULL);
 
 		/* Convert search candidates to candidates */
 		foreach(lc2, w)
@@ -1512,50 +1509,58 @@ hnsw_sparsevec_support(PG_FUNCTION_ARGS)
 RQCodebook *
 HnswLoadRQCodebook(Relation index)
 {
+	/* RQ support has been replaced by RaBitQ - return NULL */
+	return NULL;
+}
+
+/*
+ * Load RaBitQ encoder from index
+ */
+RaBitQEncoder *
+HnswLoadRaBitQEncoder(Relation index)
+{
 	Buffer		buf;
 	Page		page;
 	HnswMetaPage metap;
-	BlockNumber codebookBlkno;
+	BlockNumber encoderBlkno;
 	int			dim;
-	int			numStages;
-	int			numCentroids;
+	uint64		seed;
 	Size		totalSize;
 	char	   *data;
 	char	   *ptr;
-	RQCodebook *codebook;
+	RaBitQEncoder *encoder;
 
-	/* Read metapage to get RQ info */
+	/* Read metapage to get RaBitQ info */
 	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	metap = HnswPageGetMeta(page);
 
-	codebookBlkno = metap->rqCodebookBlkno;
-	dim = metap->dimensions;
-	numStages = metap->rqNumStages;
-	numCentroids = metap->rqNumCentroids;
+	encoderBlkno = metap->rabitqEncoderBlkno;
+	dim = metap->rabitqDim;
+	seed = metap->rabitqSeed;
 
 	UnlockReleaseBuffer(buf);
 
-	/* No RQ codebook */
-	if (!BlockNumberIsValid(codebookBlkno) || numStages == 0)
+	/* No RaBitQ encoder */
+	if (!BlockNumberIsValid(encoderBlkno) || !metap->useRaBitQ)
 		return NULL;
 
-	/* Calculate total size */
-	totalSize = sizeof(int) * 3 + (Size) numStages * numCentroids * dim * sizeof(float);
+	/* Calculate total size needed for encoder */
+	totalSize = RaBitQEncoderSerializedSize(dim);
 
 	/* Allocate buffer for serialized data */
 	data = palloc(totalSize);
 	ptr = data;
 
-	/* Read codebook pages */
-	while (codebookBlkno != InvalidBlockNumber && ptr < data + totalSize)
+	/* Read encoder pages */
+	while (BlockNumberIsValid(encoderBlkno) && ptr < data + totalSize)
 	{
 		char	   *pageData;
 		Size		chunkSize;
 		HnswPageOpaque opaque;
 
-		buf = ReadBuffer(index, codebookBlkno);
+		buf = ReadBuffer(index, encoderBlkno);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 
@@ -1572,17 +1577,17 @@ HnswLoadRQCodebook(Relation index)
 
 		/* Get next block */
 		opaque = HnswPageGetOpaque(page);
-		codebookBlkno = opaque->nextblkno;
+		encoderBlkno = opaque->nextblkno;
 
 		UnlockReleaseBuffer(buf);
 	}
 
-	/* Deserialize codebook */
-	codebook = RQDeserializeCodebook(data);
+	/* Deserialize encoder */
+	encoder = palloc(sizeof(RaBitQEncoder));
+	RaBitQEncoderDeserialize(encoder, data, dim);
 	pfree(data);
 
-	ereport(DEBUG1, (errmsg("RQ: loaded codebook (dim=%d, stages=%d, centroids=%d)",
-							codebook->dim, codebook->numStages, codebook->numCentroids)));
+	elog(DEBUG1, "RaBitQ: loaded encoder (dim=%d, seed=%lu)", encoder->dim, encoder->seed);
 
-	return codebook;
+	return encoder;
 }
