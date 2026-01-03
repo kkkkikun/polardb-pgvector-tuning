@@ -789,16 +789,35 @@ CompareFurthestCandidates(const pairingheap_node *a, const pairingheap_node *b, 
 
 /*
  * Init visited
+ *
+ * Use larger initial size to reduce hash table resizing.
+ * For index building (inMemory=true): use fixed 32768 to avoid resizing
+ *   during large-scale builds. Threshold ~29491 nodes per search.
+ * For queries (inMemory=false): use 4x multiplier which is sufficient.
+ *   ef=40, m=16 -> 2560 -> 4096 (threshold ~3686)
  */
 static inline void
 InitVisited(char *base, visited_hash * v, bool inMemory, int ef, int m)
 {
-	if (!inMemory)
-		v->tids = tidhash_create(CurrentMemoryContext, ef * m * 2, NULL);
-	else if (base != NULL)
-		v->offsets = offsethash_create(CurrentMemoryContext, ef * m * 2, NULL);
+	uint32 initial_size;
+
+	if (inMemory)
+	{
+		/* Fixed large size for building to minimize/eliminate resizing */
+		initial_size = 32768;  /* Can hold ~29491 nodes before resize */
+	}
 	else
-		v->pointers = pointerhash_create(CurrentMemoryContext, ef * m * 2, NULL);
+	{
+		/* Dynamic size for queries based on ef_search */
+		initial_size = ef * m * 4;
+	}
+
+	if (!inMemory)
+		v->tids = tidhash_create(CurrentMemoryContext, initial_size, NULL);
+	else if (base != NULL)
+		v->offsets = offsethash_create(CurrentMemoryContext, initial_size, NULL);
+	else
+		v->pointers = pointerhash_create(CurrentMemoryContext, initial_size, NULL);
 }
 
 /*
