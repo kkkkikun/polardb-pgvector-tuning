@@ -181,10 +181,16 @@ HnswSupportsQuantization(FmgrInfo *procinfo)
 void
 HnswInitSupport(HnswSupport * support, Relation index)
 {
+	const HnswTypeInfo *typeInfo;
+
 	support->procinfo = index_getprocinfo(index, 1, HNSW_DISTANCE_PROC);
 	support->collation = index->rd_indcollation[0];
 	support->normprocinfo = HnswOptionalProcInfo(index, HNSW_NORM_PROC);
 	support->allowQuantization = HnswSupportsQuantization(support->procinfo);
+
+	/* 从 TypeInfo 获取量化类型 */
+	typeInfo = HnswGetTypeInfo(index);
+	support->quantType = typeInfo->quantType;
 }
 
 /*
@@ -454,54 +460,85 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 		value = HnswNormValue(typeInfo, support->collation, value);
 	}
 
-	/* 如果不支持量化（非L2距离），直接使用原值 */
-	if (!support->allowQuantization)
+	/* 如果不支持量化（非L2距离）或量化类型为NONE，直接使用原值 */
+	if (!support->allowQuantization || support->quantType == HNSW_QUANT_NONE)
 	{
 		*out = value;
 		return true;
 	}
 
-	/* === 比赛专用 Hack：混合量化存储 (BQ + SQ8) === */
-	/* 只对L2距离的vector和halfvec类型进行量化 */
-
+	/* === 根据操作符类选择量化方法 === */
 	/* 【关键修复】先检测格式，再解包，避免halfvec误入vector分支 */
 	HnswValueFormat fmt = HnswDetectFormat(value);
 
-	if (fmt == HNSW_FMT_RAW_HALFVEC) {
-		/* 处理halfvec类型的混合量化 */
-		HalfVector *halfvec = DatumGetHalfVector(value);
-		int			dim = halfvec->dim;
-		int			bq_bytes = (dim + 7) / 8;
-
-		/* 混合格式大小: bq_bytes(2) + bq_data + scale(4) + bias(4) + sq8_codes(dim) */
-		Size payload_size = sizeof(uint16_t) + bq_bytes + sizeof(float)*2 + dim;
-		Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
-
-		/* 使用混合量化函数：同时生成 BQ 和 SQ8 */
-		HnswQuantizeHybrid(halfvec, quantized_vec);
-
-		*out = PointerGetDatum(quantized_vec);
-
-	} else if (fmt == HNSW_FMT_RAW_FLOAT_VEC) {
-		/* 处理vector类型的混合量化 */
-		Vector	   *vec = DatumGetVector(value);
-		int			dim = vec->dim;
-		int			bq_bytes = (dim + 7) / 8;
-
-		Size		payload_size = sizeof(uint16_t) + bq_bytes + sizeof(float)*2 + dim;
-		Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
-
-		/* 执行混合量化 */
-		HnswQuantizeHybridFromFloat(vec, quantized_vec);
-		*out = PointerGetDatum(quantized_vec);
-
-	} else if (fmt == HNSW_FMT_SQ8 || fmt == HNSW_FMT_HYBRID) {
-		/* 已经是量化格式，直接返回 */
+	/* 已经是量化格式，直接返回 */
+	if (fmt == HNSW_FMT_SQ8 || fmt == HNSW_FMT_HYBRID || fmt == HNSW_FMT_SQ4) {
 		elog(DEBUG1, "Heap value is already quantized, using directly");
 		*out = value;
+		return true;
+	}
+
+	/* 根据 quantType 选择量化方法 */
+	if (support->quantType == HNSW_QUANT_HYBRID) {
+		/* 混合量化 (BQ + SQ8) */
+		if (fmt == HNSW_FMT_RAW_HALFVEC) {
+			HalfVector *halfvec = DatumGetHalfVector(value);
+			int			dim = halfvec->dim;
+			int			bq_bytes = (dim + 7) / 8;
+
+			Size payload_size = sizeof(uint16_t) + bq_bytes + sizeof(float)*2 + dim;
+			Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+			HnswQuantizeHybrid(halfvec, quantized_vec);
+			*out = PointerGetDatum(quantized_vec);
+
+		} else if (fmt == HNSW_FMT_RAW_FLOAT_VEC) {
+			Vector	   *vec = DatumGetVector(value);
+			int			dim = vec->dim;
+			int			bq_bytes = (dim + 7) / 8;
+
+			Size		payload_size = sizeof(uint16_t) + bq_bytes + sizeof(float)*2 + dim;
+			Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+			HnswQuantizeHybridFromFloat(vec, quantized_vec);
+			*out = PointerGetDatum(quantized_vec);
+
+		} else {
+			/* 未知格式：不量化 */
+			*out = value;
+		}
+
+	} else if (support->quantType == HNSW_QUANT_SQ4) {
+		/* SQ4 量化 (4-bit) */
+		if (fmt == HNSW_FMT_RAW_HALFVEC) {
+			HalfVector *halfvec = DatumGetHalfVector(value);
+			int			dim = halfvec->dim;
+			int			packed_bytes = (dim + 1) / 2;
+
+			Size payload_size = sizeof(float)*2 + packed_bytes;
+			Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+			HnswQuantizeToSQ4(halfvec, quantized_vec);
+			*out = PointerGetDatum(quantized_vec);
+
+		} else if (fmt == HNSW_FMT_RAW_FLOAT_VEC) {
+			Vector	   *vec = DatumGetVector(value);
+			int			dim = vec->dim;
+			int			packed_bytes = (dim + 1) / 2;
+
+			Size		payload_size = sizeof(float)*2 + packed_bytes;
+			Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+			HnswQuantizeToSQ4FromFloat(vec, quantized_vec);
+			*out = PointerGetDatum(quantized_vec);
+
+		} else {
+			/* 未知格式：不量化 */
+			*out = value;
+		}
 
 	} else {
-		/* 未知格式(bit, sparsevec等)：不量化，直接使用原值 */
+		/* HNSW_QUANT_BQ 或其他：暂不实现，不量化 */
 		*out = value;
 	}
 
@@ -625,35 +662,54 @@ HnswGetDistance(Datum a, Datum b, HnswSupport * support)
 		return HnswHybridSQ8Distance(a, b);
 	}
 
+	/* 【SQ4】SQ4 vs SQ4（4-bit量化） */
+	if (tag_a == SQ4_TAG && tag_b == SQ4_TAG) {
+		return HnswSQ4Distance(a, b);
+	}
+
 	/* 【次常见】SQ8 vs SQ8（兼容旧索引） */
 	if (tag_a == SQ8_TAG && tag_b == SQ8_TAG) {
 		return HnswSQ8Distance(a, b);
 	}
 
+	/* 【跨格式】SQ4 vs SQ8/HYBRID（索引是SQ4，查询可能预量化为SQ8） */
+	if (tag_a == SQ4_TAG && (tag_b == SQ8_TAG || tag_b == HYBRID_TAG)) {
+		return HnswSQ4vsSQ8Distance(va, vb);
+	}
+	if (tag_b == SQ4_TAG && (tag_a == SQ8_TAG || tag_a == HYBRID_TAG)) {
+		return HnswSQ4vsSQ8Distance(vb, va);
+	}
+
 	/* 【较少】原始 vs 原始（纯原始数据比较） */
-	if (tag_a != SQ8_TAG && tag_a != HYBRID_TAG &&
-	    tag_b != SQ8_TAG && tag_b != HYBRID_TAG) {
+	if (tag_a != SQ8_TAG && tag_a != HYBRID_TAG && tag_a != SQ4_TAG &&
+	    tag_b != SQ8_TAG && tag_b != HYBRID_TAG && tag_b != SQ4_TAG) {
 		return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
 	}
 
-	/* 【较少情况】混合类型 */
-	if (tag_a == SQ8_TAG || tag_a == HYBRID_TAG) {
+	/* 【较少情况】量化 vs 原始 */
+	if (tag_a == SQ8_TAG || tag_a == HYBRID_TAG || tag_a == SQ4_TAG) {
 		/* a=量化, b=halfvec */
 		HalfVector *half_vec = (HalfVector *) PG_DETOAST_DATUM_PACKED(b);
 		if (tag_a == SQ8_TAG) {
 			return (double)HnswSQ8HalfvecDistance2(va, half_vec);
+		} else if (tag_a == HYBRID_TAG) {
+			/* HYBRID: 使用专用函数，正确跳过 BQ 部分 */
+			return (double)HnswHybridHalfvecDistance(va, half_vec);
 		} else {
-			/* HYBRID: 提取SQ8部分计算距离 - 简化处理 */
-			/* TODO: 实现 HnswHybridHalfvecDistance */
-			return (double)HnswSQ8HalfvecDistance2(va, half_vec);
+			/* SQ4 vs halfvec */
+			return (double)HnswSQ4HalfvecDistance(va, half_vec);
 		}
 	} else {
 		/* b=量化, a=halfvec */
 		HalfVector *half_vec = (HalfVector *) PG_DETOAST_DATUM_PACKED(a);
 		if (tag_b == SQ8_TAG) {
 			return (double)HnswSQ8HalfvecDistance2(vb, half_vec);
+		} else if (tag_b == HYBRID_TAG) {
+			/* HYBRID: 使用专用函数，正确跳过 BQ 部分 */
+			return (double)HnswHybridHalfvecDistance(vb, half_vec);
 		} else {
-			return (double)HnswSQ8HalfvecDistance2(vb, half_vec);
+			/* SQ4 vs halfvec */
+			return (double)HnswSQ4HalfvecDistance(vb, half_vec);
 		}
 	}
 }
@@ -1165,19 +1221,26 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 				Datum elemValue = HnswGetValue(base, eElement);
 				Vector *elemVec = (Vector *) PG_DETOAST_DATUM_PACKED(elemValue);
 
-				/* 检查是否为混合格式且不需要强制添加 */
+				/*
+				 * 【BQ 粗筛 - 固定阈值策略】
+				 * 使用 Hamming 距离的绝对阈值，而不是与 L2 距离比较
+				 * 阈值 = dim * BQ_THRESHOLD_RATIO（可调参数）
+				 */
+#define BQ_THRESHOLD_RATIO 0.42  /* 经验值，可根据测试结果调整 */
+
 				if (!alwaysAdd && elemVec->unused == HYBRID_TAG) {
 					Vector *queryVec = (Vector *) PG_DETOAST_DATUM_PACKED(q->value);
 					if (queryVec->unused == HYBRID_TAG) {
-						/* 第一阶段：BQ 粗筛 */
+						int dim = elemVec->dim;
+						double bq_threshold = dim * BQ_THRESHOLD_RATIO;
+
+						/* BQ 粗筛 */
 						double bq_dist = HnswHybridBQDistance(q->value, elemValue);
 
-						/* 阈值策略：固定倍数 K=2 */
-						/* BQ Hamming 距离与 L2 距离非线性相关，使用经验阈值 */
-						if (bq_dist > cached_f_distance * 2.0) {
-							/* 快速拒绝：BQ 距离过大，跳过 */
+						if (bq_dist > bq_threshold) {
+							/* 快速拒绝：Hamming 距离过大 */
 							if (discarded != NULL) {
-								/* 仍需计算精确距离用于 discarded 堆 */
+								/* 需要精确距离用于 discarded 堆 */
 								eDistance = HnswHybridSQ8Distance(q->value, elemValue);
 								e = HnswInitSearchCandidate(base, eElement, eDistance);
 								pairingheap_add(*discarded, &e->w_node);
@@ -1187,7 +1250,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 					}
 				}
 
-				/* 第二阶段：SQ8 精确距离 */
+				/* SQ8 精确距离 */
 				eDistance = HnswGetDistance(q->value, elemValue, support);
 			}
 			else
@@ -1711,10 +1774,12 @@ HnswGetTypeInfo(Relation index)
 
 	if (procinfo == NULL)
 	{
+		/* 默认 vector 类型：使用混合量化 */
 		static const HnswTypeInfo typeInfo = {
 			.maxDimensions = HNSW_MAX_DIM,
 			.normalize = l2_normalize,
-			.checkValue = NULL
+			.checkValue = NULL,
+			.quantType = HNSW_QUANT_HYBRID
 		};
 
 		return (&typeInfo);
@@ -1727,10 +1792,27 @@ FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_halfvec_support);
 Datum
 hnsw_halfvec_support(PG_FUNCTION_ARGS)
 {
+	/* halfvec_l2_ops 默认使用混合量化 (BQ+SQ8) */
 	static const HnswTypeInfo typeInfo = {
 		.maxDimensions = HNSW_MAX_DIM * 2,
 		.normalize = halfvec_l2_normalize,
-		.checkValue = NULL
+		.checkValue = NULL,
+		.quantType = HNSW_QUANT_HYBRID
+	};
+
+	PG_RETURN_POINTER(&typeInfo);
+}
+
+/* SQ4 量化支持函数 - 用于 halfvec_l2_sq4_ops */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_halfvec_sq4_support);
+Datum
+hnsw_halfvec_sq4_support(PG_FUNCTION_ARGS)
+{
+	static const HnswTypeInfo typeInfo = {
+		.maxDimensions = HNSW_MAX_DIM * 2,
+		.normalize = halfvec_l2_normalize,
+		.checkValue = NULL,
+		.quantType = HNSW_QUANT_SQ4
 	};
 
 	PG_RETURN_POINTER(&typeInfo);
@@ -1740,10 +1822,12 @@ FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_bit_support);
 Datum
 hnsw_bit_support(PG_FUNCTION_ARGS)
 {
+	/* bit 类型不支持量化 */
 	static const HnswTypeInfo typeInfo = {
 		.maxDimensions = HNSW_MAX_DIM * 32,
 		.normalize = NULL,
-		.checkValue = NULL
+		.checkValue = NULL,
+		.quantType = HNSW_QUANT_NONE
 	};
 
 	PG_RETURN_POINTER(&typeInfo);
@@ -1753,10 +1837,12 @@ FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_sparsevec_support);
 Datum
 hnsw_sparsevec_support(PG_FUNCTION_ARGS)
 {
+	/* sparsevec 类型不支持量化 */
 	static const HnswTypeInfo typeInfo = {
 		.maxDimensions = SPARSEVEC_MAX_DIM,
 		.normalize = sparsevec_l2_normalize,
-		.checkValue = SparsevecCheckValue
+		.checkValue = SparsevecCheckValue,
+		.quantType = HNSW_QUANT_NONE
 	};
 
 	PG_RETURN_POINTER(&typeInfo);

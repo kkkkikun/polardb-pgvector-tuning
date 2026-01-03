@@ -272,6 +272,9 @@ CREATE FUNCTION ivfflat_bit_support(internal) RETURNS internal
 CREATE FUNCTION hnsw_halfvec_support(internal) RETURNS internal
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
+CREATE FUNCTION hnsw_halfvec_sq4_support(internal) RETURNS internal
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
 CREATE FUNCTION hnsw_bit_support(internal) RETURNS internal
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
@@ -646,6 +649,13 @@ CREATE OPERATOR CLASS halfvec_l1_ops
 	OPERATOR 1 <+> (halfvec, halfvec) FOR ORDER BY float_ops,
 	FUNCTION 1 l1_distance(halfvec, halfvec),
 	FUNCTION 3 hnsw_halfvec_support(internal);
+
+-- SQ4 quantization operator class for HNSW (4-bit quantization)
+CREATE OPERATOR CLASS halfvec_l2_sq4_ops
+	FOR TYPE halfvec USING hnsw AS
+	OPERATOR 1 <-> (halfvec, halfvec) FOR ORDER BY float_ops,
+	FUNCTION 1 halfvec_l2_squared_distance(halfvec, halfvec),
+	FUNCTION 3 hnsw_halfvec_sq4_support(internal);
 
 -- bit functions
 

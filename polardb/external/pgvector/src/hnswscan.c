@@ -98,51 +98,71 @@ GetScanValue(IndexScanDesc scan)
 		if (so->support.normprocinfo != NULL)
 			value = HnswNormValue(so->typeInfo, so->support.collation, value);
 
-		/* 如果不支持量化（非L2距离），跳过量化 */
-		if (!so->support.allowQuantization)
+		/* 如果不支持量化（非L2距离）或量化类型为NONE，跳过量化 */
+		if (!so->support.allowQuantization || so->support.quantType == HNSW_QUANT_NONE)
 			return value;
 
-		/* === 比赛专用 Hack：混合量化查询 (BQ + SQ8) === */
-		/* 只对L2距离的vector和halfvec类型进行量化 */
-
-		/* 【关键修复】先检测格式，再解包，避免halfvec误入vector分支 */
+		/* === 根据操作符类选择查询向量量化方法 === */
 		HnswValueFormat fmt = HnswDetectFormat(value);
 
-		if (fmt == HNSW_FMT_RAW_HALFVEC) {
-			/* 处理halfvec类型的混合量化 */
-			HalfVector *halfvec = DatumGetHalfVector(value);
-			int			dim = halfvec->dim;
-			int			bq_bytes = (dim + 7) / 8;
-
-			/* 混合格式大小: bq_bytes(2) + bq_data + scale(4) + bias(4) + sq8_codes(dim) */
-			Size payload_size = sizeof(uint16_t) + bq_bytes + sizeof(float)*2 + dim;
-			Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
-
-			/* 使用混合量化函数 */
-			HnswQuantizeHybrid(halfvec, quantized_query);
-
-			value = PointerGetDatum(quantized_query);
-
-		} else if (fmt == HNSW_FMT_RAW_FLOAT_VEC) {
-			/* 处理vector类型的混合量化 */
-			Vector	   *query_vec = DatumGetVector(value);
-			int			dim = query_vec->dim;
-			int			bq_bytes = (dim + 7) / 8;
-
-			Size		payload_size = sizeof(uint16_t) + bq_bytes + sizeof(float)*2 + dim;
-			Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
-
-			/* 执行混合量化 */
-			HnswQuantizeHybridFromFloat(query_vec, quantized_query);
-			value = PointerGetDatum(quantized_query);
-
-		} else if (fmt == HNSW_FMT_SQ8 || fmt == HNSW_FMT_HYBRID) {
-			/* 已经是量化格式，无需重复量化 */
+		/* 已经是量化格式，无需重复量化 */
+		if (fmt == HNSW_FMT_SQ8 || fmt == HNSW_FMT_HYBRID || fmt == HNSW_FMT_SQ4) {
 			elog(DEBUG1, "Query vector is already quantized, skipping quantization");
-
-		} else {
-			/* 未知格式(bit, sparsevec等)：不量化，直接使用原值 */
+			return value;
 		}
+
+		/* 根据 quantType 选择量化方法 */
+		if (so->support.quantType == HNSW_QUANT_HYBRID) {
+			/* 混合量化 (BQ + SQ8) */
+			if (fmt == HNSW_FMT_RAW_HALFVEC) {
+				HalfVector *halfvec = DatumGetHalfVector(value);
+				int			dim = halfvec->dim;
+				int			bq_bytes = (dim + 7) / 8;
+
+				Size payload_size = sizeof(uint16_t) + bq_bytes + sizeof(float)*2 + dim;
+				Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+				HnswQuantizeHybrid(halfvec, quantized_query);
+				value = PointerGetDatum(quantized_query);
+
+			} else if (fmt == HNSW_FMT_RAW_FLOAT_VEC) {
+				Vector	   *query_vec = DatumGetVector(value);
+				int			dim = query_vec->dim;
+				int			bq_bytes = (dim + 7) / 8;
+
+				Size		payload_size = sizeof(uint16_t) + bq_bytes + sizeof(float)*2 + dim;
+				Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+				HnswQuantizeHybridFromFloat(query_vec, quantized_query);
+				value = PointerGetDatum(quantized_query);
+			}
+
+		} else if (so->support.quantType == HNSW_QUANT_SQ4) {
+			/* SQ4 量化 (4-bit) */
+			if (fmt == HNSW_FMT_RAW_HALFVEC) {
+				HalfVector *halfvec = DatumGetHalfVector(value);
+				int			dim = halfvec->dim;
+				int			packed_bytes = (dim + 1) / 2;
+
+				Size payload_size = sizeof(float)*2 + packed_bytes;
+				Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+				HnswQuantizeToSQ4(halfvec, quantized_query);
+				value = PointerGetDatum(quantized_query);
+
+			} else if (fmt == HNSW_FMT_RAW_FLOAT_VEC) {
+				Vector	   *query_vec = DatumGetVector(value);
+				int			dim = query_vec->dim;
+				int			packed_bytes = (dim + 1) / 2;
+
+				Size		payload_size = sizeof(float)*2 + packed_bytes;
+				Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+				HnswQuantizeToSQ4FromFloat(query_vec, quantized_query);
+				value = PointerGetDatum(quantized_query);
+			}
+		}
+		/* HNSW_QUANT_BQ 或其他：暂不实现 */
 	}
 
 	return value;

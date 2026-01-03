@@ -246,11 +246,21 @@ typedef struct HnswAllocator
 	void	   *state;
 }			HnswAllocator;
 
+/* 量化类型枚举 - 通过操作符类选择 */
+typedef enum HnswQuantType
+{
+	HNSW_QUANT_NONE = 0,   /* 不量化，保留原始格式 */
+	HNSW_QUANT_HYBRID,     /* BQ+SQ8 混合量化 (当前默认) */
+	HNSW_QUANT_SQ4,        /* SQ4 4-bit 量化 */
+	HNSW_QUANT_BQ          /* 纯 Binary Quantization */
+} HnswQuantType;
+
 typedef struct HnswTypeInfo
 {
 	int			maxDimensions;
 	Datum		(*normalize) (PG_FUNCTION_ARGS);
 	void		(*checkValue) (Pointer v);
+	HnswQuantType quantType;  /* 量化类型，由操作符类决定 */
 }			HnswTypeInfo;
 
 typedef struct HnswSupport
@@ -259,6 +269,7 @@ typedef struct HnswSupport
 	FmgrInfo   *normprocinfo;
 	Oid			collation;
 	bool		allowQuantization;
+	HnswQuantType quantType;  /* 量化类型，从 HnswTypeInfo 复制 */
 }			HnswSupport;
 
 typedef struct HnswQuery
@@ -530,6 +541,9 @@ typedef struct HnswSQ8Payload {
 /* 混合量化标记：BQ + SQ8 */
 #define HYBRID_TAG 0x4859  /* 'HY' - Hybrid BQ+SQ8 */
 
+/* SQ4 量化标记：4-bit 量化 */
+#define SQ4_TAG 0x5134  /* 'Q4' - SQ4 量化标记 */
+
 /* HNSW值格式枚举 */
 typedef enum
 {
@@ -537,6 +551,7 @@ typedef enum
 	HNSW_FMT_RAW_HALFVEC,      /* 原始halfvec：2字节half/元素 */
 	HNSW_FMT_SQ8,              /* SQ8量化：scale(4) + bias(4) + codes(dim) */
 	HNSW_FMT_HYBRID,           /* 混合量化：bq_bytes(2) + bq_data + scale(4) + bias(4) + sq8_codes */
+	HNSW_FMT_SQ4,              /* SQ4量化：scale(4) + bias(4) + packed_codes(dim/2) */
 	HNSW_FMT_UNKNOWN           /* 未知格式：bit, sparsevec等其他类型 */
 } HnswValueFormat;
 
@@ -598,6 +613,19 @@ HnswDetectFormat(Datum d)
 			Vector *v = (Vector *)p;
 			if (v->unused == HYBRID_TAG) {
 				return HNSW_FMT_HYBRID;
+			}
+		}
+	}
+
+	/* SQ4量化：payload == 8 + (dim+1)/2 (scale+bias+packed_codes) */
+	/* 每2个维度打包成1个字节 */
+	{
+		int packed_bytes = (dim + 1) / 2;
+		int sq4_payload = sizeof(float) * 2 + packed_bytes;
+		if (payload == sq4_payload) {
+			Vector *v = (Vector *)p;
+			if (v->unused == SQ4_TAG) {
+				return HNSW_FMT_SQ4;
 			}
 		}
 	}
@@ -862,6 +890,123 @@ HnswQuantizeHybridFromFloat(Vector *src, Vector *dest)
     dest->unused = HYBRID_TAG;
     SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) +
                 sizeof(uint16_t) + bq_bytes + sizeof(float)*2 + dim);
+}
+
+/*
+ * SQ4 量化函数：4-bit 量化
+ * 内存布局: [scale:4][bias:4][packed_codes:(dim+1)/2]
+ * 每2个维度打包成1个字节：高4位 = 第一个值，低4位 = 第二个值
+ * 768维 -> 8 + 384 = 392 bytes (比 SQ8 压缩 50%)
+ */
+static inline void
+HnswQuantizeToSQ4(HalfVector *src, Vector *dest)
+{
+    int dim = src->dim;
+    int packed_bytes = (dim + 1) / 2;
+    half *hdata = src->x;
+
+    char *buffer = (char *)dest->x;
+
+    /* 第一遍：统计 min/max */
+    float min_v = 1e30f, max_v = -1e30f;
+    for (int i = 0; i < dim; i++) {
+        float val = HalfToFloat4(hdata[i]);
+        if (val < min_v) min_v = val;
+        if (val > max_v) max_v = val;
+    }
+
+    /* SQ4 量化参数：映射到 [0, 15] */
+    float scale = (max_v == min_v) ? 0.0f : (max_v - min_v) / 15.0f;
+    float bias = min_v;
+
+    memcpy(buffer, &scale, sizeof(float));
+    memcpy(buffer + sizeof(float), &bias, sizeof(float));
+
+    /* 打包的 4-bit 数据 */
+    uint8_t *packed_ptr = (uint8_t *)(buffer + sizeof(float) * 2);
+
+    if (scale == 0.0f) {
+        memset(packed_ptr, 0, packed_bytes);
+    } else {
+        float inv_scale = 1.0f / scale;
+        for (int i = 0; i < dim; i += 2) {
+            /* 量化第一个值 */
+            float val0 = HalfToFloat4(hdata[i]);
+            int32_t q0 = (int32_t)((val0 - bias) * inv_scale + 0.5f);
+            if (q0 < 0) q0 = 0; else if (q0 > 15) q0 = 15;
+
+            /* 量化第二个值（如果存在） */
+            int32_t q1 = 0;
+            if (i + 1 < dim) {
+                float val1 = HalfToFloat4(hdata[i + 1]);
+                q1 = (int32_t)((val1 - bias) * inv_scale + 0.5f);
+                if (q1 < 0) q1 = 0; else if (q1 > 15) q1 = 15;
+            }
+
+            /* 打包：高4位 = q0, 低4位 = q1 */
+            packed_ptr[i / 2] = (uint8_t)((q0 << 4) | q1);
+        }
+    }
+
+    dest->dim = dim;
+    dest->unused = SQ4_TAG;
+    SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) + sizeof(float)*2 + packed_bytes);
+}
+
+/* 从 Float Vector 生成 SQ4 量化 */
+static inline void
+HnswQuantizeToSQ4FromFloat(Vector *src, Vector *dest)
+{
+    int dim = src->dim;
+    int packed_bytes = (dim + 1) / 2;
+    float *fdata = src->x;
+
+    char *buffer = (char *)dest->x;
+
+    /* 第一遍：统计 min/max */
+    float min_v = 1e30f, max_v = -1e30f;
+    for (int i = 0; i < dim; i++) {
+        float val = fdata[i];
+        if (val < min_v) min_v = val;
+        if (val > max_v) max_v = val;
+    }
+
+    /* SQ4 量化参数：映射到 [0, 15] */
+    float scale = (max_v == min_v) ? 0.0f : (max_v - min_v) / 15.0f;
+    float bias = min_v;
+
+    memcpy(buffer, &scale, sizeof(float));
+    memcpy(buffer + sizeof(float), &bias, sizeof(float));
+
+    /* 打包的 4-bit 数据 */
+    uint8_t *packed_ptr = (uint8_t *)(buffer + sizeof(float) * 2);
+
+    if (scale == 0.0f) {
+        memset(packed_ptr, 0, packed_bytes);
+    } else {
+        float inv_scale = 1.0f / scale;
+        for (int i = 0; i < dim; i += 2) {
+            /* 量化第一个值 */
+            float val0 = fdata[i];
+            int32_t q0 = (int32_t)((val0 - bias) * inv_scale + 0.5f);
+            if (q0 < 0) q0 = 0; else if (q0 > 15) q0 = 15;
+
+            /* 量化第二个值（如果存在） */
+            int32_t q1 = 0;
+            if (i + 1 < dim) {
+                float val1 = fdata[i + 1];
+                q1 = (int32_t)((val1 - bias) * inv_scale + 0.5f);
+                if (q1 < 0) q1 = 0; else if (q1 > 15) q1 = 15;
+            }
+
+            /* 打包：高4位 = q0, 低4位 = q1 */
+            packed_ptr[i / 2] = (uint8_t)((q0 << 4) | q1);
+        }
+    }
+
+    dest->dim = dim;
+    dest->unused = SQ4_TAG;
+    SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) + sizeof(float)*2 + packed_bytes);
 }
 
 /*
@@ -1559,6 +1704,409 @@ HnswHybridDistance(Datum a, Datum b, bool coarse)
     } else {
         return HnswHybridSQ8Distance(a, b);
     }
+}
+
+/*
+ * HYBRID 格式 vs halfvec 距离计算
+ * HYBRID 内存布局: [bq_bytes:2][bq_data:bq_bytes][scale:4][bias:4][sq8_codes:dim]
+ * 需要跳过 BQ 部分，定位到 SQ8 部分计算距离
+ */
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
+static inline float
+HnswHybridHalfvecDistance_AVX512(const Vector *hybrid, const HalfVector *hv)
+{
+    const int dim = (int)hybrid->dim;
+    const char *buf = (const char *)hybrid->x;
+
+    /* 读取 bq_bytes 并跳过 BQ 数据 */
+    uint16_t bq_bytes;
+    memcpy(&bq_bytes, buf, sizeof(uint16_t));
+
+    /* 定位到 SQ8 部分：跳过 bq_bytes(2) + bq_data(bq_bytes) */
+    const char *sq8_buf = buf + sizeof(uint16_t) + bq_bytes;
+
+    /* 读取 SQ8 参数 */
+    float s, b;
+    memcpy(&s, sq8_buf, sizeof(float));
+    memcpy(&b, sq8_buf + sizeof(float), sizeof(float));
+
+    const uint8_t *q = (const uint8_t *)(sq8_buf + sizeof(float) * 2);
+    const half *hx = (const half *)hv->x;
+
+    __m512 v_sum = _mm512_setzero_ps();
+
+    if (s == 0.0f)
+    {
+        const __m512 v_bias = _mm512_set1_ps(b);
+
+        int i = 0;
+        for (; i + 16 <= dim; i += 16)
+        {
+            __m256i h16 = _mm256_loadu_si256((const __m256i *)(hx + i));
+            __m512  v_h = _mm512_cvtph_ps(h16);
+
+            __m512 v_diff = _mm512_sub_ps(v_h, v_bias);
+            v_sum = _mm512_fmadd_ps(v_diff, v_diff, v_sum);
+        }
+
+        if (i < dim)
+        {
+            const int remain = dim - i;
+            const __mmask16 mask = (__mmask16)((1u << remain) - 1u);
+
+            __m256i h16 = _mm256_maskz_loadu_epi16(mask, (const void *)(hx + i));
+            __m512  v_h = _mm512_cvtph_ps(h16);
+
+            __m512 v_diff = _mm512_sub_ps(v_h, v_bias);
+            __m512 v_sq = _mm512_mul_ps(v_diff, v_diff);
+            v_sum = _mm512_add_ps(v_sum, _mm512_maskz_mov_ps(mask, v_sq));
+        }
+
+        return hsum512_ps(v_sum);
+    }
+
+    /* 正常情况：scale != 0 */
+    const __m512 v_scale = _mm512_set1_ps(s);
+    const __m512 v_bias  = _mm512_set1_ps(b);
+
+    int i = 0;
+    for (; i + 16 <= dim; i += 16)
+    {
+        /* 加载 16 个 SQ8 codes -> 转换为 float */
+        __m128i q16 = _mm_loadu_si128((const __m128i *)(q + i));
+        __m512i q32 = _mm512_cvtepu8_epi32(q16);
+        __m512  v_q = _mm512_cvtepi32_ps(q32);
+        __m512  v_dequant = _mm512_fmadd_ps(v_q, v_scale, v_bias);
+
+        /* 加载 16 个 half -> 转换为 float */
+        __m256i h16 = _mm256_loadu_si256((const __m256i *)(hx + i));
+        __m512  v_h = _mm512_cvtph_ps(h16);
+
+        __m512 v_diff = _mm512_sub_ps(v_dequant, v_h);
+        v_sum = _mm512_fmadd_ps(v_diff, v_diff, v_sum);
+    }
+
+    /* 处理尾部 */
+    if (i < dim)
+    {
+        const int remain = dim - i;
+        const __mmask16 mask = (__mmask16)((1u << remain) - 1u);
+
+        __m128i q16 = _mm_maskz_loadu_epi8(mask, (const void *)(q + i));
+        __m512i q32 = _mm512_cvtepu8_epi32(q16);
+        __m512  v_q = _mm512_cvtepi32_ps(q32);
+        __m512  v_dequant = _mm512_fmadd_ps(v_q, v_scale, v_bias);
+
+        __m256i h16 = _mm256_maskz_loadu_epi16(mask, (const void *)(hx + i));
+        __m512  v_h = _mm512_cvtph_ps(h16);
+
+        __m512 v_diff = _mm512_sub_ps(v_dequant, v_h);
+        __m512 v_sq = _mm512_mul_ps(v_diff, v_diff);
+        v_sum = _mm512_add_ps(v_sum, _mm512_maskz_mov_ps(mask, v_sq));
+    }
+
+    return hsum512_ps(v_sum);
+}
+
+/*
+ * HYBRID vs halfvec 距离计算主入口
+ */
+static inline float
+HnswHybridHalfvecDistance(Vector *hybrid, HalfVector *hv)
+{
+    if ((int)hv->dim != (int)hybrid->dim)
+        elog(ERROR, "dimension mismatch: hybrid=%d halfvec=%d", hybrid->dim, hv->dim);
+
+    return HnswHybridHalfvecDistance_AVX512(hybrid, hv);
+}
+
+/*
+ * SQ4 距离计算 - 标量版本
+ * 内存布局: [scale:4][bias:4][packed_codes:(dim+1)/2]
+ * 每个字节：高4位 = 第一个值，低4位 = 第二个值
+ */
+static inline double
+HnswSQ4Distance_Scalar(Datum a, Datum b)
+{
+    Vector *va = (Vector *)PG_DETOAST_DATUM_PACKED(a);
+    Vector *vb = (Vector *)PG_DETOAST_DATUM_PACKED(b);
+
+    Assert(va->unused == SQ4_TAG && vb->unused == SQ4_TAG);
+    Assert(va->dim == vb->dim);
+
+    int dim = va->dim;
+    int packed_bytes = (dim + 1) / 2;
+
+    char *bufa = (char *)va->x;
+    char *bufb = (char *)vb->x;
+
+    /* 提取 SQ4 参数 */
+    float sa, ba, sb, bb;
+    memcpy(&sa, bufa, sizeof(float));
+    memcpy(&ba, bufa + sizeof(float), sizeof(float));
+    memcpy(&sb, bufb, sizeof(float));
+    memcpy(&bb, bufb + sizeof(float), sizeof(float));
+
+    const uint8_t *pa = (const uint8_t *)(bufa + sizeof(float) * 2);
+    const uint8_t *pb = (const uint8_t *)(bufb + sizeof(float) * 2);
+
+    /* 计算 L2 距离 */
+    double sum = 0.0;
+    for (int i = 0; i < packed_bytes; i++) {
+        uint8_t byte_a = pa[i];
+        uint8_t byte_b = pb[i];
+
+        /* 解包高4位 */
+        int q0a = (byte_a >> 4) & 0x0F;
+        int q0b = (byte_b >> 4) & 0x0F;
+        float val_a0 = (float)q0a * sa + ba;
+        float val_b0 = (float)q0b * sb + bb;
+        float diff0 = val_a0 - val_b0;
+        sum += (double)diff0 * (double)diff0;
+
+        /* 解包低4位（检查边界） */
+        int idx1 = i * 2 + 1;
+        if (idx1 < dim) {
+            int q1a = byte_a & 0x0F;
+            int q1b = byte_b & 0x0F;
+            float val_a1 = (float)q1a * sa + ba;
+            float val_b1 = (float)q1b * sb + bb;
+            float diff1 = val_a1 - val_b1;
+            sum += (double)diff1 * (double)diff1;
+        }
+    }
+
+    return sum;
+}
+
+/*
+ * SQ4 距离计算 - AVX-512 优化版本
+ * 每次处理 64 个打包字节 = 128 个维度
+ */
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
+static inline double
+HnswSQ4Distance_AVX512(Datum a, Datum b)
+{
+    Vector *va = (Vector *)PG_DETOAST_DATUM_PACKED(a);
+    Vector *vb = (Vector *)PG_DETOAST_DATUM_PACKED(b);
+
+    Assert(va->unused == SQ4_TAG && vb->unused == SQ4_TAG);
+    Assert(va->dim == vb->dim);
+
+    int dim = va->dim;
+    int packed_bytes = (dim + 1) / 2;
+
+    char *bufa = (char *)va->x;
+    char *bufb = (char *)vb->x;
+
+    /* 提取 SQ4 参数 */
+    float sa, ba, sb, bb;
+    memcpy(&sa, bufa, sizeof(float));
+    memcpy(&ba, bufa + sizeof(float), sizeof(float));
+    memcpy(&sb, bufb, sizeof(float));
+    memcpy(&bb, bufb + sizeof(float), sizeof(float));
+
+    const uint8_t *pa = (const uint8_t *)(bufa + sizeof(float) * 2);
+    const uint8_t *pb = (const uint8_t *)(bufb + sizeof(float) * 2);
+
+    __m512 sum_vec = _mm512_setzero_ps();
+    __m512 vsa = _mm512_set1_ps(sa);
+    __m512 vba = _mm512_set1_ps(ba);
+    __m512 vsb = _mm512_set1_ps(sb);
+    __m512 vbb = _mm512_set1_ps(bb);
+
+    int i = 0;
+    /* 每次处理 8 个打包字节 = 16 个维度 */
+    for (; i + 8 <= packed_bytes; i += 8) {
+        /* 加载 8 字节打包数据 */
+        uint64_t bytes_a, bytes_b;
+        memcpy(&bytes_a, pa + i, 8);
+        memcpy(&bytes_b, pb + i, 8);
+
+        /* 手动解包16个4-bit值到16个int32 */
+        int32_t qa[16], qb[16];
+        for (int j = 0; j < 8; j++) {
+            uint8_t ba_byte = (bytes_a >> (j * 8)) & 0xFF;
+            uint8_t bb_byte = (bytes_b >> (j * 8)) & 0xFF;
+            qa[j * 2]     = (ba_byte >> 4) & 0x0F;
+            qa[j * 2 + 1] = ba_byte & 0x0F;
+            qb[j * 2]     = (bb_byte >> 4) & 0x0F;
+            qb[j * 2 + 1] = bb_byte & 0x0F;
+        }
+
+        /* 转换为 float 并计算距离 */
+        __m512i vqa = _mm512_loadu_si512((__m512i *)qa);
+        __m512i vqb = _mm512_loadu_si512((__m512i *)qb);
+        __m512 vfa = _mm512_cvtepi32_ps(vqa);
+        __m512 vfb = _mm512_cvtepi32_ps(vqb);
+
+        /* dequantize: val = q * scale + bias */
+        __m512 val_a = _mm512_fmadd_ps(vfa, vsa, vba);
+        __m512 val_b = _mm512_fmadd_ps(vfb, vsb, vbb);
+
+        /* diff = val_a - val_b; sum += diff * diff */
+        __m512 diff = _mm512_sub_ps(val_a, val_b);
+        sum_vec = _mm512_fmadd_ps(diff, diff, sum_vec);
+    }
+
+    /* 水平求和 */
+    double sum = _mm512_reduce_add_ps(sum_vec);
+
+    /* 标量处理剩余部分 */
+    for (; i < packed_bytes; i++) {
+        uint8_t byte_a = pa[i];
+        uint8_t byte_b = pb[i];
+
+        int q0a = (byte_a >> 4) & 0x0F;
+        int q0b = (byte_b >> 4) & 0x0F;
+        float val_a0 = (float)q0a * sa + ba;
+        float val_b0 = (float)q0b * sb + bb;
+        float diff0 = val_a0 - val_b0;
+        sum += (double)diff0 * (double)diff0;
+
+        int idx1 = i * 2 + 1;
+        if (idx1 < dim) {
+            int q1a = byte_a & 0x0F;
+            int q1b = byte_b & 0x0F;
+            float val_a1 = (float)q1a * sa + ba;
+            float val_b1 = (float)q1b * sb + bb;
+            float diff1 = val_a1 - val_b1;
+            sum += (double)diff1 * (double)diff1;
+        }
+    }
+
+    return sum;
+}
+
+/*
+ * SQ4 距离计算 - 主入口
+ */
+static inline double
+HnswSQ4Distance(Datum a, Datum b)
+{
+#ifdef __AVX512F__
+    return HnswSQ4Distance_AVX512(a, b);
+#else
+    return HnswSQ4Distance_Scalar(a, b);
+#endif
+}
+
+/*
+ * SQ4 vs HalfVector 距离计算
+ * sq4: SQ4量化向量
+ * hv: 原始halfvec
+ */
+static inline double
+HnswSQ4HalfvecDistance(Vector *sq4, HalfVector *hv)
+{
+    Assert(sq4->unused == SQ4_TAG);
+    Assert(sq4->dim == hv->dim);
+
+    int dim = sq4->dim;
+    int packed_bytes = (dim + 1) / 2;
+
+    char *buf = (char *)sq4->x;
+
+    /* 提取 SQ4 参数 */
+    float scale, bias;
+    memcpy(&scale, buf, sizeof(float));
+    memcpy(&bias, buf + sizeof(float), sizeof(float));
+
+    const uint8_t *packed = (const uint8_t *)(buf + sizeof(float) * 2);
+    half *hdata = hv->x;
+
+    /* 计算 L2 距离 */
+    double sum = 0.0;
+    for (int i = 0; i < packed_bytes; i++) {
+        uint8_t byte = packed[i];
+
+        /* 解包高4位 */
+        int q0 = (byte >> 4) & 0x0F;
+        float val_sq4_0 = (float)q0 * scale + bias;
+        float val_hv_0 = HalfToFloat4(hdata[i * 2]);
+        float diff0 = val_sq4_0 - val_hv_0;
+        sum += (double)diff0 * (double)diff0;
+
+        /* 解包低4位（检查边界） */
+        int idx1 = i * 2 + 1;
+        if (idx1 < dim) {
+            int q1 = byte & 0x0F;
+            float val_sq4_1 = (float)q1 * scale + bias;
+            float val_hv_1 = HalfToFloat4(hdata[idx1]);
+            float diff1 = val_sq4_1 - val_hv_1;
+            sum += (double)diff1 * (double)diff1;
+        }
+    }
+
+    return sum;
+}
+
+/*
+ * SQ4 vs SQ8/HYBRID 距离计算
+ * sq4: SQ4量化向量（索引数据）
+ * sq8_or_hybrid: SQ8或HYBRID量化向量（查询数据，可能预量化）
+ *
+ * 对于HYBRID格式，提取其中的SQ8部分进行计算
+ */
+static inline double
+HnswSQ4vsSQ8Distance(Vector *sq4, Vector *sq8_or_hybrid)
+{
+    Assert(sq4->unused == SQ4_TAG);
+    Assert(sq8_or_hybrid->unused == SQ8_TAG || sq8_or_hybrid->unused == HYBRID_TAG);
+    Assert(sq4->dim == sq8_or_hybrid->dim);
+
+    int dim = sq4->dim;
+    int packed_bytes = (dim + 1) / 2;
+
+    /* 提取 SQ4 参数 */
+    char *buf_sq4 = (char *)sq4->x;
+    float scale4, bias4;
+    memcpy(&scale4, buf_sq4, sizeof(float));
+    memcpy(&bias4, buf_sq4 + sizeof(float), sizeof(float));
+    const uint8_t *packed4 = (const uint8_t *)(buf_sq4 + sizeof(float) * 2);
+
+    /* 提取 SQ8 参数 */
+    char *buf_sq8;
+    float scale8, bias8;
+    const uint8_t *codes8;
+
+    if (sq8_or_hybrid->unused == HYBRID_TAG) {
+        /* HYBRID 格式：跳过 bq_bytes(2) + bq_data，定位到 SQ8 数据 */
+        int bq_bytes = (dim + 7) / 8;
+        buf_sq8 = (char *)sq8_or_hybrid->x + sizeof(uint16_t) + bq_bytes;
+    } else {
+        /* SQ8 格式 */
+        buf_sq8 = (char *)sq8_or_hybrid->x;
+    }
+    memcpy(&scale8, buf_sq8, sizeof(float));
+    memcpy(&bias8, buf_sq8 + sizeof(float), sizeof(float));
+    codes8 = (const uint8_t *)(buf_sq8 + sizeof(float) * 2);
+
+    /* 计算 L2 距离 */
+    double sum = 0.0;
+    for (int i = 0; i < packed_bytes; i++) {
+        uint8_t byte4 = packed4[i];
+
+        /* 解包 SQ4 高4位 */
+        int q4_0 = (byte4 >> 4) & 0x0F;
+        float val4_0 = (float)q4_0 * scale4 + bias4;
+        /* SQ8 对应值 */
+        float val8_0 = (float)codes8[i * 2] * scale8 + bias8;
+        float diff0 = val4_0 - val8_0;
+        sum += (double)diff0 * (double)diff0;
+
+        /* 解包 SQ4 低4位（检查边界） */
+        int idx1 = i * 2 + 1;
+        if (idx1 < dim) {
+            int q4_1 = byte4 & 0x0F;
+            float val4_1 = (float)q4_1 * scale4 + bias4;
+            float val8_1 = (float)codes8[idx1] * scale8 + bias8;
+            float diff1 = val4_1 - val8_1;
+            sum += (double)diff1 * (double)diff1;
+        }
+    }
+
+    return sum;
 }
 
 #endif
