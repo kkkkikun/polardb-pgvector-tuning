@@ -537,8 +537,66 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 			*out = value;
 		}
 
+	} else if (support->quantType == HNSW_QUANT_BQ) {
+		/* 纯 BQ 量化 */
+		if (fmt == HNSW_FMT_RAW_HALFVEC) {
+			HalfVector *halfvec = DatumGetHalfVector(value);
+			int			dim = halfvec->dim;
+			int			bq_bytes = (dim + 7) / 8;
+
+			Size payload_size = bq_bytes;
+			Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+			HnswQuantizeToPureBQ(halfvec, quantized_vec);
+			*out = PointerGetDatum(quantized_vec);
+
+		} else if (fmt == HNSW_FMT_RAW_FLOAT_VEC) {
+			Vector	   *vec = DatumGetVector(value);
+			int			dim = vec->dim;
+			int			bq_bytes = (dim + 7) / 8;
+
+			Size		payload_size = bq_bytes;
+			Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+			HnswQuantizeToPureBQFromFloat(vec, quantized_vec);
+			*out = PointerGetDatum(quantized_vec);
+
+		} else {
+			/* 未知格式：不量化 */
+			*out = value;
+		}
+
+	} else if (support->quantType == HNSW_QUANT_BQ_RERANK) {
+		/* BQ + Rerank 量化：存储 BQ + 原始 halfvec */
+		if (fmt == HNSW_FMT_RAW_HALFVEC) {
+			HalfVector *halfvec = DatumGetHalfVector(value);
+			int			dim = halfvec->dim;
+			int			bq_bytes = (dim + 7) / 8;
+
+			Size payload_size = bq_bytes + dim * sizeof(half);
+			Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+			HnswQuantizeToBQRerank(halfvec, quantized_vec);
+			*out = PointerGetDatum(quantized_vec);
+
+		} else if (fmt == HNSW_FMT_RAW_FLOAT_VEC) {
+			Vector	   *vec = DatumGetVector(value);
+			int			dim = vec->dim;
+			int			bq_bytes = (dim + 7) / 8;
+
+			Size		payload_size = bq_bytes + dim * sizeof(half);
+			Vector	   *quantized_vec = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+			HnswQuantizeToBQRerankFromFloat(vec, quantized_vec);
+			*out = PointerGetDatum(quantized_vec);
+
+		} else {
+			/* 未知格式：不量化 */
+			*out = value;
+		}
+
 	} else {
-		/* HNSW_QUANT_BQ 或其他：暂不实现，不量化 */
+		/* 其他未实现的量化类型：不量化 */
 		*out = value;
 	}
 
@@ -665,6 +723,16 @@ HnswGetDistance(Datum a, Datum b, HnswSupport * support)
 	/* 【SQ4】SQ4 vs SQ4（4-bit量化） */
 	if (tag_a == SQ4_TAG && tag_b == SQ4_TAG) {
 		return HnswSQ4Distance(a, b);
+	}
+
+	/* 【PURE_BQ】纯 BQ vs 纯 BQ（Hamming距离） */
+	if (tag_a == PURE_BQ_TAG && tag_b == PURE_BQ_TAG) {
+		return HnswPureBQDistance(a, b);
+	}
+
+	/* 【BQ_RERANK】BQ+Rerank vs BQ+Rerank（使用精排L2距离） */
+	if (tag_a == BQ_RERANK_TAG && tag_b == BQ_RERANK_TAG) {
+		return HnswBQRerankFineDistance(a, b);
 	}
 
 	/* 【次常见】SQ8 vs SQ8（兼容旧索引） */
@@ -1814,6 +1882,36 @@ hnsw_halfvec_sq4_support(PG_FUNCTION_ARGS)
 		.normalize = halfvec_l2_normalize,
 		.checkValue = NULL,
 		.quantType = HNSW_QUANT_SQ4
+	};
+
+	PG_RETURN_POINTER(&typeInfo);
+}
+
+/* 纯 BQ 量化支持函数 - 用于 halfvec_l2_bq_ops */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_halfvec_bq_support);
+Datum
+hnsw_halfvec_bq_support(PG_FUNCTION_ARGS)
+{
+	static const HnswTypeInfo typeInfo = {
+		.maxDimensions = HNSW_MAX_DIM * 2,
+		.normalize = halfvec_l2_normalize,
+		.checkValue = NULL,
+		.quantType = HNSW_QUANT_BQ
+	};
+
+	PG_RETURN_POINTER(&typeInfo);
+}
+
+/* BQ + Rerank 量化支持函数 - 用于 halfvec_l2_bqrerank_ops */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_halfvec_bqrerank_support);
+Datum
+hnsw_halfvec_bqrerank_support(PG_FUNCTION_ARGS)
+{
+	static const HnswTypeInfo typeInfo = {
+		.maxDimensions = HNSW_MAX_DIM * 2,
+		.normalize = halfvec_l2_normalize,
+		.checkValue = NULL,
+		.quantType = HNSW_QUANT_BQ_RERANK
 	};
 
 	PG_RETURN_POINTER(&typeInfo);

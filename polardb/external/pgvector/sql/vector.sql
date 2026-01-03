@@ -275,6 +275,12 @@ CREATE FUNCTION hnsw_halfvec_support(internal) RETURNS internal
 CREATE FUNCTION hnsw_halfvec_sq4_support(internal) RETURNS internal
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
+CREATE FUNCTION hnsw_halfvec_bq_support(internal) RETURNS internal
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION hnsw_halfvec_bqrerank_support(internal) RETURNS internal
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
 CREATE FUNCTION hnsw_bit_support(internal) RETURNS internal
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
@@ -656,6 +662,20 @@ CREATE OPERATOR CLASS halfvec_l2_sq4_ops
 	OPERATOR 1 <-> (halfvec, halfvec) FOR ORDER BY float_ops,
 	FUNCTION 1 halfvec_l2_squared_distance(halfvec, halfvec),
 	FUNCTION 3 hnsw_halfvec_sq4_support(internal);
+
+-- Pure BQ quantization operator class for HNSW (Binary Quantization)
+CREATE OPERATOR CLASS halfvec_l2_bq_ops
+	FOR TYPE halfvec USING hnsw AS
+	OPERATOR 1 <-> (halfvec, halfvec) FOR ORDER BY float_ops,
+	FUNCTION 1 halfvec_l2_squared_distance(halfvec, halfvec),
+	FUNCTION 3 hnsw_halfvec_bq_support(internal);
+
+-- BQ + Rerank operator class for HNSW (BQ coarse + halfvec fine)
+CREATE OPERATOR CLASS halfvec_l2_bqrerank_ops
+	FOR TYPE halfvec USING hnsw AS
+	OPERATOR 1 <-> (halfvec, halfvec) FOR ORDER BY float_ops,
+	FUNCTION 1 halfvec_l2_squared_distance(halfvec, halfvec),
+	FUNCTION 3 hnsw_halfvec_bqrerank_support(internal);
 
 -- bit functions
 

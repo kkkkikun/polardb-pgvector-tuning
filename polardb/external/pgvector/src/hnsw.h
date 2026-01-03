@@ -252,7 +252,8 @@ typedef enum HnswQuantType
 	HNSW_QUANT_NONE = 0,   /* 不量化，保留原始格式 */
 	HNSW_QUANT_HYBRID,     /* BQ+SQ8 混合量化 (当前默认) */
 	HNSW_QUANT_SQ4,        /* SQ4 4-bit 量化 */
-	HNSW_QUANT_BQ          /* 纯 Binary Quantization */
+	HNSW_QUANT_BQ,         /* 纯 Binary Quantization */
+	HNSW_QUANT_BQ_RERANK   /* BQ + 原始 halfvec 精排 */
 } HnswQuantType;
 
 typedef struct HnswTypeInfo
@@ -544,6 +545,12 @@ typedef struct HnswSQ8Payload {
 /* SQ4 量化标记：4-bit 量化 */
 #define SQ4_TAG 0x5134  /* 'Q4' - SQ4 量化标记 */
 
+/* 纯 BQ 量化标记：Binary Quantization */
+#define PURE_BQ_TAG 0x5042  /* 'PB' - Pure BQ 量化标记 */
+
+/* BQ + Rerank 量化标记：BQ 粗筛 + 原始 halfvec 精排 */
+#define BQ_RERANK_TAG 0x5252  /* 'RR' - BQ Rerank 量化标记 */
+
 /* HNSW值格式枚举 */
 typedef enum
 {
@@ -552,6 +559,8 @@ typedef enum
 	HNSW_FMT_SQ8,              /* SQ8量化：scale(4) + bias(4) + codes(dim) */
 	HNSW_FMT_HYBRID,           /* 混合量化：bq_bytes(2) + bq_data + scale(4) + bias(4) + sq8_codes */
 	HNSW_FMT_SQ4,              /* SQ4量化：scale(4) + bias(4) + packed_codes(dim/2) */
+	HNSW_FMT_PURE_BQ,          /* 纯BQ量化：bq_data((dim+7)/8) */
+	HNSW_FMT_BQ_RERANK,        /* BQ+Rerank：bq_data + halfvec原始数据 */
 	HNSW_FMT_UNKNOWN           /* 未知格式：bit, sparsevec等其他类型 */
 } HnswValueFormat;
 
@@ -626,6 +635,29 @@ HnswDetectFormat(Datum d)
 			Vector *v = (Vector *)p;
 			if (v->unused == SQ4_TAG) {
 				return HNSW_FMT_SQ4;
+			}
+		}
+	}
+
+	/* 纯BQ量化：payload == (dim+7)/8 (仅bq_data) */
+	{
+		int bq_bytes = (dim + 7) / 8;
+		if (payload == bq_bytes) {
+			Vector *v = (Vector *)p;
+			if (v->unused == PURE_BQ_TAG) {
+				return HNSW_FMT_PURE_BQ;
+			}
+		}
+	}
+
+	/* BQ+Rerank量化：payload == (dim+7)/8 + dim*2 (bq_data + halfvec) */
+	{
+		int bq_bytes = (dim + 7) / 8;
+		int bq_rerank_payload = bq_bytes + dim * sizeof(half);
+		if (payload == bq_rerank_payload) {
+			Vector *v = (Vector *)p;
+			if (v->unused == BQ_RERANK_TAG) {
+				return HNSW_FMT_BQ_RERANK;
 			}
 		}
 	}
@@ -1007,6 +1039,215 @@ HnswQuantizeToSQ4FromFloat(Vector *src, Vector *dest)
     dest->dim = dim;
     dest->unused = SQ4_TAG;
     SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) + sizeof(float)*2 + packed_bytes);
+}
+
+/*
+ * 纯 BQ 量化函数：Binary Quantization
+ * 内存布局: [bq_data:(dim+7)/8]
+ * 每维 1 bit，按符号位量化（>0 为 1，<=0 为 0）
+ * 768维 -> 96 bytes (压缩比 32:1)
+ * 128维 -> 16 bytes
+ */
+static inline void
+HnswQuantizeToPureBQ(HalfVector *src, Vector *dest)
+{
+    int dim = src->dim;
+    int bq_bytes = (dim + 7) / 8;
+    half *hdata = src->x;
+
+    uint8_t *bq_ptr = (uint8_t *)dest->x;
+    memset(bq_ptr, 0, bq_bytes);
+
+    /* 符号位量化：正数 -> 1，非正数 -> 0 */
+    for (int i = 0; i < dim; i++) {
+        float val = HalfToFloat4(hdata[i]);
+        if (val > 0) {
+            bq_ptr[i / 8] |= (1 << (7 - (i % 8)));
+        }
+    }
+
+    dest->dim = dim;
+    dest->unused = PURE_BQ_TAG;
+    SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) + bq_bytes);
+}
+
+/* 从 Float Vector 生成纯 BQ 量化 */
+static inline void
+HnswQuantizeToPureBQFromFloat(Vector *src, Vector *dest)
+{
+    int dim = src->dim;
+    int bq_bytes = (dim + 7) / 8;
+    float *fdata = src->x;
+
+    uint8_t *bq_ptr = (uint8_t *)dest->x;
+    memset(bq_ptr, 0, bq_bytes);
+
+    /* 符号位量化：正数 -> 1，非正数 -> 0 */
+    for (int i = 0; i < dim; i++) {
+        float val = fdata[i];
+        if (val > 0) {
+            bq_ptr[i / 8] |= (1 << (7 - (i % 8)));
+        }
+    }
+
+    dest->dim = dim;
+    dest->unused = PURE_BQ_TAG;
+    SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) + bq_bytes);
+}
+
+/*
+ * 纯 BQ 距离计算：使用 Hamming 距离
+ * 返回归一化距离 [0.0, 1.0]，其中 0 = 完全相同，1 = 完全不同
+ */
+static inline double
+HnswPureBQDistance(Datum a, Datum b)
+{
+    Vector *va = (Vector *) PG_DETOAST_DATUM_PACKED(a);
+    Vector *vb = (Vector *) PG_DETOAST_DATUM_PACKED(b);
+
+    Assert(va->unused == PURE_BQ_TAG && vb->unused == PURE_BQ_TAG);
+    Assert(va->dim == vb->dim);
+
+    int dim = va->dim;
+    int bq_bytes = (dim + 7) / 8;
+
+    uint8_t *bq_a = (uint8_t *)va->x;
+    uint8_t *bq_b = (uint8_t *)vb->x;
+
+    /* 计算 Hamming 距离 */
+    uint64_t hamming = 0;
+    for (int i = 0; i < bq_bytes; i++) {
+        hamming += __builtin_popcount(bq_a[i] ^ bq_b[i]);
+    }
+
+    /* 归一化到 [0, 1] */
+    return (double)hamming / (double)dim;
+}
+
+/*
+ * BQ + Rerank 量化函数
+ * 内存布局: [bq_data:(dim+7)/8][halfvec_data:dim*2]
+ * 768维 -> 96 + 1536 = 1632 bytes
+ * 128维 -> 16 + 256 = 272 bytes
+ */
+static inline void
+HnswQuantizeToBQRerank(HalfVector *src, Vector *dest)
+{
+    int dim = src->dim;
+    int bq_bytes = (dim + 7) / 8;
+    half *hdata = src->x;
+
+    char *buffer = (char *)dest->x;
+
+    /* BQ 数据区 */
+    uint8_t *bq_ptr = (uint8_t *)buffer;
+    memset(bq_ptr, 0, bq_bytes);
+
+    /* 符号位量化：正数 -> 1，非正数 -> 0 */
+    for (int i = 0; i < dim; i++) {
+        float val = HalfToFloat4(hdata[i]);
+        if (val > 0) {
+            bq_ptr[i / 8] |= (1 << (7 - (i % 8)));
+        }
+    }
+    buffer += bq_bytes;
+
+    /* 原始 halfvec 数据 */
+    memcpy(buffer, hdata, dim * sizeof(half));
+
+    dest->dim = dim;
+    dest->unused = BQ_RERANK_TAG;
+    SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) + bq_bytes + dim * sizeof(half));
+}
+
+/* 从 Float Vector 生成 BQ + Rerank 量化 */
+static inline void
+HnswQuantizeToBQRerankFromFloat(Vector *src, Vector *dest)
+{
+    int dim = src->dim;
+    int bq_bytes = (dim + 7) / 8;
+    float *fdata = src->x;
+
+    char *buffer = (char *)dest->x;
+
+    /* BQ 数据区 */
+    uint8_t *bq_ptr = (uint8_t *)buffer;
+    memset(bq_ptr, 0, bq_bytes);
+
+    /* 符号位量化 + 转换为 half */
+    for (int i = 0; i < dim; i++) {
+        float val = fdata[i];
+        if (val > 0) {
+            bq_ptr[i / 8] |= (1 << (7 - (i % 8)));
+        }
+    }
+    buffer += bq_bytes;
+
+    /* 转换并存储 halfvec 数据 */
+    half *half_ptr = (half *)buffer;
+    for (int i = 0; i < dim; i++) {
+        half_ptr[i] = Float4ToHalf(fdata[i]);
+    }
+
+    dest->dim = dim;
+    dest->unused = BQ_RERANK_TAG;
+    SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) + bq_bytes + dim * sizeof(half));
+}
+
+/*
+ * BQ Rerank 的 BQ 粗筛距离（Hamming）
+ */
+static inline double
+HnswBQRerankCoarseDistance(Datum a, Datum b)
+{
+    Vector *va = (Vector *) PG_DETOAST_DATUM_PACKED(a);
+    Vector *vb = (Vector *) PG_DETOAST_DATUM_PACKED(b);
+
+    Assert(va->unused == BQ_RERANK_TAG && vb->unused == BQ_RERANK_TAG);
+    Assert(va->dim == vb->dim);
+
+    int dim = va->dim;
+    int bq_bytes = (dim + 7) / 8;
+
+    uint8_t *bq_a = (uint8_t *)va->x;
+    uint8_t *bq_b = (uint8_t *)vb->x;
+
+    /* 计算 Hamming 距离 */
+    uint64_t hamming = 0;
+    for (int i = 0; i < bq_bytes; i++) {
+        hamming += __builtin_popcount(bq_a[i] ^ bq_b[i]);
+    }
+
+    return (double)hamming;
+}
+
+/*
+ * BQ Rerank 的精排距离（使用原始 halfvec 计算 L2）
+ */
+static inline double
+HnswBQRerankFineDistance(Datum a, Datum b)
+{
+    Vector *va = (Vector *) PG_DETOAST_DATUM_PACKED(a);
+    Vector *vb = (Vector *) PG_DETOAST_DATUM_PACKED(b);
+
+    Assert(va->unused == BQ_RERANK_TAG && vb->unused == BQ_RERANK_TAG);
+    Assert(va->dim == vb->dim);
+
+    int dim = va->dim;
+    int bq_bytes = (dim + 7) / 8;
+
+    /* halfvec 数据在 BQ 数据之后 */
+    half *half_a = (half *)((char *)va->x + bq_bytes);
+    half *half_b = (half *)((char *)vb->x + bq_bytes);
+
+    /* 计算 L2 距离 */
+    double sum = 0.0;
+    for (int i = 0; i < dim; i++) {
+        float diff = HalfToFloat4(half_a[i]) - HalfToFloat4(half_b[i]);
+        sum += diff * diff;
+    }
+
+    return sum;
 }
 
 /*

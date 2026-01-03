@@ -106,7 +106,8 @@ GetScanValue(IndexScanDesc scan)
 		HnswValueFormat fmt = HnswDetectFormat(value);
 
 		/* 已经是量化格式，无需重复量化 */
-		if (fmt == HNSW_FMT_SQ8 || fmt == HNSW_FMT_HYBRID || fmt == HNSW_FMT_SQ4) {
+		if (fmt == HNSW_FMT_SQ8 || fmt == HNSW_FMT_HYBRID || fmt == HNSW_FMT_SQ4 ||
+		    fmt == HNSW_FMT_PURE_BQ || fmt == HNSW_FMT_BQ_RERANK) {
 			elog(DEBUG1, "Query vector is already quantized, skipping quantization");
 			return value;
 		}
@@ -161,8 +162,57 @@ GetScanValue(IndexScanDesc scan)
 				HnswQuantizeToSQ4FromFloat(query_vec, quantized_query);
 				value = PointerGetDatum(quantized_query);
 			}
+
+		} else if (so->support.quantType == HNSW_QUANT_BQ) {
+			/* 纯 BQ 量化 */
+			if (fmt == HNSW_FMT_RAW_HALFVEC) {
+				HalfVector *halfvec = DatumGetHalfVector(value);
+				int			dim = halfvec->dim;
+				int			bq_bytes = (dim + 7) / 8;
+
+				Size payload_size = bq_bytes;
+				Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+				HnswQuantizeToPureBQ(halfvec, quantized_query);
+				value = PointerGetDatum(quantized_query);
+
+			} else if (fmt == HNSW_FMT_RAW_FLOAT_VEC) {
+				Vector	   *query_vec = DatumGetVector(value);
+				int			dim = query_vec->dim;
+				int			bq_bytes = (dim + 7) / 8;
+
+				Size		payload_size = bq_bytes;
+				Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+				HnswQuantizeToPureBQFromFloat(query_vec, quantized_query);
+				value = PointerGetDatum(quantized_query);
+			}
+
+		} else if (so->support.quantType == HNSW_QUANT_BQ_RERANK) {
+			/* BQ + Rerank 量化 */
+			if (fmt == HNSW_FMT_RAW_HALFVEC) {
+				HalfVector *halfvec = DatumGetHalfVector(value);
+				int			dim = halfvec->dim;
+				int			bq_bytes = (dim + 7) / 8;
+
+				Size payload_size = bq_bytes + dim * sizeof(half);
+				Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+				HnswQuantizeToBQRerank(halfvec, quantized_query);
+				value = PointerGetDatum(quantized_query);
+
+			} else if (fmt == HNSW_FMT_RAW_FLOAT_VEC) {
+				Vector	   *query_vec = DatumGetVector(value);
+				int			dim = query_vec->dim;
+				int			bq_bytes = (dim + 7) / 8;
+
+				Size		payload_size = bq_bytes + dim * sizeof(half);
+				Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+
+				HnswQuantizeToBQRerankFromFloat(query_vec, quantized_query);
+				value = PointerGetDatum(quantized_query);
+			}
 		}
-		/* HNSW_QUANT_BQ 或其他：暂不实现 */
 	}
 
 	return value;
