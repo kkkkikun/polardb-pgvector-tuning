@@ -806,12 +806,12 @@ InitVisited(char *base, visited_hash * v, bool inMemory, int ef, int m)
 	if (inMemory)
 	{
 		/* Fixed large size for building to minimize/eliminate resizing */
-		initial_size = ef * m * 2;  /* Can hold ~29491 nodes before resize */
+		initial_size = ef * m * 16;  /* Can hold ~29491 nodes before resize */
 	}
 	else
 	{
 		/* Dynamic size for queries based on ef_search */
-		initial_size = ef * m * 8;
+		initial_size = ef * m * 2;
 	}
 
 	if (!inMemory)
