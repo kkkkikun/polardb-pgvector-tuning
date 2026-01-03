@@ -1226,9 +1226,10 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 				 * 使用 Hamming 距离的绝对阈值，而不是与 L2 距离比较
 				 * 阈值 = dim * BQ_THRESHOLD_RATIO（可调参数）
 				 */
-#define BQ_THRESHOLD_RATIO 0.42  /* 经验值，可根据测试结果调整 */
+#define BQ_THRESHOLD_RATIO 0.30  /* 经验值，可根据测试结果调整 */
+#define BQ_COARSE_FILTER_ENABLED 1  /* 0=禁用BQ粗筛, 1=启用 */
 
-				if (!alwaysAdd && elemVec->unused == HYBRID_TAG) {
+				if (BQ_COARSE_FILTER_ENABLED && !alwaysAdd && elemVec->unused == HYBRID_TAG) {
 					Vector *queryVec = (Vector *) PG_DETOAST_DATUM_PACKED(q->value);
 					if (queryVec->unused == HYBRID_TAG) {
 						int dim = elemVec->dim;
