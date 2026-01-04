@@ -1077,6 +1077,13 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		if (tuples != NULL)
 			(*tuples) += unvisitedLength;
 
+		/* ==========================================================
+		 * 【Early Termination 优化】
+		 * 记录连续被拒绝的候选数，用于提前终止内循环
+		 * ========================================================== */
+		int consecutiveRejections = 0;
+		const int maxConsecutiveRejections = 3; /* 连续3个被拒绝则停止 */
+
 		for (int i = 0; i < unvisitedLength; i++)
 		{
 			HnswElement eElement;
@@ -1147,8 +1154,18 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 					pairingheap_add(*discarded, &e->w_node);
 				}
 
+				/* 【Early Termination】候选被拒绝，增加计数 */
+				consecutiveRejections++;
+
+				/* 当已找到足够候选且连续被拒绝时，提前终止内循环 */
+				if (!alwaysAdd && consecutiveRejections >= maxConsecutiveRejections)
+					break;
+
 				continue;
 			}
+
+			/* 【Early Termination】候选被接受，重置计数 */
+			consecutiveRejections = 0;
 
 			/* Make robust to issues */
 			if (eElement->level < lc)
