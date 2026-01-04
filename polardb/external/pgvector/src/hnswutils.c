@@ -1078,11 +1078,20 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			(*tuples) += unvisitedLength;
 
 		/* ==========================================================
-		 * 【Early Termination 优化】
-		 * 记录连续被拒绝的候选数，用于提前终止内循环
+		 * 【Early Termination 优化 - 动态阈值】
+		 * 根据 ef 值动态调整阈值，针对 ef=80~100 场景优化
+		 * - ef <= 50:   阈值=3（小ef可以激进）
+		 * - 50 < ef <= 120: 阈值=5（中等ef需保守）
+		 * - ef > 120:   阈值=4（大ef适度激进）
 		 * ========================================================== */
 		int consecutiveRejections = 0;
-		const int maxConsecutiveRejections = 3; /* 连续3个被拒绝则停止 */
+		// int maxConsecutiveRejections;
+		// if (ef <= 50)
+		// 	maxConsecutiveRejections = 3;
+		// else if (ef <= 120)
+		// 	maxConsecutiveRejections = 5;  /* 针对 ef=80~100 更保守 */
+		// else
+		// 	maxConsecutiveRejections = 4;
 
 		for (int i = 0; i < unvisitedLength; i++)
 		{
@@ -1158,7 +1167,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 				consecutiveRejections++;
 
 				/* 当已找到足够候选且连续被拒绝时，提前终止内循环 */
-				if (!alwaysAdd && consecutiveRejections >= maxConsecutiveRejections)
+				if (!alwaysAdd && consecutiveRejections >= 5)
 					break;
 
 				continue;
