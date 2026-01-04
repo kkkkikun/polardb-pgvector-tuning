@@ -121,6 +121,17 @@ hash_offset(Size offset)
 #define SH_DEFINE
 #include "lib/simplehash.h"
 
+/* Vdist cache hash table - 论文算法7 */
+#define SH_PREFIX		vdisthash
+#define SH_ELEMENT_TYPE	VdistHashEntry
+#define SH_KEY_TYPE		uintptr_t
+#define	SH_KEY			ptr
+#define SH_HASH_KEY(tb, key)	hash_pointer(key)
+#define SH_EQUAL(tb, a, b)		(a == b)
+#define	SH_SCOPE		extern
+#define SH_DEFINE
+#include "lib/simplehash.h"
+
 /*
  * Get the max number of connections in an upper layer for each element in the index
  */
@@ -373,6 +384,34 @@ HnswGetEntryPoint(Relation index)
 }
 
 /*
+ * 从metapage读取全局量化器信息
+ */
+void
+HnswGetGlobalQuantizerFromMeta(Relation index, HnswGlobalQuantizer *gq)
+{
+	Buffer		buf;
+	Page		page;
+	HnswMetaPage metap;
+
+	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	metap = HnswPageGetMeta(page);
+
+	if (unlikely(metap->magicNumber != HNSW_MAGIC_NUMBER))
+		elog(ERROR, "hnsw index is not valid");
+
+	gq->global_min = metap->gq_global_min;
+	gq->global_max = metap->gq_global_max;
+	gq->scale = metap->gq_scale;
+	gq->initialized = metap->gq_initialized;
+	gq->dim = metap->dimensions;
+	gq->scale_sq = gq->scale * gq->scale;
+
+	UnlockReleaseBuffer(buf);
+}
+
+/*
  * Update the metapage info
  */
 static void
@@ -606,37 +645,49 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
  *
  * 【性能优化】优化分支预测，使用likely()减少分支预测失败
  * 零分配的距离计算，显著提升性能
+ * 支持SQ8、SQ16、halfvec和原始vector格式
  */
 static inline double
 HnswGetDistance(Datum a, Datum b, HnswSupport * support)
 {
-	/* 【优化】使用更快速的SQ8检测 - 直接检查unused字段避免复杂计算 */
+	/* 【优化】使用更快速的格式检测 - 直接检查unused字段 */
 	Vector *va = (Vector *) PG_DETOAST_DATUM_PACKED(a);
 	Vector *vb = (Vector *) PG_DETOAST_DATUM_PACKED(b);
 
 	bool a_sq8 = (va->unused == SQ8_TAG);
 	bool b_sq8 = (vb->unused == SQ8_TAG);
+	bool a_sq16 = (va->unused == SQ16_TAG);
+	bool b_sq16 = (vb->unused == SQ16_TAG);
 
-	/* 【优化】最常见情况优先：SQ8 vs SQ8（索引内部比较） */
+	/* 【优化】最常见情况优先：SQ16 vs SQ16（全局量化索引内部比较） */
+	if (likely(a_sq16 && b_sq16)) {
+		return HnswSQ16DistanceAuto(a, b);
+	}
+
+	/* 【优化】SQ8 vs SQ8（per-vector量化索引内部比较） */
 	if (likely(a_sq8 && b_sq8)) {
-		/* case 1: SQ8 vs SQ8 - 使用零分配优化版本 */
 		return HnswSQ8Distance(a, b);
 	}
 
-	/* 【优化】次常见情况：原始 vs 原始（纯原始数据比较） */
-	if (likely(!a_sq8 && !b_sq8)) {
-		/* case 2: 原始 vs 原始 - 使用标准距离函数 */
+	/* 【优化】原始 vs 原始（纯原始数据比较） */
+	if (likely(!a_sq8 && !b_sq8 && !a_sq16 && !b_sq16)) {
 		return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
 	}
 
-	/* 【较少情况】混合类型：SQ8 vs halfvec（查询时发生） */
+	/* 【混合类型】SQ16 vs halfvec（查询时发生） */
+	if (a_sq16) {
+		return HnswSQ16HalfvecDistance(a, b);
+	}
+	if (b_sq16) {
+		return HnswSQ16HalfvecDistance(b, a);
+	}
+
+	/* 【混合类型】SQ8 vs halfvec（查询时发生） */
 	if (a_sq8) {
-		/* a=SQ8, b=halfvec - 使用零分配混合距离 */
 		Vector *sq8_vec = (Vector *) PG_DETOAST_DATUM_PACKED(a);
 		HalfVector *half_vec = (HalfVector *) PG_DETOAST_DATUM_PACKED(b);
 		return (double)HnswSQ8HalfvecDistance2(sq8_vec, half_vec);
 	} else {
-		/* b=SQ8, a=halfvec - 使用零分配混合距离 */
 		Vector *sq8_vec = (Vector *) PG_DETOAST_DATUM_PACKED(b);
 		HalfVector *half_vec = (HalfVector *) PG_DETOAST_DATUM_PACKED(a);
 		return (double)HnswSQ8HalfvecDistance2(sq8_vec, half_vec);
@@ -670,7 +721,6 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
         else
         {
             /* 从 HnswElementTuple 的 data 字段构造正确的 Datum */
-            /* 注意：etup->data 是一个 Vector 结构体，不是指针 */
             Datum       index_datum = PointerGetDatum(&etup->data);
 
             /* 使用统一的距离计算函数，它会自动判断 SQ8 vs 原始数据 */
@@ -703,12 +753,44 @@ HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation i
 
 /*
  * Get the distance for an element
+ * 论文算法7: 使用Vdist缓存共享距离计算结果
  */
 static double
 GetElementDistance(char *base, HnswElement element, HnswQuery * q, HnswSupport * support)
 {
-	Datum		value = HnswGetValue(base, element);
+	uintptr_t	key;
+	double		distance;
 
+	/* 【Vdist优化 - 算法7】检查距离缓存 */
+	if (q->vdist_cache != NULL)
+	{
+		vdisthash_hash *cache = (vdisthash_hash *) q->vdist_cache;
+		VdistHashEntry *entry;
+		bool		found;
+
+		/* 使用element指针作为key */
+		key = (uintptr_t) element;
+		entry = vdisthash_lookup(cache, key);
+
+		if (entry != NULL)
+		{
+			/* 缓存命中，直接返回 */
+			return (double) entry->distance;
+		}
+
+		/* 缓存未命中，计算距离 */
+		Datum value = HnswGetValue(base, element);
+		distance = HnswGetDistance(q->value, value, support);
+
+		/* 存入缓存 */
+		entry = vdisthash_insert(cache, key, &found);
+		entry->distance = (float) distance;
+
+		return distance;
+	}
+
+	/* 无缓存，直接计算 */
+	Datum value = HnswGetValue(base, element);
 	return HnswGetDistance(q->value, value, support);
 }
 
@@ -1122,6 +1204,29 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			if (inMemory)
 			{
 				eElement = unvisited[i].element;
+
+				/* 【AQD优化 - 算法8】使用AQD下界过滤候选点 */
+				if (q->aqd_table != NULL && !alwaysAdd)
+				{
+					/* 获取候选点的SQ16编码 */
+					Datum eValue = HnswGetValue(base, eElement);
+					HnswValueFormat fmt = HnswDetectFormat(eValue);
+
+					if (fmt == HNSW_FMT_SQ16)
+					{
+						Vector *vec = (Vector *) DatumGetPointer(eValue);
+						int dim = vec->dim;
+						char *vec_buf = (char *)vec->x;
+						uint16_t *codes = (uint16_t *)(vec_buf + 2 * sizeof(float));
+
+						float aqd = HnswComputeAQD(codes, q->aqd_table, dim);
+
+						/* 如果AQD下界 > 当前最远距离，跳过 */
+						if (aqd > f->distance)
+							continue;
+					}
+				}
+
 				eDistance = GetElementDistance(base, eElement, q, support);
 			}
 			else
@@ -1514,9 +1619,10 @@ PrecomputeHash(char *base, HnswElement element)
 
 /*
  * Algorithm 1 from paper
+ * 增强：论文算法7 - Vdist共享距离计算结果
  */
 void
-HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing)
+HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing, HnswGlobalQuantizer *gq)
 {
 	List	   *ep;
 	List	   *w;
@@ -1525,8 +1631,47 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 	HnswQuery	q;
 	HnswElement skipElement = existing ? element : NULL;
 	bool		inMemory = index == NULL;
+	vdisthash_hash *vdist_cache = NULL;
 
 	q.value = HnswGetValue(base, element);
+	q.gq = gq;
+
+	/* 【AQD优化 - 算法8】临时禁用以调试recall问题 */
+	/* TODO: AQD的SQ16→SQ8转换可能破坏下界性质，需要重新设计 */
+	q.aqd_table = NULL;
+#if 0
+	if (gq != NULL && gq->initialized && inMemory)
+	{
+		/* 从SQ16格式的值中提取原始halfvec来构建AQD表 */
+		HnswValueFormat fmt = HnswDetectFormat(q.value);
+		if (fmt == HNSW_FMT_SQ16)
+		{
+			q.aqd_table = (HnswAQDTable *) palloc(sizeof(HnswAQDTable));
+			HnswBuildAQDTableFromSQ16(q.value, gq, q.aqd_table);
+		}
+		else
+		{
+			q.aqd_table = NULL;
+		}
+	}
+	else
+	{
+		q.aqd_table = NULL;
+	}
+#endif
+
+	/* 【Vdist优化 - 算法7】创建距离缓存哈希表
+	 * 该缓存跨所有层共享，避免重复计算距离 */
+	if (inMemory)
+	{
+		/* 初始大小设为 efConstruction * m，足够容纳大多数情况 */
+		vdist_cache = vdisthash_create(CurrentMemoryContext, efConstruction * m * 2, NULL);
+		q.vdist_cache = vdist_cache;
+	}
+	else
+	{
+		q.vdist_cache = NULL;
+	}
 
 	/* Precompute hash */
 	if (inMemory)
@@ -1534,7 +1679,11 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 
 	/* No neighbors if no entry point */
 	if (entryPoint == NULL)
+	{
+		if (vdist_cache != NULL)
+			vdisthash_destroy(vdist_cache);
 		return;
+	}
 
 	/* Get entry point and level */
 	ep = list_make1(HnswEntryCandidate(base, entryPoint, &q, index, support, true));
@@ -1592,6 +1741,14 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 
 		ep = w;
 	}
+
+	/* 【AQD优化 - 算法8】释放AQD表 */
+	if (q.aqd_table != NULL)
+		pfree(q.aqd_table);
+
+	/* 【Vdist优化 - 算法7】销毁距离缓存 */
+	if (vdist_cache != NULL)
+		vdisthash_destroy(vdist_cache);
 }
 
 PGDLLEXPORT Datum l2_normalize(PG_FUNCTION_ARGS);

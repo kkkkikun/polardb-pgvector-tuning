@@ -100,6 +100,13 @@ CreateMetaPage(HnswBuildState * buildstate)
 	metap->entryOffno = InvalidOffsetNumber;
 	metap->entryLevel = -1;
 	metap->insertPage = InvalidBlockNumber;
+
+	/* 写入全局量化器信息（用于AQD查表过滤） */
+	metap->gq_global_min = buildstate->gq.global_min;
+	metap->gq_global_max = buildstate->gq.global_max;
+	metap->gq_scale = buildstate->gq.scale;
+	metap->gq_initialized = buildstate->gq.initialized;
+
 	((PageHeader) page)->pd_lower =
 		((char *) metap + sizeof(HnswMetaPageData)) - (char *) page;
 
@@ -462,8 +469,10 @@ InsertTupleInMemory(HnswBuildState * buildstate, HnswElement element)
 		entryPoint = HnswPtrAccess(base, graph->entryPoint);
 	}
 
-	/* Find neighbors for element */
-	HnswFindElementNeighbors(base, element, entryPoint, NULL, support, m, efConstruction, false);
+	/* Find neighbors for element
+	 * 传递全局量化器用于AQD优化（算法8） */
+	HnswFindElementNeighbors(base, element, entryPoint, NULL, support, m, efConstruction, false,
+							 buildstate->useGlobalQuantization ? &buildstate->gq : NULL);
 
 	/* Update graph in memory */
 	UpdateGraphInMemory(support, element, m, entryPoint, buildstate);
@@ -487,10 +496,43 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	LWLock	   *flushLock = &graph->flushLock;
 	char	   *base = buildstate->hnswarea;
 	Datum		value;
+	Vector	   *sq16_vec = NULL;
 
-	/* Form index value */
-	if (!HnswFormIndexValue(&value, values, isnull, buildstate->typeInfo, support))
-		return false;
+	/*
+	 * HNSW_SSQ: 使用全局量化器进行SQ16量化
+	 */
+	if (buildstate->useGlobalQuantization && buildstate->gq.initialized)
+	{
+		Datum rawValue = PointerGetDatum(PG_DETOAST_DATUM(values[0]));
+		HnswValueFormat fmt = HnswDetectFormat(rawValue);
+
+		if (fmt == HNSW_FMT_RAW_HALFVEC)
+		{
+			HalfVector *hv = DatumGetHalfVector(rawValue);
+			int dim = hv->dim;
+
+			/* 分配SQ16向量（payload = global_min + scale + dim*2 bytes） */
+			Size payload_size = 2 * sizeof(float) + dim * sizeof(uint16_t);
+			sq16_vec = (Vector *) palloc0(VARHDRSZ + sizeof(int16) + sizeof(uint16) + payload_size);
+
+			/* 使用全局量化器进行SQ16量化 */
+			HnswQuantizeToSQ16(hv, sq16_vec, &buildstate->gq);
+
+			value = PointerGetDatum(sq16_vec);
+		}
+		else
+		{
+			/* 非halfvec格式，使用原有逻辑 */
+			if (!HnswFormIndexValue(&value, values, isnull, buildstate->typeInfo, support))
+				return false;
+		}
+	}
+	else
+	{
+		/* 不使用全局量化，使用原有的per-vector量化 */
+		if (!HnswFormIndexValue(&value, values, isnull, buildstate->typeInfo, support))
+			return false;
+	}
 
 	/* Get datum size */
 	valueSize = VARSIZE_ANY(DatumGetPointer(value));
@@ -563,6 +605,52 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	LWLockRelease(flushLock);
 
 	return true;
+}
+
+/*
+ * 统计回调函数（HNSW_SSQ第一遍扫描）
+ * 收集全局min/max用于区间对齐量化
+ */
+static void
+StatsCallback(Relation index, ItemPointer tid, Datum *values,
+			  bool *isnull, bool tupleIsAlive, void *state)
+{
+	HnswBuildState *buildstate = (HnswBuildState *) state;
+
+	/* Skip nulls */
+	if (isnull[0])
+		return;
+
+	/* 必须先完全解压datum（可能是TOAST压缩的） */
+	Datum rawValue = PointerGetDatum(PG_DETOAST_DATUM(values[0]));
+	HnswValueFormat fmt = HnswDetectFormat(rawValue);
+
+	if (fmt == HNSW_FMT_RAW_HALFVEC)
+	{
+		HalfVector *hv = DatumGetHalfVector(rawValue);
+		HnswGlobalQuantizerUpdate(&buildstate->gq, hv);
+	}
+	else if (fmt == HNSW_FMT_RAW_FLOAT_VEC)
+	{
+		/* 对于float vector，直接统计float值 */
+		Vector *vec = DatumGetVector(rawValue);
+		int dim = vec->dim;
+		float *data = vec->x;
+
+		for (int i = 0; i < dim; i++)
+		{
+			float val = data[i];
+			/* 更新全局最小值和最大值 */
+			if (val < buildstate->gq.global_min)
+			{
+				buildstate->gq.global_min = val;
+			}
+			if (val > buildstate->gq.global_max)
+			{
+				buildstate->gq.global_max = val;
+			}
+		}
+	}
 }
 
 /*
@@ -720,6 +808,15 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	buildstate->hnswleader = NULL;
 	buildstate->hnswshared = NULL;
 	buildstate->hnswarea = NULL;
+
+	/* 初始化全局量化器 (HNSW_SSQ) */
+	buildstate->useGlobalQuantization = buildstate->support.allowQuantization;
+	buildstate->gqStatsPhase = false;
+	if (buildstate->useGlobalQuantization)
+	{
+		HnswGlobalQuantizerInit(&buildstate->gq, buildstate->dimensions);
+		elog(DEBUG1, "HNSW_SSQ: Global quantizer initialized for %d dimensions", buildstate->dimensions);
+	}
 }
 
 /*
@@ -783,6 +880,20 @@ HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnsw
 	buildstate.graph = &hnswshared->graphData;
 	buildstate.hnswarea = hnswarea;
 	InitAllocator(&buildstate.allocator, &HnswSharedMemoryAlloc, &buildstate);
+
+	/* 从共享内存恢复全局量化器参数 - HNSW_SSQ */
+	buildstate.useGlobalQuantization = hnswshared->useGlobalQuantization;
+	if (hnswshared->gq_initialized)
+	{
+		buildstate.gq.global_min = hnswshared->gq_global_min;
+		buildstate.gq.global_max = hnswshared->gq_global_max;
+		buildstate.gq.scale = hnswshared->gq_scale;
+		buildstate.gq.scale_sq = hnswshared->gq_scale_sq;
+		buildstate.gq.dim = hnswshared->gq_dim;
+		buildstate.gq.initialized = hnswshared->gq_initialized;
+		elog(DEBUG1, "HNSW_SSQ: Worker received global quantizer: global_min=%.6f, global_max=%.6f, scale=%.10f",
+			 buildstate.gq.global_min, buildstate.gq.global_max, buildstate.gq.scale);
+	}
 	scan = table_beginscan_parallel(heapRel,
 									ParallelTableScanFromHnswShared(hnswshared));
 	reltuples = table_index_build_scan(heapRel, indexRel, indexInfo,
@@ -979,6 +1090,24 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
 								  ParallelTableScanFromHnswShared(hnswshared),
 								  snapshot);
 
+	/* 共享全局量化器参数给并行workers - HNSW_SSQ */
+	hnswshared->useGlobalQuantization = buildstate->useGlobalQuantization;
+	if (buildstate->useGlobalQuantization && buildstate->gq.initialized)
+	{
+		hnswshared->gq_global_min = buildstate->gq.global_min;
+		hnswshared->gq_global_max = buildstate->gq.global_max;
+		hnswshared->gq_scale = buildstate->gq.scale;
+		hnswshared->gq_scale_sq = buildstate->gq.scale_sq;
+		hnswshared->gq_dim = buildstate->gq.dim;
+		hnswshared->gq_initialized = buildstate->gq.initialized;
+		elog(DEBUG1, "HNSW_SSQ: Sharing global quantizer with workers: global_min=%.6f, global_max=%.6f, scale=%.10f",
+			 hnswshared->gq_global_min, hnswshared->gq_global_max, hnswshared->gq_scale);
+	}
+	else
+	{
+		hnswshared->gq_initialized = false;
+	}
+
 	hnswarea = (char *) shm_toc_allocate(pcxt->toc, esthnswarea);
 	/* Report less than allocated so never fails */
 	InitGraph(&hnswshared->graphData, hnswarea, esthnswarea - 1024 * 1024);
@@ -1066,6 +1195,27 @@ BuildGraph(HnswBuildState * buildstate)
 
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, PROGRESS_HNSW_PHASE_LOAD);
 
+	/*
+	 * HNSW_SSQ: 两遍构建
+	 * 第一遍：统计全局min/max用于区间对齐量化
+	 */
+	if (buildstate->useGlobalQuantization && buildstate->heap != NULL)
+	{
+		elog(DEBUG1, "HNSW_SSQ: Starting stats phase (pass 1)");
+		buildstate->gqStatsPhase = true;
+
+		/* 第一遍扫描：只统计，不构建 */
+		table_index_build_scan(buildstate->heap, buildstate->index, buildstate->indexInfo,
+							   false, false, StatsCallback, (void *) buildstate, NULL);
+
+		/* 完成全局量化器初始化 */
+		HnswGlobalQuantizerFinalize(&buildstate->gq);
+		buildstate->gqStatsPhase = false;
+
+		elog(DEBUG1, "HNSW_SSQ: Stats phase complete. global_min=%.6f, global_max=%.6f, scale=%.10f",
+			 buildstate->gq.global_min, buildstate->gq.global_max, buildstate->gq.scale);
+	}
+
 	/* Calculate parallel workers */
 	if (buildstate->heap != NULL)
 		parallel_workers = ComputeParallelWorkers(buildstate->heap, buildstate->index);
@@ -1074,7 +1224,7 @@ BuildGraph(HnswBuildState * buildstate)
 	if (parallel_workers > 0)
 		HnswBeginParallel(buildstate, buildstate->indexInfo->ii_Concurrent, parallel_workers);
 
-	/* Add tuples to graph */
+	/* Add tuples to graph (第二遍：实际构建) */
 	if (buildstate->heap != NULL)
 	{
 		if (buildstate->hnswleader)

@@ -728,8 +728,8 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPo
 		entryPoint = HnswGetEntryPoint(index);
 	}
 
-	/* Find neighbors for element */
-	HnswFindElementNeighbors(base, element, entryPoint, index, support, m, efConstruction, false);
+	/* Find neighbors for element (磁盘插入阶段不使用全局量化) */
+	HnswFindElementNeighbors(base, element, entryPoint, index, support, m, efConstruction, false, NULL);
 
 	/* Update graph on disk */
 	UpdateGraphOnDisk(index, support, element, m, entryPoint, building);

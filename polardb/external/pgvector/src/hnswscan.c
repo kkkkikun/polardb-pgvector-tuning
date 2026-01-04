@@ -102,46 +102,39 @@ GetScanValue(IndexScanDesc scan)
 		if (!so->support.allowQuantization)
 			return value;
 
-		/* === 比赛专用 Hack：查询量化 === */
-		/* 只对L2距离的vector和halfvec类型进行量化 */
+		/* === 查询向量格式转换 === */
+		/* 检查索引是否使用全局SQ16量化 */
+		HnswGlobalQuantizer gq;
+		HnswGetGlobalQuantizerFromMeta(scan->indexRelation, &gq);
 
-		/* 【关键修复】先检测格式，再解包，避免halfvec误入vector分支 */
-		HnswValueFormat fmt = HnswDetectFormat(value);
+		if (gq.initialized)
+		{
+			/* 【全局SQ16模式】索引使用全局量化，查询保持原始格式
+			 * 距离计算将使用 HnswSQ16HalfvecDistance */
+			/* 不需要转换查询向量 */
+		}
+		else
+		{
+			/* 【per-vector SQ8模式】查询向量也需要量化 */
+			HnswValueFormat fmt = HnswDetectFormat(value);
 
-		if (fmt == HNSW_FMT_RAW_HALFVEC) {
-			/* 处理halfvec类型的量化 - 使用熔断优化 */
-			HalfVector *halfvec = DatumGetHalfVector(value);
-			int			dim = halfvec->dim;
+			if (fmt == HNSW_FMT_RAW_HALFVEC) {
+				HalfVector *halfvec = DatumGetHalfVector(value);
+				int dim = halfvec->dim;
+				Size payload_size = sizeof(float)*2 + dim;
+				Vector *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+				HnswQuantizeHalfVector(halfvec, quantized_query);
+				value = PointerGetDatum(quantized_query);
 
-			/* 直接分配结果 Vector (SQ8 大小) */
-			Size payload_size = sizeof(float)*2 + dim;
-			Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
-
-			/* 使用熔断优化函数：直接 Half -> SQ8 */
-			HnswQuantizeHalfVector(halfvec, quantized_query);
-
-			value = PointerGetDatum(quantized_query);
-
-		} else if (fmt == HNSW_FMT_RAW_FLOAT_VEC) {
-			/* 处理vector类型的量化 */
-			Vector	   *query_vec = DatumGetVector(value);
-			int			dim = query_vec->dim;
-
-			Size		payload_size = sizeof(float)*2 + dim; /* scale + bias + data */
-
-			/* 创建新的Vector用于存储量化后的查询向量 */
-			Vector	   *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
-
-			/* 使用相同的量化函数进行序列化 */
-			QuantizeAndSerialize(query_vec, quantized_query);
-			value = PointerGetDatum(quantized_query);
-
-		} else if (fmt == HNSW_FMT_SQ8) {
-			/* 已经是SQ8格式，无需重复量化 */
-			elog(DEBUG1, "Query vector is already SQ8 quantized, skipping quantization");
-
-		} else {
-			/* 未知格式(bit, sparsevec等)：不量化，直接使用原值 */
+			} else if (fmt == HNSW_FMT_RAW_FLOAT_VEC) {
+				Vector *query_vec = DatumGetVector(value);
+				int dim = query_vec->dim;
+				Size payload_size = sizeof(float)*2 + dim;
+				Vector *quantized_query = (Vector *) palloc0(offsetof(Vector, x) + payload_size);
+				QuantizeAndSerialize(query_vec, quantized_query);
+				value = PointerGetDatum(quantized_query);
+			}
+			/* SQ8/其他格式：不转换 */
 		}
 	}
 

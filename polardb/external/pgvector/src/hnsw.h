@@ -226,6 +226,15 @@ typedef struct HnswShared
 	int			nparticipantsdone;
 	double		reltuples;
 	HnswGraph	graphData;
+
+	/* 全局量化器（共享给并行workers） - HNSW_SSQ */
+	float		gq_global_min;
+	float		gq_global_max;
+	float		gq_scale;
+	float		gq_scale_sq;
+	int			gq_dim;
+	bool		gq_initialized;
+	bool		useGlobalQuantization;
 }			HnswShared;
 
 #define ParallelTableScanFromHnswShared(shared) \
@@ -261,9 +270,35 @@ typedef struct HnswSupport
 	bool		allowQuantization;
 }			HnswSupport;
 
+/*
+ * 全局量化器 (HNSW_SSQ) - 论文第4章
+ * 使用区间对齐的标量量化，所有向量共用一个量化器
+ */
+typedef struct HnswGlobalQuantizer
+{
+	float		global_min;				/* 全局最小值（所有维度中） */
+	float		global_max;				/* 全局最大值（所有维度中） */
+	float		scale;					/* 量化缩放因子 = (global_max - global_min) / 65535 */
+	float		scale_sq;				/* scale的平方，用于距离计算 */
+	int			dim;					/* 维度 */
+	bool		initialized;			/* 是否已初始化 */
+}			HnswGlobalQuantizer;
+
+/*
+ * AQD查找表 - 论文算法8
+ * 用于非对称量化距离的快速计算
+ */
+typedef struct HnswAQDTable
+{
+	float		T[HNSW_MAX_DIM][256];	/* T[i][j] = (q_shifted[i] - center_j)^2 */
+}			HnswAQDTable;
+
 typedef struct HnswQuery
 {
 	Datum		value;
+	HnswAQDTable *aqd_table;			/* AQD查找表 - 构建阶段使用（可选） */
+	HnswGlobalQuantizer *gq;			/* 全局量化器指针 - 用于AQD（可选） */
+	void	   *vdist_cache;			/* Vdist缓存哈希表 - 论文算法7（可选） */
 }			HnswQuery;
 
 typedef struct HnswBuildState
@@ -286,6 +321,11 @@ typedef struct HnswBuildState
 
 	/* Support functions */
 	HnswSupport support;
+
+	/* 全局量化器 (HNSW_SSQ) - 论文第4章 */
+	HnswGlobalQuantizer gq;
+	bool		useGlobalQuantization;	/* 是否使用全局量化 */
+	bool		gqStatsPhase;			/* 是否处于统计阶段（第一遍） */
 
 	/* Variables */
 	HnswGraph	graphData;
@@ -315,6 +355,11 @@ typedef struct HnswMetaPageData
 	OffsetNumber entryOffno;
 	int16		entryLevel;
 	BlockNumber insertPage;
+	/* 全局量化器信息（用于AQD查表过滤） */
+	float		gq_global_min;		/* 全局最小值 */
+	float		gq_global_max;		/* 全局最大值 */
+	float		gq_scale;			/* 量化缩放因子 */
+	bool		gq_initialized;		/* 是否已初始化 */
 }			HnswMetaPageData;
 
 typedef HnswMetaPageData * HnswMetaPage;
@@ -423,10 +468,11 @@ void		HnswInit(void);
 List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
 HnswElement HnswGetEntryPoint(Relation index);
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
+void		HnswGetGlobalQuantizerFromMeta(Relation index, HnswGlobalQuantizer *gq);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
 HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc);
 HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno);
-void		HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing);
+void		HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing, HnswGlobalQuantizer *gq);
 HnswSearchCandidate *HnswEntryCandidate(char *base, HnswElement em, HnswQuery * q, Relation rel, HnswSupport * support, bool loadVec);
 void		HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building);
 void		HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m);
@@ -511,6 +557,24 @@ typedef struct OffsetHashEntry
 #define SH_DECLARE
 #include "lib/simplehash.h"
 
+/*
+ * Vdist缓存哈希表 - 论文算法7
+ * 用于跨层共享距离计算结果
+ */
+typedef struct VdistHashEntry
+{
+	uintptr_t	ptr;		/* element指针作为key */
+	float		distance;	/* 缓存的距离 */
+	char		status;
+}			VdistHashEntry;
+
+#define SH_PREFIX vdisthash
+#define SH_ELEMENT_TYPE VdistHashEntry
+#define SH_KEY_TYPE uintptr_t
+#define SH_SCOPE extern
+#define SH_DECLARE
+#include "lib/simplehash.h"
+
 /* * SQ8 数据包结构
  * 我们将其存储在标准 Vector 的 x[] 数组位置
  */
@@ -524,15 +588,17 @@ typedef struct HnswSQ8Payload {
 #include <immintrin.h>
 #include <string.h>
 
-/* SQ8 量化数据的魔数标记，用于可靠识别 */
-#define SQ8_TAG 0x5158  /* 'QX' - 量化标记 */
+/* 量化数据的魔数标记 */
+#define SQ8_TAG  0x5158  /* 'QX' - SQ8量化标记（per-vector） */
+#define SQ16_TAG 0x5159  /* 'QY' - SQ16量化标记（全局量化器） */
 
 /* HNSW值格式枚举 */
 typedef enum
 {
 	HNSW_FMT_RAW_FLOAT_VEC,    /* 原始vector：4字节float/元素 */
 	HNSW_FMT_RAW_HALFVEC,      /* 原始halfvec：2字节half/元素 */
-	HNSW_FMT_SQ8,              /* SQ8量化：scale(4) + bias(4) + codes(dim) */
+	HNSW_FMT_SQ8,              /* SQ8量化（per-vector）：scale(4) + bias(4) + codes(dim) */
+	HNSW_FMT_SQ16,             /* SQ16量化（全局量化器）：codes(dim*2) */
 	HNSW_FMT_UNKNOWN           /* 未知格式：bit, sparsevec等其他类型 */
 } HnswValueFormat;
 
@@ -573,7 +639,16 @@ HnswDetectFormat(Datum d)
 		return HNSW_FMT_RAW_HALFVEC;
 	}
 
-	/* SQ8量化：payload == 8 + dim (scale+bias+codes) */
+	/* SQ16量化（全局量化器）：payload == 8 + dim * 2 (global_min + scale + codes) */
+	if (payload == (int)(2 * sizeof(float) + dim * sizeof(uint16_t))) {
+		Vector *v = (Vector *)p;
+		/* 通过魔数标记确认是SQ16 */
+		if (v->unused == SQ16_TAG) {
+			return HNSW_FMT_SQ16;
+		}
+	}
+
+	/* SQ8量化（per-vector）：payload == 8 + dim (scale+bias+codes) */
 	if (payload == (int)(sizeof(float) * 2 + dim)) {
 		/* 进一步检查SQ8魔数标记 */
 		Vector *v = (Vector *)p;
@@ -1263,6 +1338,376 @@ HnswSQ8Distance(Datum a, Datum b)
 
     /* 直接调用零分配优化版本 */
     return (double)HnswSQ8Distance2_Vector(vec_a, vec_b);
+}
+
+/* ============================================================
+ * SQ16全局量化距离计算（HNSW_SSQ - 论文第4章）
+ * ============================================================ */
+
+/*
+ * 全局量化器初始化
+ */
+static inline void
+HnswGlobalQuantizerInit(HnswGlobalQuantizer *gq, int dim)
+{
+    gq->dim = dim;
+    gq->global_min = 1e30f;   /* 初始化为大值，后续取min */
+    gq->global_max = -1e30f;  /* 初始化为小值，后续取max */
+    gq->scale = 0.0f;
+    gq->scale_sq = 0.0f;
+    gq->initialized = false;
+}
+
+/*
+ * 全局量化器统计更新（第一遍扫描时调用）
+ * 输入：原始halfvec数据
+ * 简化方案：使用单一全局min/max而非每维平移
+ */
+static inline void
+HnswGlobalQuantizerUpdate(HnswGlobalQuantizer *gq, HalfVector *hv)
+{
+    int dim = hv->dim;
+    half *data = hv->x;
+
+    for (int i = 0; i < dim; i++) {
+        float val = HalfToFloat4(data[i]);
+        /* 更新全局最小值 */
+        if (val < gq->global_min) {
+            gq->global_min = val;
+        }
+        /* 更新全局最大值 */
+        if (val > gq->global_max) {
+            gq->global_max = val;
+        }
+    }
+}
+
+/*
+ * 全局量化器完成初始化（第一遍扫描结束后调用）
+ */
+static inline void
+HnswGlobalQuantizerFinalize(HnswGlobalQuantizer *gq)
+{
+    float range = gq->global_max - gq->global_min;
+    if (range > 0.0f) {
+        gq->scale = range / 65535.0f;
+        gq->scale_sq = gq->scale * gq->scale;
+    } else {
+        gq->scale = 1.0f;
+        gq->scale_sq = 1.0f;
+    }
+    gq->initialized = true;
+}
+
+/*
+ * 使用全局量化器将halfvec量化为SQ16
+ * 存储格式：[global_min(4B)][scale(4B)][codes(dim*2B)]
+ * 这样距离计算时可以直接反量化
+ */
+static inline void
+HnswQuantizeToSQ16(HalfVector *src, Vector *dest, HnswGlobalQuantizer *gq)
+{
+    int dim = src->dim;
+    half *hdata = src->x;
+    char *buffer = (char *)dest->x;
+
+    dest->dim = dim;
+    dest->unused = SQ16_TAG;
+
+    /* 存储global_min和scale */
+    memcpy(buffer, &gq->global_min, sizeof(float));
+    memcpy(buffer + sizeof(float), &gq->scale, sizeof(float));
+
+    /* 量化数据从buffer + 8开始 */
+    uint16_t *codes = (uint16_t *)(buffer + 2 * sizeof(float));
+
+    float inv_scale = (gq->scale > 0.0f) ? (1.0f / gq->scale) : 0.0f;
+
+    for (int i = 0; i < dim; i++) {
+        float val = HalfToFloat4(hdata[i]);
+        /* 量化: code = (val - global_min) / scale */
+        float normalized = (val - gq->global_min) * inv_scale;
+        int32_t code = (int32_t)(normalized + 0.5f);  /* 四舍五入 */
+        if (code < 0) code = 0;
+        if (code > 65535) code = 65535;
+        codes[i] = (uint16_t)code;
+    }
+
+    /* 设置VARSIZE: header + dim + unused + global_min + scale + codes */
+    SET_VARSIZE(dest, VARHDRSZ + sizeof(int16) + sizeof(uint16) + 2 * sizeof(float) + dim * sizeof(uint16));
+}
+
+/*
+ * SQ16 vs SQ16 距离计算（标量版本）
+ * 使用全局scale，只需计算code差值的平方和
+ */
+static inline float
+HnswSQ16Distance2_scalar(uint16_t *a, uint16_t *b, int dim, float scale_sq)
+{
+    int64_t sum = 0;
+    for (int i = 0; i < dim; i++) {
+        int32_t diff = (int32_t)a[i] - (int32_t)b[i];
+        sum += (int64_t)diff * diff;
+    }
+    return (float)sum * scale_sq;
+}
+
+/*
+ * SQ16 vs SQ16 距离计算（AVX-512优化版本）
+ */
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
+static inline float
+HnswSQ16Distance2_avx512(uint16_t *a, uint16_t *b, int dim, float scale_sq)
+{
+    __m512i vsum = _mm512_setzero_si512();
+    int i = 0;
+
+    /* 32路展开（2x16 uint16） */
+    for (; i <= dim - 32; i += 32) {
+        /* 加载32个uint16 */
+        __m512i va = _mm512_loadu_si512((const __m512i *)(a + i));
+        __m512i vb = _mm512_loadu_si512((const __m512i *)(b + i));
+
+        /* 分成两组16个，扩展为int32计算差值 */
+        __m256i va_lo = _mm512_castsi512_si256(va);
+        __m256i va_hi = _mm512_extracti32x8_epi32(va, 1);
+        __m256i vb_lo = _mm512_castsi512_si256(vb);
+        __m256i vb_hi = _mm512_extracti32x8_epi32(vb, 1);
+
+        /* 扩展为int32 */
+        __m512i va32_lo = _mm512_cvtepu16_epi32(va_lo);
+        __m512i va32_hi = _mm512_cvtepu16_epi32(va_hi);
+        __m512i vb32_lo = _mm512_cvtepu16_epi32(vb_lo);
+        __m512i vb32_hi = _mm512_cvtepu16_epi32(vb_hi);
+
+        /* 计算差值 */
+        __m512i vdiff_lo = _mm512_sub_epi32(va32_lo, vb32_lo);
+        __m512i vdiff_hi = _mm512_sub_epi32(va32_hi, vb32_hi);
+
+        /* 计算平方并累加 */
+        __m512i vsq_lo = _mm512_mullo_epi32(vdiff_lo, vdiff_lo);
+        __m512i vsq_hi = _mm512_mullo_epi32(vdiff_hi, vdiff_hi);
+
+        vsum = _mm512_add_epi64(vsum, _mm512_add_epi64(
+            _mm512_cvtepu32_epi64(_mm512_castsi512_si256(vsq_lo)),
+            _mm512_cvtepu32_epi64(_mm512_extracti32x8_epi32(vsq_lo, 1))
+        ));
+        vsum = _mm512_add_epi64(vsum, _mm512_add_epi64(
+            _mm512_cvtepu32_epi64(_mm512_castsi512_si256(vsq_hi)),
+            _mm512_cvtepu32_epi64(_mm512_extracti32x8_epi32(vsq_hi, 1))
+        ));
+    }
+
+    /* 处理剩余元素 */
+    int64_t sum = _mm512_reduce_add_epi64(vsum);
+    for (; i < dim; i++) {
+        int32_t diff = (int32_t)a[i] - (int32_t)b[i];
+        sum += (int64_t)diff * diff;
+    }
+
+    return (float)sum * scale_sq;
+}
+
+/*
+ * SQ16 vs SQ16 距离计算（自动选择最优实现）
+ */
+static inline float
+HnswSQ16Distance2(uint16_t *a, uint16_t *b, int dim, float scale_sq)
+{
+#if HNSW_SQ8_FORCE_AVX512
+    return HnswSQ16Distance2_avx512(a, b, dim, scale_sq);
+#else
+    if (__builtin_expect(HnswAvx512EnabledCached(), 1))
+        return HnswSQ16Distance2_avx512(a, b, dim, scale_sq);
+    else
+        return HnswSQ16Distance2_scalar(a, b, dim, scale_sq);
+#endif
+}
+
+/*
+ * SQ16 Datum距离计算（自动从向量中读取参数）
+ * 存储格式：[global_min(4B)][scale(4B)][codes(dim*2B)]
+ */
+static inline double
+HnswSQ16DistanceAuto(Datum a, Datum b)
+{
+    Vector *vec_a = (Vector *) PG_DETOAST_DATUM_PACKED(a);
+    Vector *vec_b = (Vector *) PG_DETOAST_DATUM_PACKED(b);
+
+    Assert(vec_a->dim == vec_b->dim);
+    Assert(vec_a->unused == SQ16_TAG && vec_b->unused == SQ16_TAG);
+
+    char *buf_a = (char *)vec_a->x;
+    char *buf_b = (char *)vec_b->x;
+
+    /* 从向量中读取scale（两个向量应该相同） */
+    float scale_a;
+    memcpy(&scale_a, buf_a + sizeof(float), sizeof(float));
+
+    float scale_sq = scale_a * scale_a;
+
+    /* 量化数据从buffer + 8开始 */
+    uint16_t *codes_a = (uint16_t *)(buf_a + 2 * sizeof(float));
+    uint16_t *codes_b = (uint16_t *)(buf_b + 2 * sizeof(float));
+
+    return (double)HnswSQ16Distance2(codes_a, codes_b, vec_a->dim, scale_sq);
+}
+
+/*
+ * SQ16 vs halfvec 混合距离计算
+ * 用于查询时：查询向量是halfvec，索引向量是SQ16
+ * 存储格式：[global_min(4B)][scale(4B)][codes(dim*2B)]
+ */
+static inline double
+HnswSQ16HalfvecDistance(Datum sq16_datum, Datum hv_datum)
+{
+    Vector *vec = (Vector *) PG_DETOAST_DATUM_PACKED(sq16_datum);
+    HalfVector *hv = DatumGetHalfVector(hv_datum);
+
+    Assert(vec->unused == SQ16_TAG);
+    Assert(vec->dim == hv->dim);
+
+    int dim = vec->dim;
+    char *buf = (char *)vec->x;
+
+    /* 读取global_min和scale */
+    float global_min, scale;
+    memcpy(&global_min, buf, sizeof(float));
+    memcpy(&scale, buf + sizeof(float), sizeof(float));
+    uint16_t *codes = (uint16_t *)(buf + 2 * sizeof(float));
+
+    /* 反量化并计算距离 */
+    double sum = 0.0;
+    for (int i = 0; i < dim; i++) {
+        /* 反量化: val = code * scale + global_min */
+        float val_sq16 = (float)codes[i] * scale + global_min;
+        float val_hv = HalfToFloat4(hv->x[i]);
+        float diff = val_sq16 - val_hv;
+        sum += (double)diff * diff;
+    }
+
+    return sum;
+}
+
+/* ============================================================
+ * AQD查表过滤（论文算法8）
+ * ============================================================ */
+
+/*
+ * 为查询点构建AQD查找表
+ * 输入：查询点（halfvec格式）、全局量化器
+ * 输出：AQD查找表（200KB for 200维）
+ * 新方案：使用global_min和scale，不再使用per-dimension shift
+ */
+static inline void
+HnswBuildAQDTable(HalfVector *query, HnswGlobalQuantizer *gq, HnswAQDTable *table)
+{
+    int dim = query->dim;
+    half *qdata = query->x;
+
+    /* SQ8精度的缩放因子（256个中心） */
+    float range = gq->global_max - gq->global_min;
+    float sq8_scale = range / 255.0f;
+
+    for (int i = 0; i < dim; i++) {
+        float q_val = HalfToFloat4(qdata[i]);
+
+        for (int j = 0; j < 256; j++) {
+            /* 第j个SQ8量化中心的值 = j * sq8_scale + global_min */
+            float center = (float)j * sq8_scale + gq->global_min;
+            float diff = q_val - center;
+            table->T[i][j] = diff * diff;
+        }
+    }
+}
+
+/*
+ * 从SQ16编码的向量构建AQD查找表
+ * 用于构建阶段，查询点已经是SQ16格式
+ */
+static inline void
+HnswBuildAQDTableFromSQ16(Datum sq16_value, HnswGlobalQuantizer *gq, HnswAQDTable *table)
+{
+    Vector *vec = (Vector *) DatumGetPointer(sq16_value);
+    int dim = vec->dim;
+    char *buf = (char *)vec->x;
+
+    /* SQ16格式: [global_min(4B)][scale(4B)][codes(dim*2B)] */
+    float stored_min, stored_scale;
+    memcpy(&stored_min, buf, sizeof(float));
+    memcpy(&stored_scale, buf + sizeof(float), sizeof(float));
+    uint16_t *codes = (uint16_t *)(buf + 2 * sizeof(float));
+
+    /* SQ8精度的缩放因子（256个中心） */
+    float range = gq->global_max - gq->global_min;
+    float sq8_scale = range / 255.0f;
+
+    for (int i = 0; i < dim; i++) {
+        /* 将SQ16编码还原为float值 */
+        float q_val = (float)codes[i] * stored_scale + stored_min;
+
+        for (int j = 0; j < 256; j++) {
+            /* 第j个SQ8量化中心的值 = j * sq8_scale + global_min */
+            float center = (float)j * sq8_scale + gq->global_min;
+            float diff = q_val - center;
+            table->T[i][j] = diff * diff;
+        }
+    }
+}
+
+/*
+ * 快速AQD计算（只需查表+累加）
+ * 输入：SQ16编码的候选点
+ * 返回：AQD下界距离
+ */
+static inline float
+HnswComputeAQD(uint16_t *codes, HnswAQDTable *table, int dim)
+{
+    float sum = 0.0f;
+    for (int i = 0; i < dim; i++) {
+        /* SQ16 -> SQ8（取高8位） */
+        uint8_t sq8_code = codes[i] >> 8;
+        sum += table->T[i][sq8_code];
+    }
+    return sum;
+}
+
+/*
+ * AVX-512优化的AQD计算
+ */
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
+static inline float
+HnswComputeAQD_avx512(uint16_t *codes, HnswAQDTable *table, int dim)
+{
+    __m512 vsum = _mm512_setzero_ps();
+    int i = 0;
+
+    /* 16路展开 */
+    for (; i <= dim - 16; i += 16) {
+        /* 加载16个SQ16 codes */
+        __m256i vcodes = _mm256_loadu_si256((const __m256i *)(codes + i));
+
+        /* SQ16 -> SQ8（右移8位取高8位） */
+        __m256i vsq8 = _mm256_srli_epi16(vcodes, 8);
+
+        /* 提取8个byte索引并查表 */
+        /* 由于查表操作复杂，这里简化为标量实现 */
+        float local_sum = 0.0f;
+        for (int j = 0; j < 16; j++) {
+            uint8_t sq8_code = codes[i + j] >> 8;
+            local_sum += table->T[i + j][sq8_code];
+        }
+        vsum = _mm512_add_ps(vsum, _mm512_set1_ps(local_sum));
+    }
+
+    /* 处理剩余元素 */
+    float sum = _mm512_reduce_add_ps(vsum);
+    for (; i < dim; i++) {
+        uint8_t sq8_code = codes[i] >> 8;
+        sum += table->T[i][sq8_code];
+    }
+
+    return sum;
 }
 
 #endif
