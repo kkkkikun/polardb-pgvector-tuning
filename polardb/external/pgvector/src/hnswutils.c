@@ -74,7 +74,11 @@ hash_tid(ItemPointerData tid)
 #define SH_KEY_TYPE		ItemPointerData
 #define	SH_KEY			tid
 #define SH_HASH_KEY(tb, key)	hash_tid(key)
-#define SH_EQUAL(tb, a, b)		ItemPointerEquals(&a, &b)
+/* 内联比较替代函数调用，避免 PLT 跳转开销 */
+#define SH_EQUAL(tb, a, b) \
+	((a).ip_blkid.bi_hi == (b).ip_blkid.bi_hi && \
+	 (a).ip_blkid.bi_lo == (b).ip_blkid.bi_lo && \
+	 (a).ip_posid == (b).ip_posid)
 #define	SH_SCOPE		extern
 #define SH_DEFINE
 #include "lib/simplehash.h"
