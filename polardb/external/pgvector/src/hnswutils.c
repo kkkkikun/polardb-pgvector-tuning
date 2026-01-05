@@ -1167,7 +1167,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 				consecutiveRejections++;
 
 				/* 当已找到足够候选且连续被拒绝时，提前终止内循环 */
-				if (!alwaysAdd && consecutiveRejections >= 16)
+				if (!alwaysAdd && consecutiveRejections >= 32)
 					break;
 
 				continue;
