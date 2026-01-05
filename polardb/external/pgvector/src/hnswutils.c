@@ -619,8 +619,8 @@ HnswGetDistance(Datum a, Datum b, HnswSupport * support)
 
 	/* 【优化】最常见情况优先：SQ8 vs SQ8（索引内部比较） */
 	if (likely(a_sq8 && b_sq8)) {
-		/* case 1: SQ8 vs SQ8 - 使用零分配优化版本 */
-		return HnswSQ8Distance(a, b);
+		/* case 1: SQ8 vs SQ8 - 直接使用已解引用的指针，避免冗余解引用 */
+		return (double)HnswSQ8Distance2_Vector(va, vb);
 	}
 
 	/* 【优化】次常见情况：原始 vs 原始（纯原始数据比较） */
@@ -1167,7 +1167,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 				consecutiveRejections++;
 
 				/* 当已找到足够候选且连续被拒绝时，提前终止内循环 */
-				if (!alwaysAdd && consecutiveRejections >= 5)
+				if (!alwaysAdd && consecutiveRejections >= 9)
 					break;
 
 				continue;
