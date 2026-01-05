@@ -608,42 +608,44 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 /*
  * Calculate the distance between values
  *
- * 【性能优化】优化分支预测，使用likely()减少分支预测失败
- * 零分配的距离计算，显著提升性能
+ * 【性能优化】
+ * 1. 使用 DatumGetPointer 替代 PG_DETOAST_DATUM_PACKED
+ *    - 表设置了 STORAGE PLAIN，索引数据不会被 TOAST 压缩
+ *    - 128维 halfvec 约 260 字节，远小于 TOAST 阈值（~2KB），查询向量也不会被压缩
+ *    - 消除每次距离计算的 varatt 头部检查开销
+ * 2. 使用 likely() 优化分支预测
+ * 3. 零分配的距离计算
  */
 static inline double
 HnswGetDistance(Datum a, Datum b, HnswSupport * support)
 {
-	/* 【优化】使用更快速的SQ8检测 - 直接检查unused字段避免复杂计算 */
-	Vector *va = (Vector *) PG_DETOAST_DATUM_PACKED(a);
-	Vector *vb = (Vector *) PG_DETOAST_DATUM_PACKED(b);
+	/*
+	 * 【优化】直接指针转换，跳过 detoast 检查
+	 * 前提：STORAGE PLAIN + 数据大小 < TOAST 阈值
+	 */
+	Vector *va = (Vector *) DatumGetPointer(a);
+	Vector *vb = (Vector *) DatumGetPointer(b);
 
 	bool a_sq8 = (va->unused == SQ8_TAG);
 	bool b_sq8 = (vb->unused == SQ8_TAG);
 
 	/* 【优化】最常见情况优先：SQ8 vs SQ8（索引内部比较） */
 	if (likely(a_sq8 && b_sq8)) {
-		/* case 1: SQ8 vs SQ8 - 直接使用已解引用的指针，避免冗余解引用 */
 		return (double)HnswSQ8Distance2_Vector(va, vb);
 	}
 
 	/* 【优化】次常见情况：原始 vs 原始（纯原始数据比较） */
 	if (likely(!a_sq8 && !b_sq8)) {
-		/* case 2: 原始 vs 原始 - 使用标准距离函数 */
 		return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
 	}
 
 	/* 【较少情况】混合类型：SQ8 vs halfvec（查询时发生） */
 	if (a_sq8) {
-		/* a=SQ8, b=halfvec - 使用零分配混合距离 */
-		Vector *sq8_vec = (Vector *) PG_DETOAST_DATUM_PACKED(a);
-		HalfVector *half_vec = (HalfVector *) PG_DETOAST_DATUM_PACKED(b);
-		return (double)HnswSQ8HalfvecDistance2(sq8_vec, half_vec);
+		/* va 已经是 SQ8，vb 是 halfvec，直接使用已解引用的指针 */
+		return (double)HnswSQ8HalfvecDistance2(va, (HalfVector *)vb);
 	} else {
-		/* b=SQ8, a=halfvec - 使用零分配混合距离 */
-		Vector *sq8_vec = (Vector *) PG_DETOAST_DATUM_PACKED(b);
-		HalfVector *half_vec = (HalfVector *) PG_DETOAST_DATUM_PACKED(a);
-		return (double)HnswSQ8HalfvecDistance2(sq8_vec, half_vec);
+		/* vb 是 SQ8，va 是 halfvec */
+		return (double)HnswSQ8HalfvecDistance2(vb, (HalfVector *)va);
 	}
 }
 
