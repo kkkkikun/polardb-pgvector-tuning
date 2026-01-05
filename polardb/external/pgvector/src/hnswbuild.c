@@ -267,9 +267,8 @@ WriteNeighborTuples(HnswBuildState * buildstate)
 		/* Zero memory for each element */
 		MemSet(ntup, 0, HNSW_TUPLE_ALLOC_SIZE);
 
-		/* Can take a while, so ensure we can interrupt */
-		/* Needs to be called when no buffer locks are held */
-		CHECK_FOR_INTERRUPTS();
+		/* 【比赛优化】删除 CHECK_FOR_INTERRUPTS */
+		/* CHECK_FOR_INTERRUPTS(); */
 
 		buf = ReadBufferExtended(index, forkNum, element->neighborPage, RBM_NORMAL, NULL);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);

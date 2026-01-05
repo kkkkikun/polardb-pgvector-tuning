@@ -1046,9 +1046,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		{
 			AddToVisited(base, v, sc->element, inMemory, &found);
 
-			/* OK to count elements instead of tuples */
-			if (tuples != NULL)
-				(*tuples)++;
+			/* 【比赛优化】移除 tuples 统计，减少热路径开销 */
 		}
 
 		pairingheap_add(C, &sc->c_node);
@@ -1079,9 +1077,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		else
 			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc);
 
-		/* OK to count elements instead of tuples */
-		if (tuples != NULL)
-			(*tuples) += unvisitedLength;
+		/* 【比赛优化】移除 tuples 统计 */
 
 		/* ==========================================================
 		 * 【Early Termination 优化 - 动态阈值】

@@ -23,7 +23,8 @@ REGRESS_OPTS = --inputdir=test --load-extension=$(EXTENSION)
 BASE_FLAGS = -march=native -O3 -flto -funroll-loops \
              -mavx512f -mavx512vl -mavx512bw -mavx512dq \
              -mfma -ftree-vectorize -fassociative-math \
-             -fno-signed-zeros -fno-trapping-math
+             -fno-signed-zeros -fno-trapping-math \
+			 -DUSE_ASSERT_CHECKING=0 -DNDEBUG  # ← 添加这行！
 
 # 2. PGO 模式控制 (由 build.sh 传入 PGO=xxx 参数控制)
 ifeq ($(PGO),generate)
